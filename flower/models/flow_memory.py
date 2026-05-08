@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+from flower.config import ModelConfig
+from flower.flows.coupling import ConditionalCouplingFlow
+from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
+from flower.models.memory import MemoryRead
+
+
+class FlowMemoryBlock(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.local = CausalSelfAttention(config, config.local_window)
+        self.ln_mem = nn.LayerNorm(config.d_model)
+        self.mem_read = MemoryRead(config)
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        flat_dim = config.memory_slots * config.d_model
+        if flat_dim % 2:
+            flat_dim += 1
+        self.flat_dim = flat_dim
+        self.cond = nn.Linear(config.d_model, config.d_model)
+        self.flow = ConditionalCouplingFlow(flat_dim, config.d_model, layers=2)
+
+    def _flat_memory(self, memory: torch.Tensor) -> torch.Tensor:
+        flat = memory.reshape(memory.shape[0], -1)
+        if flat.shape[-1] < self.flat_dim:
+            flat = torch.nn.functional.pad(flat, (0, self.flat_dim - flat.shape[-1]))
+        return flat
+
+    def _unflat_memory(self, flat: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        size = self.config.memory_slots * self.config.d_model
+        return flat[:, :size].reshape_as(memory)
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if memory is None:
+            memory = x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
+        x = x + self.local(self.ln1(x))
+        x = x + self.mem_read(self.ln_mem(x), memory)
+        x = x + self.ff(self.ln2(x))
+        cond = self.cond(x.mean(dim=1))
+        memory = self._unflat_memory(self.flow(self._flat_memory(memory), cond), memory)
+        return x, memory
+
+    def inverse_update(self, new_memory: torch.Tensor, cond_tokens: torch.Tensor) -> torch.Tensor:
+        cond = self.cond(cond_tokens.mean(dim=1))
+        flat = self.flow.inverse(self._flat_memory(new_memory), cond)
+        return self._unflat_memory(flat, new_memory)
+
+
+def build_flow_memory_model(config: ModelConfig) -> CausalLM:
+    blocks = [FlowMemoryBlock(config) for _ in range(config.num_layers)]
+    return CausalLM(config, blocks)

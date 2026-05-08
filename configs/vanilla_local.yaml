@@ -1,0 +1,17 @@
+model:
+  variant: vanilla_local
+  d_model: 256
+  num_heads: 4
+  num_layers: 4
+  ffn_dim: 1024
+  max_seq_len: 512
+  local_window: 64
+training:
+  batch_size: 32
+  steps: 30000
+  lr: 0.0003
+  warmup_steps: 1000
+  grad_clip: 1.0
+data:
+  dataset: fineweb_edu
+  sequence_length: 512

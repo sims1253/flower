@@ -1,0 +1,24 @@
+[project]
+name = "flower"
+version = "0.1.0"
+description = "Flow-attention memory experiments"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "torch>=2.0",
+    "tqdm>=4.66",
+    "datasets>=2.18",
+    "transformers>=4.40",
+    "tensorboard>=2.16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["flower*"]

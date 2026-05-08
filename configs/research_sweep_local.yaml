@@ -1,0 +1,32 @@
+sweep:
+  name: research_sweep_local
+  defaults:
+    data:
+      dataset: synthetic
+      sequence_length: 32
+      synthetic_vocab_size: 256
+    training:
+      batch_size: 2
+      steps: 2
+      device: cpu
+    model:
+      vocab_size: 256
+      d_model: 32
+      num_heads: 4
+      num_layers: 1
+      ffn_dim: 64
+      max_seq_len: 32
+      local_window: 8
+      memory_slots: 4
+      short_memory_slots: 2
+  variants:
+    - {model: {variant: vanilla_local}}
+    - {model: {variant: vanilla_full, local_window: null}}
+    - {model: {variant: linear_memory}}
+    - {model: {variant: summary_memory, memory_aggregation: sum}}
+    - {model: {variant: summary_memory, memory_aggregation: max, hierarchical_memory: true}}
+    - {model: {variant: summary_memory, summary_style: perceiver, memory_aggregation: attention}}
+    - {model: {variant: flow_attention, flow_mode: direct, flow_steps: 1}}
+    - {model: {variant: flow_attention, flow_mode: shortcut, flow_step_size: 0.5}}
+    - {model: {variant: fa_sm, memory_kernel_bias: positional, flow_mode: direct}}
+    - {model: {variant: fa_fm, memory_update_frequency: 2}}

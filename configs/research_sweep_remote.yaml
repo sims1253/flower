@@ -1,0 +1,46 @@
+sweep:
+  name: research_sweep_remote
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: gpt2
+      split: train
+      validation_split: validation
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 32
+      steps: 30000
+      lr: 0.0003
+      warmup_steps: 1000
+      grad_clip: 1.0
+      device: auto
+      metrics_json: runs/metrics.json
+      log_backend: tensorboard
+      validation_steps: 100
+      validation_interval: 1000
+    model:
+      vocab_size: 50257
+      d_model: 256
+      num_heads: 4
+      num_layers: 4
+      ffn_dim: 1024
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 8
+      short_memory_slots: 4
+      flow_steps: 3
+  variants:
+    - {name: vanilla_local, model: {variant: vanilla_local}}
+    - {name: vanilla_full, model: {variant: vanilla_full, local_window: null}}
+    - {name: linear_memory, model: {variant: linear_memory}}
+    - {name: summary_mean, model: {variant: summary_memory, memory_aggregation: mean}}
+    - {name: summary_attention_perceiver, model: {variant: summary_memory, summary_style: perceiver, memory_aggregation: attention}}
+    - {name: summary_hierarchical_max, model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}}
+    - {name: flow_euler_shared, model: {variant: flow_attention, flow_mode: euler, flow_shared: true}}
+    - {name: flow_direct_meanflow, model: {variant: flow_attention, flow_mode: direct, flow_steps: 1}}
+    - {name: flow_shortcut, model: {variant: flow_attention, flow_mode: shortcut, flow_step_size: 0.5}}
+    - {name: fa_sm_rbf, model: {variant: fa_sm, memory_kernel_bias: rbf, summary_style: perceiver}}
+    - {name: fa_sm_positional_deepshallow, model: {variant: fa_sm, memory_kernel_bias: positional, deep_shallow_flow: true}}
+    - {name: fa_fm_update_every_2, model: {variant: fa_fm, memory_update_frequency: 2}}
+    - {name: fa_fm_noise, model: {variant: fa_fm, noise_std: 0.01}}
