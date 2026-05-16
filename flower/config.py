@@ -17,6 +17,9 @@ class ModelConfig:
     ffn_dim: int = 1024
     max_seq_len: int = 512
     local_window: int | None = 64
+    # Sweep 4: RoPE base frequency. Keep 10000 for the Phase 1 bake-off; larger
+    # values can support post-training long-context extension via YaRN/PI.
+    rope_base: float = 10000.0
     memory_slots: int = 8
     flow_steps: int = 3
     flow_shared: bool = True

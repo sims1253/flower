@@ -5,10 +5,10 @@ sweep:
     data:
       dataset: fineweb-edu
       tokenizer: "custom:tokenizers/fineweb_4k.json"
-      sequence_length: 512
+      sequence_length: 2048
       streaming: true
     training:
-      batch_size: 128
+      batch_size: 32
       steps: 10000
       lr: 0.000283
       lr_schedule: linear_warmup
@@ -30,8 +30,9 @@ sweep:
       num_heads: 6
       num_layers: 6
       ffn_dim: 1536
-      max_seq_len: 512
-      local_window: 64
+      max_seq_len: 2048
+      local_window: 128
+      rope_base: 10000.0
       memory_slots: 16
       short_memory_slots: 4
       hierarchical_memory: true

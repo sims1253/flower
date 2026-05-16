@@ -33,6 +33,44 @@ def scaled_dot_attention(
     return attn @ v
 
 
+class RotaryEmbedding(nn.Module):
+    """Standard RoPE with cached cos/sin tables."""
+
+    def __init__(self, head_dim: int, max_seq_len: int, base: float = 10000.0) -> None:
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError("RoPE requires even head_dim")
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        positions = torch.arange(max_seq_len).float()
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer(
+            "cos",
+            freqs.cos().repeat_interleave(2, dim=-1).view(1, 1, max_seq_len, head_dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin",
+            freqs.sin().repeat_interleave(2, dim=-1).view(1, 1, max_seq_len, head_dim),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = q.shape[-2]
+        cos_cache = self.get_buffer("cos")
+        sin_cache = self.get_buffer("sin")
+        if seq_len > cos_cache.shape[-2]:
+            raise ValueError("input length exceeds RoPE cache")
+        cos = cos_cache[..., :seq_len, :].to(device=q.device, dtype=q.dtype)
+        sin = sin_cache[..., :seq_len, :].to(device=q.device, dtype=q.dtype)
+        return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, ffn_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -55,6 +93,7 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = config.num_heads
         self.head_dim = config.d_model // config.num_heads
         self.local_window = local_window
+        self.rope = RotaryEmbedding(self.head_dim, config.max_seq_len, base=config.rope_base)
         self.qkv = nn.Linear(config.d_model, config.d_model * 3)
         self.out = nn.Linear(config.d_model, config.d_model)
         # S2.4: optional RBF distance kernel as additive attention bias.
@@ -81,6 +120,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q), self._split(k), self._split(v)
+        q, k = self.rope(q, k)
         mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
         if self.kernel_bias == "rbf":
             scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
@@ -114,7 +154,6 @@ class CausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.token = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos = nn.Embedding(config.max_seq_len, config.d_model)
         self.blocks = nn.ModuleList(blocks)
         self.ln = nn.LayerNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -123,8 +162,7 @@ class CausalLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
         if input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError("input length exceeds max_seq_len")
-        pos = torch.arange(input_ids.shape[1], device=input_ids.device)
-        x = self.token(input_ids) + self.pos(pos).unsqueeze(0)
+        x = self.token(input_ids)
         memory = None
         diagnostics: dict[str, Any] = {}
         # A2 looped transformer: run the block stack `loop_count` times. Memory state

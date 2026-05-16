@@ -72,7 +72,6 @@ class EngramLiteLM(CausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.token = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos = nn.Embedding(config.max_seq_len, config.d_model)
         self.blocks = nn.ModuleList([EngramLiteBlock(config) for _ in range(config.num_layers)])
         self.ln = nn.LayerNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -81,8 +80,7 @@ class EngramLiteLM(CausalLM):
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
         if input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError("input length exceeds max_seq_len")
-        pos = torch.arange(input_ids.shape[1], device=input_ids.device)
-        x = self.token(input_ids) + self.pos(pos).unsqueeze(0)
+        x = self.token(input_ids)
         loops = max(1, getattr(self.config, "loop_count", 1))
         for _ in range(loops):
             for block in self.blocks:
