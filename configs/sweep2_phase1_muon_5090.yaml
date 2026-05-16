@@ -1,0 +1,101 @@
+# Sweep 2 — Phase 1 Muon arm, retrofitted on RTX 5090 (32GB)
+#
+# The original Phase 1 ran the AdamW arm on 96GB cards at batch=256, lr=4e-4.
+# After Phase 2 finished we got a long-term 5090 (32GB) and now run the Muon
+# arm here. To fit the smaller card we drop to batch=128 and sqrt-scale the LR
+# down to 2.83e-4. Step count stays at 2500 so total tokens-per-trial drops by
+# 2x relative to the AdamW arm — note this when reading the comparison.
+#
+# 11 variants × ~25M params each. On a single 5090: ~2-3h sequential.
+
+sweep:
+  name: sweep2_phase1_muon_5090
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 128       # 5090 32GB — half of AdamW arm's 256 on 96GB cards.
+      steps: 2500           # match AdamW arm step count.
+      lr: 0.000283          # 4e-4 / sqrt(2) — sqrt-rule scaling for halved batch.
+      warmup_steps: 500
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      validation_steps: 100
+      validation_interval: 1000
+      optimizer: muon
+      memory_lr: 0.0
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 12
+      short_memory_slots: 4
+      flow_steps: 3
+      phase_memory_dim: 64
+
+  variants:
+    - name: p1_vanilla_muon
+      training: {optimizer: muon}
+      model: {variant: vanilla_local}
+
+    - name: p1_hier_max_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: p1_hier_orthogonal_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: orthogonal}
+
+    - name: p1_hier_max_looped_x2_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, loop_count: 2}
+
+    - name: p1_hier_max_rbf_local_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, local_attn_kernel_bias: rbf}
+
+    - name: p1_phase_memory_muon
+      training: {optimizer: muon}
+      model: {variant: phase_memory}
+
+    - name: p1_hier_max_16slots_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 16}
+
+    - name: p1_partitioned_4banks_muon
+      training: {optimizer: muon}
+      model: {variant: partitioned_memory, hierarchical_memory: true, num_memory_banks: 4}
+
+    - name: p1_hier_max_dual_lr_muon
+      training: {optimizer: muon, memory_lr: 0.05}  # I8 with Muon backbone.
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: p1_fa_fm_fixed_muon
+      training: {optimizer: muon}
+      model: {variant: fa_fm}
+
+    - name: p1_hier_max_32slots_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 32}
+
+    # ===== Salvage: Phase 1 AdamW retries =====
+    # dual_lr originally ran with memory_lr=1e-3 (diverged, val_loss=53). Retry
+    # at 5e-4 — only 1.25× backbone, more in line with what survives in practice.
+    - name: p1_hier_max_dual_lr_adamw_retry
+      training: {optimizer: adamw, lr: 0.000283, memory_lr: 0.0005}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    # looped_x2 originally OOM'd / NaN'd on 96GB at batch=256. Retry at the
+    # 5090's batch=128 with sqrt-scaled LR — looped models often need
+    # extra LR caution since gradients flow through shared weights twice.
+    - name: p1_hier_max_looped_x2_adamw_retry
+      training: {optimizer: adamw, lr: 0.000283}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, loop_count: 2}

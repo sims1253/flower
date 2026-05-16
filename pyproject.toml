@@ -3,15 +3,19 @@ name = "flower"
 version = "0.1.0"
 description = "Flow-attention memory experiments"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.24",
     "pyyaml>=6.0",
-    "torch>=2.0",
+    # Pin torch to a CUDA-12.x-compatible release. Vast hosts vary on driver:
+    # some have CUDA 13 (where torch 2.10+/cu130 works), others have 12.8 (need
+    # torch <= 2.9 with cu128 wheels). 2.6-2.9 covers both.
+    "torch>=2.6,<2.10",
     "tqdm>=4.66",
     "datasets>=2.18",
     "transformers>=4.40",
     "tensorboard>=2.16",
+    "flash-linear-attention==0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +23,53 @@ dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [
+    ".claude",
+    ".codex",
+    "data_cache",
+    "runs",
+    "tokenizers",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+include = ["flower", "scripts", "tests"]
+exclude = [
+    ".claude",
+    ".codex",
+    "data_cache",
+    "runs",
+    "tokenizers",
+]
 
 [tool.setuptools.packages.find]
 include = ["flower*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.13",
+    "ty>=0.0.37",
+]

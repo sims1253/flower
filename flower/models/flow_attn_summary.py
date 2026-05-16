@@ -11,7 +11,18 @@ from flower.models.summary_memory import SummaryMemoryBlock
 def build_fa_sm_model(config: ModelConfig) -> CausalLM:
     blocks = []
     for _ in range(config.num_layers):
-        block = SummaryMemoryBlock(config, MemoryRead(config, EulerFlow(config.d_model // config.num_heads, config.flow_steps, mode=config.flow_mode, step_size=config.flow_step_size)))
+        block = SummaryMemoryBlock(
+            config,
+            MemoryRead(
+                config,
+                EulerFlow(
+                    config.d_model // config.num_heads,
+                    config.flow_steps,
+                    mode=config.flow_mode,
+                    step_size=config.flow_step_size,
+                ),
+            ),
+        )
         block.local = FlowSelfAttention(config, config.local_window)
         blocks.append(block)
     return CausalLM(config, blocks)

@@ -54,9 +54,7 @@ class AffineCouplingLayer(nn.Module):
 class ConditionalCouplingFlow(nn.Module):
     def __init__(self, dim: int, cond_dim: int, layers: int = 2, hidden_dim: int | None = None) -> None:
         super().__init__()
-        self.layers = nn.ModuleList(
-            [AffineCouplingLayer(dim, cond_dim, hidden_dim) for _ in range(layers)]
-        )
+        self.layers = nn.ModuleList([AffineCouplingLayer(dim, cond_dim, hidden_dim) for _ in range(layers)])
 
     def forward(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         out = z

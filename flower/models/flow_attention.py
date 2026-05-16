@@ -17,7 +17,11 @@ class FlowSelfAttention(nn.Module):
         self.qkv = nn.Linear(config.d_model, config.d_model * 3)
         flow_steps = 1 if config.deep_shallow_flow and config.flow_steps > 1 else config.flow_steps
         self.q_flow = EulerFlow(self.head_dim, flow_steps, mode=config.flow_mode, step_size=config.flow_step_size)
-        self.k_flow = self.q_flow if config.flow_shared else EulerFlow(self.head_dim, flow_steps, mode=config.flow_mode, step_size=config.flow_step_size)
+        self.k_flow = (
+            self.q_flow
+            if config.flow_shared
+            else EulerFlow(self.head_dim, flow_steps, mode=config.flow_mode, step_size=config.flow_step_size)
+        )
         self.out = nn.Linear(config.d_model, config.d_model)
         self.q_flow.noise_std = config.noise_std
 
@@ -42,5 +46,7 @@ class FlowSelfAttention(nn.Module):
 
 
 def build_flow_attention_model(config: ModelConfig) -> CausalLM:
-    blocks = [TransformerBlock(config, FlowSelfAttention(config, config.local_window)) for _ in range(config.num_layers)]
+    blocks = [
+        TransformerBlock(config, FlowSelfAttention(config, config.local_window)) for _ in range(config.num_layers)
+    ]
     return CausalLM(config, blocks)

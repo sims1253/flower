@@ -12,6 +12,11 @@ wheels/
 # Run outputs and artifacts
 runs/
 reports/
+data_cache/
+.pytest_cache/
+.ruff_cache/
+.claude/
+.codex
 
 # Model weights
 *.pt

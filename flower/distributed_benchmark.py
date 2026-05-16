@@ -18,6 +18,7 @@ from flower.models import build_model
 
 UNUSED_PARAMETER_VARIANTS = {"fa_sm", "fa_fm"}
 
+
 def resolve_find_unused_parameters(value: str, variant: str) -> bool:
     if value == "auto":
         return variant in UNUSED_PARAMETER_VARIANTS
@@ -87,7 +88,9 @@ def run_benchmark(argv: list[str] | None = None) -> dict[str, Any] | None:
         find_unused_parameters = bool(cfg.training.find_unused_parameters)
     model = build_model(cfg.model).to(device)
     if use_ddp:
-        ddp_kwargs: dict[str, Any] = {"device_ids": [local_rank], "output_device": local_rank} if device.type == "cuda" else {}
+        ddp_kwargs: dict[str, Any] = (
+            {"device_ids": [local_rank], "output_device": local_rank} if device.type == "cuda" else {}
+        )
         model = DistributedDataParallel(model, find_unused_parameters=find_unused_parameters, **ddp_kwargs)
 
     optim = AdamW(model.parameters(), lr=cfg.training.lr)
@@ -108,7 +111,9 @@ def run_benchmark(argv: list[str] | None = None) -> dict[str, Any] | None:
         if loss is None:
             raise RuntimeError("loss was not computed")
         loss.backward()
-        trainable_parameters = model.module.parameters() if isinstance(model, DistributedDataParallel) else model.parameters()
+        trainable_parameters = (
+            model.module.parameters() if isinstance(model, DistributedDataParallel) else model.parameters()
+        )
         torch.nn.utils.clip_grad_norm_(trainable_parameters, cfg.training.grad_clip)
         optim.step()
         last_loss = float(loss.detach().cpu())

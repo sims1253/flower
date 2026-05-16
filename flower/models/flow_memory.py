@@ -24,7 +24,13 @@ class FlowMemoryBlock(nn.Module):
             flat_dim += 1
         self.flat_dim = flat_dim
         self.cond = nn.Linear(config.d_model, config.d_model)
-        self.flow = ConditionalCouplingFlow(flat_dim, config.d_model, layers=2)
+        # hidden_dim must scale modestly with d_model (NOT with flat_dim = slots*d_model).
+        # History: original default `hidden_dim = dim*2` gave 504M at d=256 (broken).
+        # First fix: `hidden_dim = 2*d_model` gave 49M at d=256 (fine) but 184M at d=384.
+        # Second fix: `hidden_dim = d_model//2` keeps fa_fm in the 40-70M regime alongside
+        # the other variants across the 256d-384d range.
+        flow_hidden = max(64, config.d_model // 2)
+        self.flow = ConditionalCouplingFlow(flat_dim, config.d_model, layers=2, hidden_dim=flow_hidden)
 
     def _flat_memory(self, memory: torch.Tensor) -> torch.Tensor:
         flat = memory.reshape(memory.shape[0], -1)

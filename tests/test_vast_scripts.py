@@ -42,7 +42,7 @@ def test_vast_search_uses_sdk_json_and_parser_fallback() -> None:
     text = (SCRIPTS / "vast_search.sh").read_text()
     assert "VastAI(api_key=api_key).search_offers" in text
     assert "vast_parse_offers.py" in text
-    assert "--limit \"$limit\"" in text
+    assert '--limit "$limit"' in text
 
 
 def test_vast_create_uses_sdk_and_preserves_safety_guards() -> None:
@@ -50,7 +50,7 @@ def test_vast_create_uses_sdk_and_preserves_safety_guards() -> None:
     helper_text = (SCRIPTS / "vast_create_instance.py").read_text()
     assert "vast_create_instance.py" in shell_text
     assert "vast create instance" not in shell_text
-    assert "validate_price \"$max_price\"" in shell_text
+    assert 'validate_price "$max_price"' in shell_text
     assert "require_yes" in shell_text
     assert "client.create_instance" in helper_text
     assert "--offer-type" in shell_text
@@ -67,7 +67,7 @@ def test_vast_stop_destroy_uses_sdk_and_preserves_safety_guards() -> None:
     assert "vast stop instance" not in text
     assert "client.destroy_instance" in text
     assert "client.stop_instance" in text
-    assert "VastAI(api_key=os.environ[\"VAST_API_KEY\"])" in text
+    assert 'VastAI(api_key=os.environ["VAST_API_KEY"])' in text
     assert "require_yes" in text
 
 
@@ -80,9 +80,9 @@ def test_vast_upload_and_pull_use_sdk_for_ssh_url() -> None:
     assert "IdentitiesOnly=yes" in common_text
     for name in ["vast_run_upload.sh", "vast_pull.sh"]:
         text = (SCRIPTS / name).read_text()
-        assert "vast_instance_info.py\" ssh-url" in text
+        assert 'vast_instance_info.py" ssh-url' in text
         assert "vast ssh-url" not in text
-        assert "build_ssh_opts \"$port\"" in text
+        assert 'build_ssh_opts "$port"' in text
 
 
 def test_existing_instance_sweep_script_uses_sweep_runner_without_create_or_destroy() -> None:
@@ -99,7 +99,7 @@ def test_tensorboard_script_uses_existing_instance_and_ssh_tunnel() -> None:
     text = (SCRIPTS / "vast_tensorboard.sh").read_text()
     assert "--instance-id" in text
     assert "uv run tensorboard" in text
-    assert "vast_instance_info.py\" ssh-url" in text
+    assert 'vast_instance_info.py" ssh-url' in text
     assert "ssh -L" in text
     assert "vast_create.sh" not in text
     assert "vast_stop_destroy.sh" not in text
@@ -118,7 +118,7 @@ def test_existing_instance_sweep_forwards_dry_run_only_when_requested() -> None:
                 f"""\
                 #!/usr/bin/bash
                 set -euo pipefail
-                target={SCRIPTS / 'vast_run_upload.sh'}
+                target={SCRIPTS / "vast_run_upload.sh"}
                 for ((idx = 1; idx <= $#; idx++)); do
                   if [[ ${{!idx}} == \"$target\" ]]; then
                     printf '%s\\n' \"${{@:idx}}\"
@@ -138,7 +138,6 @@ def test_existing_instance_sweep_forwards_dry_run_only_when_requested() -> None:
 
     assert "--dry-run" not in default_out.splitlines()
     assert "--dry-run" in dry_run_out.splitlines()
-
 
 
 def _parse_ssh_args(value: str) -> tuple[str, str, str]:
@@ -162,18 +161,18 @@ def test_vast_upload_and_pull_use_parsed_nondefault_port() -> None:
     assert _parse_ssh_args("ssh://root@ssh5.vast.ai:19420")[2] == "19420"
     for name in ["vast_run_upload.sh", "vast_pull.sh"]:
         text = (SCRIPTS / name).read_text()
-        assert "read -r user host port < <(ssh_args_from_url \"$ssh_url\")" in text
-        assert "build_ssh_opts \"$port\"" in text
+        assert 'read -r user host port < <(ssh_args_from_url "$ssh_url")' in text
+        assert 'build_ssh_opts "$port"' in text
 
 
 def test_vast_run_upload_groups_remote_background_pid_write() -> None:
     text = (SCRIPTS / "vast_run_upload.sh").read_text()
     assert "printf -v remote_cmd_q '%q' \"$remote_cmd\"" in text
-    assert "ssh \"${ssh_opts[@]}\" \"$user@$host\" \"bash -s -- $remote_dir_q $run_dir_q $remote_cmd_q\"" in text
-    assert "cd \"$remote_dir\"" in text
-    assert "mkdir -p \"$run_dir\"" in text
-    assert "nohup bash -lc \"$remote_cmd\" > \"$run_dir/remote.log\" 2>&1 &" in text
-    assert "printf '%s\\n' \"$!\" > \"$run_dir/remote.pid\"" in text
+    assert 'ssh "${ssh_opts[@]}" "$user@$host" "bash -s -- $remote_dir_q $run_dir_q $remote_cmd_q"' in text
+    assert 'cd "$remote_dir"' in text
+    assert 'mkdir -p "$run_dir"' in text
+    assert 'nohup bash -lc "$remote_cmd" > "$run_dir/remote.log" 2>&1 &' in text
+    assert 'printf \'%s\\n\' "$!" > "$run_dir/remote.pid"' in text
     assert "& echo \\$! > '$VAST_RUN_DIR/remote.pid'" not in text
 
 
@@ -198,7 +197,9 @@ def test_vast_default_image_uses_cuda128_for_broad_driver_compatibility() -> Non
 
 
 def test_vast_offer_parser_accepts_json_payload() -> None:
-    rows = vast_parse_offers.parse_offers('{"offers":[{"id":1,"gpu_name":"RTX 4090","dph_total":0.19,"reliability":0.99,"inet_up":50,"inet_down":100}]}')
+    rows = vast_parse_offers.parse_offers(
+        '{"offers":[{"id":1,"gpu_name":"RTX 4090","dph_total":0.19,"reliability":0.99,"inet_up":50,"inet_down":100}]}'
+    )
     assert vast_parse_offers.normalize_offer(rows[0]) == {
         "id": 1,
         "gpu": "RTX 4090",

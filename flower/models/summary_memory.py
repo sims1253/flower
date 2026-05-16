@@ -18,15 +18,21 @@ class SummaryMemoryBlock(nn.Module):
         self.mem_read = memory_read or MemoryRead(config)
         self.ln2 = nn.LayerNorm(config.d_model)
         self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
-        self.token_mlp = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model))
-        self.mem_mlp = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model))
-        self.update = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model))
+        self.token_mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model)
+        )
+        self.mem_mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model)
+        )
+        self.update = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model)
+        )
         self.agg_query = nn.Parameter(torch.zeros(1, 1, config.d_model))
         self.perceiver_latents = nn.Parameter(torch.randn(1, config.memory_slots, config.d_model) * 0.02)
         self.perceiver = nn.MultiheadAttention(config.d_model, config.num_heads, batch_first=True)
         self.short_project = nn.Linear(config.d_model, config.d_model)
-        if config.memory_aggregation not in {"sum", "mean", "max", "attention"}:
-            raise ValueError("memory_aggregation must be sum, mean, max, or attention")
+        if config.memory_aggregation not in {"sum", "mean", "max", "attention", "orthogonal"}:
+            raise ValueError("memory_aggregation must be sum, mean, max, attention, or orthogonal")
         if config.summary_style not in {"deepsets", "perceiver"}:
             raise ValueError("summary_style must be deepsets or perceiver")
 
@@ -38,13 +44,33 @@ class SummaryMemoryBlock(nn.Module):
         mode = self.config.memory_aggregation
         if mode == "sum":
             return x.sum(dim=1, keepdim=True)
-        if mode == "max":
+        # `orthogonal` shares the max-pool aggregation with `max`; the orthogonality
+        # constraint is applied later in `_update_memory` as a projection on the
+        # candidate update vector, not on the aggregation step.
+        if mode == "max" or mode == "orthogonal":
             return x.max(dim=1, keepdim=True).values
         if mode == "attention":
             q = self.agg_query.expand(x.shape[0], -1, -1)
             weights = torch.softmax(q @ x.transpose(1, 2) / (x.shape[-1] ** 0.5), dim=-1)
             return weights @ x
         return x.mean(dim=1, keepdim=True)
+
+    @staticmethod
+    def _orthogonal_residual(update: torch.Tensor, memory: torch.Tensor, eps: float) -> torch.Tensor:
+        """Project `update` onto the orthogonal complement of `memory` (per batch).
+
+        update: (B, S, D)  candidate write to each memory slot
+        memory: (B, S, D)  current contents of those slots
+        Returns the component of `update` that's orthogonal to the row span of `memory`,
+        so the additive write minimally overlaps with what's already stored (LATTICE A1).
+        """
+        # Normalise rows of memory to get an approximate orthonormal basis. For S<=D this
+        # works as a cheap stand-in for full Gram-Schmidt; we project each update row
+        # against each normalised memory row independently.
+        mem_norm = memory / (memory.norm(dim=-1, keepdim=True) + eps)  # (B, S, D)
+        # Coefficients of update along each memory row: (B, S, 1) via batched dot product.
+        coeff = (update * mem_norm).sum(dim=-1, keepdim=True)
+        return update - coeff * mem_norm
 
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         if self.config.summary_style == "perceiver":
@@ -55,7 +81,10 @@ class SummaryMemoryBlock(nn.Module):
             token_summary = self._aggregate(x).expand(x.shape[0], self.config.memory_slots, x.shape[-1])
         long_mem = memory[:, : self.config.memory_slots]
         combined = self.token_mlp(token_summary) + self.mem_mlp(long_mem)
-        long_mem = long_mem + self.update(combined) / max(1, self.config.num_layers)
+        candidate_update = self.update(combined) / max(1, self.config.num_layers)
+        if self.config.memory_aggregation == "orthogonal":
+            candidate_update = self._orthogonal_residual(candidate_update, long_mem, self.config.orthogonal_eps)
+        long_mem = long_mem + candidate_update
         if not self.config.hierarchical_memory:
             return long_mem
         short = self.short_project(x[:, -self.config.short_memory_slots :])

@@ -10,7 +10,23 @@ def test_smoke_training_step_runs():
 
 def test_smoke_training_writes_validation_metrics(tmp_path):
     metrics_path = tmp_path / "metrics.json"
-    metrics = train(["--variant", "vanilla_local", "--smoke", "--steps", "1", "--device", "cpu", "--validation-steps", "1", "--metrics-json", str(metrics_path), "--log-backend", "none"])
+    metrics = train(
+        [
+            "--variant",
+            "vanilla_local",
+            "--smoke",
+            "--steps",
+            "1",
+            "--device",
+            "cpu",
+            "--validation-steps",
+            "1",
+            "--metrics-json",
+            str(metrics_path),
+            "--log-backend",
+            "none",
+        ]
+    )
 
     assert metrics["train_loss"] > 0
     assert metrics["val_loss"] > 0

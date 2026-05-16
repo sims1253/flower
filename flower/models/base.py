@@ -23,7 +23,9 @@ def causal_mask(seq_len: int, device: torch.device, local_window: int | None = N
     return mask
 
 
-def scaled_dot_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+def scaled_dot_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None
+) -> torch.Tensor:
     scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
     if mask is not None:
         scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
@@ -55,16 +57,39 @@ class CausalSelfAttention(nn.Module):
         self.local_window = local_window
         self.qkv = nn.Linear(config.d_model, config.d_model * 3)
         self.out = nn.Linear(config.d_model, config.d_model)
+        # S2.4: optional RBF distance kernel as additive attention bias.
+        # rbf bias = -scale * (i-j)^2 / window^2, learnable scale, per-head.
+        self.kernel_bias = getattr(config, "local_attn_kernel_bias", "none")
+        if self.kernel_bias not in {"none", "rbf"}:
+            raise ValueError("local_attn_kernel_bias must be 'none' or 'rbf'")
+        if self.kernel_bias == "rbf":
+            init_scale = float(getattr(config, "local_attn_rbf_scale", 4.0))
+            self.rbf_log_scale = nn.Parameter(torch.full((self.num_heads,), math.log(max(init_scale, 1e-3))))
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, dim = x.shape
         return x.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+    def _rbf_bias(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        # Normalised positions so behaviour is window-size invariant.
+        denom = float(self.local_window) if self.local_window is not None else float(seq_len)
+        idx = torch.arange(seq_len, device=device, dtype=dtype) / max(denom, 1.0)
+        d2 = (idx[:, None] - idx[None, :]).pow(2)  # (T, T)
+        scale = self.rbf_log_scale.exp().to(device=device, dtype=dtype).view(self.num_heads, 1, 1)
+        return (-scale * d2).unsqueeze(0)  # (1, H, T, T)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q), self._split(k), self._split(v)
         mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
-        out = scaled_dot_attention(q, k, v, mask)
+        if self.kernel_bias == "rbf":
+            scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+            scores = scores + self._rbf_bias(x.shape[1], x.device, scores.dtype)
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            attn = torch.softmax(scores, dim=-1)
+            out = attn @ v
+        else:
+            out = scaled_dot_attention(q, k, v, mask)
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
@@ -102,8 +127,13 @@ class CausalLM(nn.Module):
         x = self.token(input_ids) + self.pos(pos).unsqueeze(0)
         memory = None
         diagnostics: dict[str, Any] = {}
-        for block in self.blocks:
-            x, memory = block(x, memory)
+        # A2 looped transformer: run the block stack `loop_count` times. Memory state
+        # carries across loops, so the bank acts as a scratchpad / persistent state.
+        # loop_count=1 reproduces the standard single-pass behaviour.
+        loops = max(1, getattr(self.config, "loop_count", 1))
+        for _ in range(loops):
+            for block in self.blocks:
+                x, memory = block(x, memory)
         logits = self.head(self.ln(x))
         loss = None
         if labels is not None:

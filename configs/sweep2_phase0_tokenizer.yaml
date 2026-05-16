@@ -1,0 +1,85 @@
+# Sweep 2 — Phase 0: Tokenizer Ablation
+#
+# Question: which tokenizer should the Phase 1 architecture sweep use?
+# Hypothesis (per SWEEP_RESEARCH_BRIEF.md §H): GPT-2's 50K vocab puts 80% of
+# parameters into the embedding lookup; smaller vocab unlocks the architectural
+# improvements by giving them parameter headroom.
+#
+# Matrix: {vanilla_local, summary_hierarchical_max} × {gpt2 50K, custom 4K BPE, byte 256}
+# = 6 trials × 10k steps each. AdamW only (Muon comparison happens in Phase 1).
+#
+# Note: vocab_size MUST match the tokenizer (sanity-checked in build_model).
+# All variants use the same seq_len so direct PPL is informative; the aggregator
+# will additionally compute bits-per-byte for tokenizer-invariant comparison.
+
+sweep:
+  name: sweep2_phase0_tokenizer
+  defaults:
+    data:
+      dataset: fineweb-edu
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 32        # match Sweep 1 LR/batch; new-scale model at batch=64 OOMs on 32GB cards.
+      steps: 10000
+      lr: 0.0003            # Sweep 1 LR (no scaling needed at matching batch).
+      warmup_steps: 500
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      validation_steps: 100
+      validation_interval: 1000
+      optimizer: adamw
+    model:
+      # Scaled-up "new" config: ~30M params with GPT-2 vocab (the 1.5-2× scale step from Sweep 1).
+      # Embedding fraction stays ~65% with GPT-2 — drops to ~10% with 4K BPE / byte (the brief's H1 point).
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 12        # bumped proportionally with model dim
+      short_memory_slots: 4   # 12+4=16 total: divisible by 1/2/4 banks for partitioned variants
+
+  variants:
+    # ===== Anchor: hier_max @ Sweep 1 config (256d, 4L, batch=32) for direct PPL comparison =====
+    - name: phase0_anchor_hier_max_gpt2_old
+      data: {tokenizer: gpt2}
+      training: {batch_size: 32, lr: 0.0003}
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        vocab_size: 50257
+        d_model: 256
+        num_heads: 4
+        num_layers: 4
+        ffn_dim: 1024
+        memory_slots: 8
+        short_memory_slots: 4
+
+    # ===== Phase 0 proper: 6 trials × {3 tokenizers × 2 architectures} at NEW config =====
+    - name: phase0_vanilla_gpt2
+      data: {tokenizer: gpt2}
+      model: {variant: vanilla_local, vocab_size: 50257}
+
+    - name: phase0_hier_max_gpt2
+      data: {tokenizer: gpt2}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, vocab_size: 50257}
+
+    - name: phase0_vanilla_bpe4k
+      data: {tokenizer: "custom:tokenizers/fineweb_4k.json"}
+      model: {variant: vanilla_local, vocab_size: 4096}
+
+    - name: phase0_hier_max_bpe4k
+      data: {tokenizer: "custom:tokenizers/fineweb_4k.json"}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, vocab_size: 4096}
+
+    - name: phase0_vanilla_byte
+      data: {tokenizer: byte}
+      model: {variant: vanilla_local, vocab_size: 256}
+
+    - name: phase0_hier_max_byte
+      data: {tokenizer: byte}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, vocab_size: 256}

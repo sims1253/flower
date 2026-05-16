@@ -1,0 +1,67 @@
+# Sweep 4 Phase 1: memory architecture screen at matched training recipe.
+sweep:
+  name: sweep4_phase1_memory_bake_off
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 128
+      steps: 10000
+      lr: 0.000283
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 2500
+      validation_steps: 200
+      checkpoint_interval: 2500
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: adamw
+      memory_lr: 0.0
+      seed: 0
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: true
+      memory_aggregation: max
+      flow_steps: 3
+      phase_memory_dim: 64
+      engram_table_size: 8192
+      engram_ngram_min: 2
+      engram_ngram_max: 3
+      engram_scale: 0.1
+  variants:
+    - name: hier_max_16_control
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+    - name: engram_lite
+      model:
+        variant: engram_lite
+    - name: flow_meanflow
+      model:
+        variant: flow_meanflow
+    - name: flow_pma
+      model:
+        variant: flow_pma
+        flow_pma_layers: 2
+    - name: titans_mac
+      model:
+        variant: titans_mac
+    - name: fla_gdn
+      model:
+        variant: fla_gdn

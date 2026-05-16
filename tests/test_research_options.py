@@ -5,21 +5,39 @@ import torch
 
 from flower.config import ModelConfig, load_config
 from flower.eval import evaluate
-from flower.train import train
 from flower.models import build_model
-
+from flower.train import train
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def tiny_config(**kwargs):
-    values = dict(variant="fa_sm", vocab_size=128, d_model=32, num_heads=4, num_layers=1, ffn_dim=64, max_seq_len=16, local_window=4, memory_slots=4, flow_steps=1)
+    values = dict(
+        variant="fa_sm",
+        vocab_size=128,
+        d_model=32,
+        num_heads=4,
+        num_layers=1,
+        ffn_dim=64,
+        max_seq_len=16,
+        local_window=4,
+        memory_slots=4,
+        flow_steps=1,
+    )
     values.update(kwargs)
     return ModelConfig(**values)
 
 
 def test_config_constructs_new_research_options():
-    cfg = tiny_config(flow_mode="shortcut", memory_aggregation="attention", summary_style="perceiver", hierarchical_memory=True, memory_kernel_bias="rbf", memory_update_frequency=2, noise_std=0.01)
+    cfg = tiny_config(
+        flow_mode="shortcut",
+        memory_aggregation="attention",
+        summary_style="perceiver",
+        hierarchical_memory=True,
+        memory_kernel_bias="rbf",
+        memory_update_frequency=2,
+        noise_std=0.01,
+    )
     model = build_model(cfg)
     tokens = torch.randint(0, cfg.vocab_size, (2, 16))
     out = model(tokens, labels=tokens)
@@ -40,7 +58,19 @@ def test_aggregation_and_flow_modes_smoke():
 
 def test_eval_writes_metrics_json(tmp_path):
     metrics_path = tmp_path / "metrics.json"
-    metrics = evaluate(["--variant", "flow_attention", "--smoke", "--batches", "1", "--device", "cpu", "--metrics-json", str(metrics_path)])
+    metrics = evaluate(
+        [
+            "--variant",
+            "flow_attention",
+            "--smoke",
+            "--batches",
+            "1",
+            "--device",
+            "cpu",
+            "--metrics-json",
+            str(metrics_path),
+        ]
+    )
     written = json.loads(metrics_path.read_text())
     assert written["variant"] == "flow_attention"
     assert written["gpu_memory_allocated"] == 0
@@ -49,7 +79,9 @@ def test_eval_writes_metrics_json(tmp_path):
 
 def test_train_writes_metrics_json(tmp_path):
     metrics_path = tmp_path / "train_metrics.json"
-    metrics = train(["--variant", "fa_sm", "--smoke", "--steps", "1", "--device", "cpu", "--metrics-json", str(metrics_path)])
+    metrics = train(
+        ["--variant", "fa_sm", "--smoke", "--steps", "1", "--device", "cpu", "--metrics-json", str(metrics_path)]
+    )
     written = json.loads(metrics_path.read_text())
     assert written["variant"] == "fa_sm"
     assert written["steps"] == 1

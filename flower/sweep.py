@@ -121,7 +121,9 @@ def run_sweep(argv: list[str] | None = None) -> dict[str, Any]:
             if args.smoke:
                 train_args.append("--smoke")
             metrics = train(train_args)
-            summary["variants"].append({"name": name, "metrics_json": config["training"]["metrics_json"], "metrics": metrics})
+            summary["variants"].append(
+                {"name": name, "metrics_json": config["training"]["metrics_json"], "metrics": metrics}
+            )
 
     summary["finished_at"] = time.time()
     summary["variant_count"] = len(summary["variants"])

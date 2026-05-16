@@ -1,0 +1,140 @@
+# Sweep 2 — Phase 1: Architecture Sweep
+#
+# Runs after Phase 0 selects a tokenizer. The `data.tokenizer` and
+# `model.vocab_size` defaults below assume GPT-2 50K (the Sweep 1 reference); if
+# Phase 0 picks a different tokenizer, override at launch with --variants or by
+# editing this file (look for `tokenizer:` and `vocab_size:` in defaults).
+#
+# Variants stack the principled upgrades on top of summary_hierarchical_max,
+# plus the wild card (phase_associative) and the partitioned-bank ablation.
+# Both AdamW and Muon arms run for every variant. I8 dual-LR is opt-in via
+# memory_lr.
+#
+# Total: 22 variants × 10k steps. On 2× RTX PRO 6000 WS in parallel: ~1-2 hours.
+
+sweep:
+  name: sweep2_phase1_arch
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"  # Phase 0 winner: 4K BPE > byte > GPT-2
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 256       # 8× Sweep 1 — fits 96GB cards w/ ~45GB used.
+      steps: 2500           # 8× batch × 2500 = 2× Sweep 1 data budget per trial.
+      lr: 0.0004            # 1.33× Sweep 1 — sqrt-rule of √8 ≈ 2.8× was too aggressive (divergence).
+      warmup_steps: 500     # 20% of run — more cautious LR ramp prevents early instability.
+      validation_interval: 500
+      warmup_steps: 500
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      validation_steps: 100
+      validation_interval: 1000
+      optimizer: adamw
+      memory_lr: 0.0  # I8 dual-LR; 0 = disabled (single-LR like Sweep 1).
+    model:
+      # ~25M-param scaled-up config with 4K BPE (Phase 0 winner).
+      vocab_size: 4096                     # 4K BPE; embedding now ~6% of params instead of 64%
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 12
+      short_memory_slots: 4                # total=16 slots, divisible by partitioned-bank counts (2, 4, 8)
+      flow_steps: 3
+      phase_memory_dim: 64
+
+  variants:
+    # ===== AdamW arm =====
+    - name: p1_vanilla_adamw
+      training: {optimizer: adamw}
+      model: {variant: vanilla_local}
+
+    - name: p1_hier_max_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: p1_hier_orthogonal_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: orthogonal}
+
+    - name: p1_hier_max_looped_x2_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, loop_count: 2}
+
+    - name: p1_hier_max_rbf_local_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, local_attn_kernel_bias: rbf}
+
+    - name: p1_phase_memory_adamw
+      training: {optimizer: adamw}
+      model: {variant: phase_memory}
+
+    - name: p1_hier_max_16slots_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 16}
+
+    - name: p1_hier_max_32slots_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 32}
+
+    - name: p1_partitioned_4banks_adamw
+      training: {optimizer: adamw}
+      model: {variant: partitioned_memory, hierarchical_memory: true, num_memory_banks: 4}
+
+    - name: p1_partitioned_2banks_adamw
+      training: {optimizer: adamw}
+      model: {variant: partitioned_memory, hierarchical_memory: true, num_memory_banks: 2}
+
+    - name: p1_hier_max_dual_lr_adamw
+      training: {optimizer: adamw, memory_lr: 0.001}  # I8: 3.3× backbone LR for memory params
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: p1_fa_fm_fixed_adamw
+      training: {optimizer: adamw}
+      model: {variant: fa_fm}                          # ~69M at new scale (coupling hidden=d_model/2)
+
+    # ===== Muon arm =====
+    - name: p1_vanilla_muon
+      training: {optimizer: muon}
+      model: {variant: vanilla_local}
+
+    - name: p1_hier_max_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: p1_hier_orthogonal_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: orthogonal}
+
+    - name: p1_hier_max_looped_x2_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, loop_count: 2}
+
+    - name: p1_hier_max_rbf_local_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, local_attn_kernel_bias: rbf}
+
+    - name: p1_phase_memory_muon
+      training: {optimizer: muon}
+      model: {variant: phase_memory}
+
+    - name: p1_hier_max_16slots_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 16}
+
+    - name: p1_partitioned_4banks_muon
+      training: {optimizer: muon}
+      model: {variant: partitioned_memory, hierarchical_memory: true, num_memory_banks: 4}
+
+    - name: p1_hier_max_dual_lr_muon
+      training: {optimizer: muon, memory_lr: 0.05}  # I8 with Muon: 2.5× the Muon backbone LR
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: p1_fa_fm_fixed_muon
+      training: {optimizer: muon}
+      model: {variant: fa_fm}

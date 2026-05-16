@@ -1,0 +1,57 @@
+# Sweep 3 — Phase B: Memory-slot fine-grain
+#
+# Sweep 2 Phase 2 30k showed non-monotonic slot scaling: 12 → 22.2, 16 → 12.7,
+# 32 → 19.4. The sweet spot is somewhere between 12 and 32, with 16 as the
+# best-known. This phase pins the curve shape with fine-grain trials.
+#
+# 16 is already done (s2_phase2 = 12.69 PPL). Skip 12 (= baseline = 22.20)
+# and 32 (= 19.44). Run {14, 18, 20, 24} = 4 new trials × 30k.
+#
+# Defaults match Phase 2 30k.
+
+sweep:
+  name: sweep3_phaseB_slot_finegrain
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 128
+      steps: 30000
+      lr: 0.000283
+      warmup_steps: 1000
+      validation_interval: 5000
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      validation_steps: 200
+      optimizer: adamw
+      memory_lr: 0.0
+      save_checkpoints: true
+      checkpoint_interval: 2500
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      short_memory_slots: 4
+      flow_steps: 3
+      phase_memory_dim: 64
+      variant: summary_memory
+      hierarchical_memory: true
+      memory_aggregation: max
+
+  variants:
+    - name: s3_slots_14_30k
+      model: {memory_slots: 14}
+    - name: s3_slots_18_30k
+      model: {memory_slots: 18}
+    - name: s3_slots_20_30k
+      model: {memory_slots: 20}
+    - name: s3_slots_24_30k
+      model: {memory_slots: 24}

@@ -95,8 +95,8 @@ validate_price() {
   python3 - "$price" <<'PY'
 import sys
 price=float(sys.argv[1])
-if price > 0.20:
-    raise SystemExit(f"ERROR: max price {price:.4f} exceeds hard safety default 0.20/hr")
+if price > 1.00:
+    raise SystemExit(f"ERROR: max price {price:.4f} exceeds hard safety cap 1.00/hr")
 PY
 }
 

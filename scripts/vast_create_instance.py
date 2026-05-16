@@ -7,7 +7,7 @@ import os
 import sys
 from typing import Any
 
-HARD_MAX_PRICE = 0.20
+HARD_MAX_PRICE = 1.00
 
 
 def positive_price(value: str) -> float:

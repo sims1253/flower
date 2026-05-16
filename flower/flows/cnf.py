@@ -39,7 +39,9 @@ class VectorField(nn.Module):
 
 
 class EulerFlow(nn.Module):
-    def __init__(self, dim: int, steps: int = 3, hidden_dim: int | None = None, mode: str = "euler", step_size: float = 1.0) -> None:
+    def __init__(
+        self, dim: int, steps: int = 3, hidden_dim: int | None = None, mode: str = "euler", step_size: float = 1.0
+    ) -> None:
         super().__init__()
         if steps < 1:
             raise ValueError("steps must be >= 1")

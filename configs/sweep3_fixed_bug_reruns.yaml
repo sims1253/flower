@@ -1,0 +1,68 @@
+# Correctness reruns after fixing training.lr_schedule / warmup handling.
+#
+# These runs keep the old metrics intact and write fresh corrected metrics under
+# runs/local_5090/fixed_bug_reruns. They answer the two report-sensitive
+# questions:
+#   1. Does the current AdamW winner change when warmup is actually applied?
+#   2. Does the "safer Muon" retry still fail when muon_lr, not just lr, is set
+#      to 1e-4 and warmup is actually applied?
+
+sweep:
+  name: sweep3_fixed_bug_reruns
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 128
+      steps: 30000
+      lr: 0.000283
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 5000
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      validation_steps: 200
+      optimizer: adamw
+      memory_lr: 0.0
+      save_checkpoints: true
+      checkpoint_interval: 2500
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 16
+      short_memory_slots: 4
+      flow_steps: 3
+      phase_memory_dim: 64
+
+  variants:
+    - name: fixed_p2_hier_max_16slots_adamw_30k
+      training:
+        optimizer: adamw
+        lr: 0.000283
+        warmup_steps: 1000
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+
+    - name: fixed_s3_hier_max_muon_safer_30k
+      training:
+        optimizer: muon
+        muon_lr: 0.0001
+        lr: 0.0001
+        warmup_steps: 2000
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16

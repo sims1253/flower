@@ -42,6 +42,7 @@ def test_synthetic_validation_stream_uses_separate_seed() -> None:
 
     assert not torch.equal(train_batch, val_batch)
 
+
 def test_fineweb_validation_requires_distinct_split() -> None:
     from flower.data import validation_token_batches
 

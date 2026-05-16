@@ -1,0 +1,74 @@
+# Sweep 4 Phase 0: corrected Muon ladder after warmup/muon_lr bug fix.
+sweep:
+  name: sweep4_phase0_remuon
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 128
+      steps: 10000
+      lr: 0.000283
+      lr_schedule: linear_warmup
+      validation_interval: 2500
+      validation_steps: 200
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: muon
+      muon_momentum: 0.95
+      memory_lr: 0.0
+      save_checkpoints: true
+      checkpoint_interval: 2500
+      seed: 0
+      composite_eval: true
+    model:
+      variant: summary_memory
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 64
+      hierarchical_memory: true
+      memory_aggregation: max
+      memory_slots: 16
+      short_memory_slots: 4
+      flow_steps: 3
+      phase_memory_dim: 64
+  variants:
+    - {name: muon_lr1e-4_ns5_warm1k, training: {muon_lr: 0.0001, muon_ns_steps: 5, warmup_steps: 1000}}
+    - {name: muon_lr1e-4_ns5_warm2k, training: {muon_lr: 0.0001, muon_ns_steps: 5, warmup_steps: 2000}}
+    - {name: muon_lr1e-4_ns5_warm4k, training: {muon_lr: 0.0001, muon_ns_steps: 5, warmup_steps: 4000}}
+    - {name: muon_lr1e-4_ns7_warm1k, training: {muon_lr: 0.0001, muon_ns_steps: 7, warmup_steps: 1000}}
+    - {name: muon_lr1e-4_ns7_warm2k, training: {muon_lr: 0.0001, muon_ns_steps: 7, warmup_steps: 2000}}
+    - {name: muon_lr1e-4_ns7_warm4k, training: {muon_lr: 0.0001, muon_ns_steps: 7, warmup_steps: 4000}}
+    - {name: muon_lr3e-4_ns5_warm1k, training: {muon_lr: 0.0003, muon_ns_steps: 5, warmup_steps: 1000}}
+    - {name: muon_lr3e-4_ns5_warm2k, training: {muon_lr: 0.0003, muon_ns_steps: 5, warmup_steps: 2000}}
+    - {name: muon_lr3e-4_ns5_warm4k, training: {muon_lr: 0.0003, muon_ns_steps: 5, warmup_steps: 4000}}
+    - {name: muon_lr3e-4_ns7_warm1k, training: {muon_lr: 0.0003, muon_ns_steps: 7, warmup_steps: 1000}}
+    - {name: muon_lr3e-4_ns7_warm2k, training: {muon_lr: 0.0003, muon_ns_steps: 7, warmup_steps: 2000}}
+    - {name: muon_lr3e-4_ns7_warm4k, training: {muon_lr: 0.0003, muon_ns_steps: 7, warmup_steps: 4000}}
+    - {name: muon_lr1e-3_ns5_warm1k, training: {muon_lr: 0.001, muon_ns_steps: 5, warmup_steps: 1000}}
+    - {name: muon_lr1e-3_ns5_warm2k, training: {muon_lr: 0.001, muon_ns_steps: 5, warmup_steps: 2000}}
+    - {name: muon_lr1e-3_ns5_warm4k, training: {muon_lr: 0.001, muon_ns_steps: 5, warmup_steps: 4000}}
+    - {name: muon_lr1e-3_ns7_warm1k, training: {muon_lr: 0.001, muon_ns_steps: 7, warmup_steps: 1000}}
+    - {name: muon_lr1e-3_ns7_warm2k, training: {muon_lr: 0.001, muon_ns_steps: 7, warmup_steps: 2000}}
+    - {name: muon_lr1e-3_ns7_warm4k, training: {muon_lr: 0.001, muon_ns_steps: 7, warmup_steps: 4000}}
+    - {name: muon_lr3e-3_ns5_warm1k, training: {muon_lr: 0.003, muon_ns_steps: 5, warmup_steps: 1000}}
+    - {name: muon_lr3e-3_ns5_warm2k, training: {muon_lr: 0.003, muon_ns_steps: 5, warmup_steps: 2000}}
+    - {name: muon_lr3e-3_ns5_warm4k, training: {muon_lr: 0.003, muon_ns_steps: 5, warmup_steps: 4000}}
+    - {name: muon_lr3e-3_ns7_warm1k, training: {muon_lr: 0.003, muon_ns_steps: 7, warmup_steps: 1000}}
+    - {name: muon_lr3e-3_ns7_warm2k, training: {muon_lr: 0.003, muon_ns_steps: 7, warmup_steps: 2000}}
+    - {name: muon_lr3e-3_ns7_warm4k, training: {muon_lr: 0.003, muon_ns_steps: 7, warmup_steps: 4000}}
+    - name: phase_memory_adamw_retest
+      training: {optimizer: adamw, lr: 0.000283, warmup_steps: 1000}
+      model: {variant: phase_memory}
+    - name: dual_lr_1e-4_adamw_retest
+      training: {optimizer: adamw, lr: 0.000283, memory_lr: 0.0001, warmup_steps: 1000}
+    - name: looped_x2_adamw_retest
+      training: {optimizer: adamw, lr: 0.000283, warmup_steps: 1000}
+      model: {loop_count: 2}

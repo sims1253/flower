@@ -1,0 +1,121 @@
+# Sweep 2 — Memory-Augmented Attention, Phase 1
+#
+# Goal: stack the Sweep 1 winner (summary_hierarchical_max) against principled
+# upgrades and one wild card, with both AdamW and Muon optimizers.
+#
+# Phase 1 is intended to run at 10k steps for quick filtering. The trainer's
+# --steps flag overrides; for full 30k, drop --steps. For Phase 2, take the top 3-5
+# variants and re-run with --steps 30000.
+#
+# All variants share the same model size as Sweep 1: 4 layers / 256 dim / ~16-20M params,
+# seq_len=512, local_window=64, GPT-2 tokenizer, FineWeb-Edu streaming.
+
+sweep:
+  name: research_sweep2
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: gpt2
+      split: train
+      validation_split: validation
+      sequence_length: 512
+      streaming: true
+    training:
+      batch_size: 32
+      steps: 30000
+      lr: 0.0003
+      warmup_steps: 1000
+      grad_clip: 1.0
+      device: auto
+      metrics_json: runs/metrics.json
+      log_backend: tensorboard
+      validation_steps: 100
+      validation_interval: 1000
+      optimizer: adamw
+    model:
+      vocab_size: 50257
+      d_model: 256
+      num_heads: 4
+      num_layers: 4
+      ffn_dim: 1024
+      max_seq_len: 512
+      local_window: 64
+      memory_slots: 8
+      short_memory_slots: 4
+      flow_steps: 3
+      phase_memory_dim: 64
+
+  variants:
+    # ---- AdamW arm: matches Sweep 1 conditions for direct comparison ----
+    - name: s2_vanilla_local_adamw
+      training: {optimizer: adamw}
+      model: {variant: vanilla_local}
+
+    - name: s2_hier_max_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: s2_hier_orthogonal_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: orthogonal}
+
+    - name: s2_hier_max_looped_x2_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, loop_count: 2}
+
+    - name: s2_hier_max_rbf_local_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, local_attn_kernel_bias: rbf}
+
+    - name: s2_phase_memory_adamw
+      training: {optimizer: adamw}
+      model: {variant: phase_memory}
+
+    - name: s2_hier_max_16slots_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 16}
+
+    - name: s2_hier_max_32slots_adamw
+      training: {optimizer: adamw}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 32}
+
+    - name: s2_fa_fm_fixed_adamw
+      training: {optimizer: adamw}
+      model: {variant: fa_fm}
+
+    # ---- Muon arm: same architectures, Muon optimizer ----
+    - name: s2_vanilla_local_muon
+      training: {optimizer: muon}
+      model: {variant: vanilla_local}
+
+    - name: s2_hier_max_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max}
+
+    - name: s2_hier_orthogonal_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: orthogonal}
+
+    - name: s2_hier_max_looped_x2_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, loop_count: 2}
+
+    - name: s2_hier_max_rbf_local_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, local_attn_kernel_bias: rbf}
+
+    - name: s2_phase_memory_muon
+      training: {optimizer: muon}
+      model: {variant: phase_memory}
+
+    - name: s2_hier_max_16slots_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 16}
+
+    - name: s2_hier_max_32slots_muon
+      training: {optimizer: muon}
+      model: {variant: summary_memory, hierarchical_memory: true, memory_aggregation: max, memory_slots: 32}
+
+    - name: s2_fa_fm_fixed_muon
+      training: {optimizer: muon}
+      model: {variant: fa_fm}

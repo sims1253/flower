@@ -87,7 +87,7 @@ def parse_table(text: str) -> list[dict[str, Any]]:
         parts = re.split(r"\s{2,}", line.strip(), maxsplit=max(len(headers) - 1, 0))
         if len(parts) < 2:
             continue
-        rows.append(dict(zip(headers, parts)))
+        rows.append(dict(zip(headers, parts, strict=False)))
     return rows
 
 
@@ -103,11 +103,7 @@ def main() -> int:
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else 20
     max_price = float(sys.argv[2]) if len(sys.argv) > 2 else 0.20
     rows = parse_offers(sys.stdin.read())
-    rows = [
-        row
-        for row in rows
-        if _as_float(_field(row, "dph_total", "dph_base", "dph", "$/hr", "PRICE")) <= max_price
-    ]
+    rows = [row for row in rows if _as_float(_field(row, "dph_total", "dph_base", "dph", "$/hr", "PRICE")) <= max_price]
     rows = sorted(rows, key=lambda r: _as_float(_field(r, "dph_total", "dph_base", "dph", "$/hr", "PRICE")))[:limit]
     for row in rows:
         print(json.dumps(normalize_offer(row), sort_keys=True))

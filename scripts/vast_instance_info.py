@@ -9,7 +9,9 @@ from typing import Any
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fetch Vast.ai instance connection/status information using the Python SDK.")
+    parser = argparse.ArgumentParser(
+        description="Fetch Vast.ai instance connection/status information using the Python SDK."
+    )
     parser.add_argument("action", choices=["ssh-url", "status"])
     parser.add_argument("instance_id", type=int)
     return parser
