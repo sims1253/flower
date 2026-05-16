@@ -129,6 +129,7 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     parser.add_argument("--variant", type=str, default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--metrics-json", type=str, default=None)
@@ -148,6 +149,8 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         overrides["training"]["steps"] = args.steps
     if args.batch_size is not None:
         overrides["training"]["batch_size"] = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        overrides["training"]["gradient_accumulation_steps"] = args.gradient_accumulation_steps
     if args.device:
         overrides["training"]["device"] = args.device
     if args.metrics_json:
@@ -238,20 +241,24 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     model.train()
     try:
         for step in range(resume_step + 1, cfg.training.steps + 1):
-            input_ids = next(batches)
+            accum_steps = max(1, int(cfg.training.gradient_accumulation_steps))
             for opt in optims:
                 opt.zero_grad(set_to_none=True)
-            out = model(input_ids, labels=input_ids)
-            loss = out["loss"]
-            if loss is None:
-                raise RuntimeError("loss was not computed")
-            loss.backward()
+            step_loss = 0.0
+            for _ in range(accum_steps):
+                input_ids = next(batches)
+                out = model(input_ids, labels=input_ids)
+                loss = out["loss"]
+                if loss is None:
+                    raise RuntimeError("loss was not computed")
+                (loss / accum_steps).backward()
+                step_loss += float(loss.detach().cpu())
+                tokens += input_ids.numel()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
             apply_lr_schedule(optims, step, cfg.training.warmup_steps, cfg.training.lr_schedule)
             for opt in optims:
                 opt.step()
-            last_loss = float(loss.detach().cpu())
-            tokens += input_ids.numel()
+            last_loss = step_loss / accum_steps
             should_log = step == 1 or step % log_interval == 0 or step == cfg.training.steps
             if writer is not None and should_log:
                 now = time.perf_counter()

@@ -8,7 +8,8 @@ sweep:
       sequence_length: 2048
       streaming: true
     training:
-      batch_size: 32
+      batch_size: 16
+      gradient_accumulation_steps: 2
       steps: 10000
       lr: 0.000283
       lr_schedule: linear_warmup

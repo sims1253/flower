@@ -76,6 +76,7 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     batch_size: int = 32
+    gradient_accumulation_steps: int = 1
     steps: int = 30_000
     lr: float = 3e-4
     warmup_steps: int = 1000
