@@ -10,16 +10,37 @@ import torch
 import torch.nn.functional as F
 
 from flower.config import ExperimentConfig
-from flower.data import build_tokenizer
+from flower.data import build_tokenizer, fineweb_validation_documents
 from flower.eval import evaluate_documents
 
 
 def _probe_vocab(cfg: ExperimentConfig) -> tuple[int, int]:
     # Avoid the first few token ids because tokenizers often reserve them for
     # special/control tokens. Synthetic configs can still use the full range.
-    if cfg.data.dataset == "synthetic":
+    if cfg.data.dataset in {"synthetic", "mqar"}:
         return 0, min(cfg.model.vocab_size, cfg.data.synthetic_vocab_size)
     return min(8, cfg.model.vocab_size - 1), cfg.model.vocab_size
+
+
+def _eval_seq_len(cfg: ExperimentConfig) -> int:
+    """Return the effective eval sequence length for probes (Sweep 7 A1)."""
+    return getattr(cfg.data, "eval_seq_len", None) or cfg.model.max_seq_len
+
+
+def _long_context_batch_size(requested: int, seq_len: int, *, token_budget: int = 8192) -> int:
+    """Cap probe microbatches so eval_seq_len probes do not dominate VRAM.
+
+    The attention path is dense in T x T even when `local_window` is set, so
+    memory scales roughly with batch * seq_len^2. A token budget of 8192 means
+    eval_seq_len=4096 probes run at batch=2, while short smoke probes keep their
+    original batch sizes.
+    """
+    return max(1, min(requested, token_budget // max(1, seq_len)))
+
+
+def _empty_cuda_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -32,7 +53,10 @@ def induction_copy_probe(
     batch_size: int = 16,
 ) -> dict[str, float | int]:
     lo, hi = _probe_vocab(cfg)
-    pattern_len = max(4, min(32, cfg.model.max_seq_len // 4))
+    seq_cap = _eval_seq_len(cfg)
+    pattern_len = max(4, seq_cap // 3)
+    seq_len = pattern_len * 3
+    batch_size = _long_context_batch_size(batch_size, seq_len)
     gen = torch.Generator(device="cpu").manual_seed(int(cfg.training.seed) + 101)
     total_loss = 0.0
     total_correct = 0
@@ -67,7 +91,8 @@ def associative_recall_probe(
     pairs: int = 8,
 ) -> dict[str, float | int]:
     lo, hi = _probe_vocab(cfg)
-    seq_len = min(cfg.model.max_seq_len, max(32, pairs * 2 + 8))
+    seq_len = max(32, _eval_seq_len(cfg))
+    batch_size = _long_context_batch_size(batch_size, seq_len)
     gen = torch.Generator(device="cpu").manual_seed(int(cfg.training.seed) + 202)
     total_loss = 0.0
     total_correct = 0
@@ -92,6 +117,396 @@ def associative_recall_probe(
         "loss": total_loss / max(total, 1),
         "accuracy": total_correct / max(total, 1),
         "examples": total,
+    }
+
+
+@torch.no_grad()
+def mqar_probe(
+    model: torch.nn.Module,
+    cfg: ExperimentConfig,
+    device: torch.device,
+    *,
+    batches: int = 8,
+    batch_size: int = 8,
+    num_pairs_list: tuple[int, ...] = (16, 32, 64, 128),
+    query_fraction: float = 0.25,
+    delay_modes: tuple[str, ...] = ("short", "long"),
+) -> dict[str, Any]:
+    """Multi-query associative recall (MQAR) capacity curve.
+
+    Plants N key→value pairs then queries a fraction of them at the end.
+    Returns accuracy at each num_pairs level and a breaking_point scalar
+    (largest num_pairs with accuracy >= 0.5).
+    """
+    lo, hi = _probe_vocab(cfg)
+    seq_cap = _eval_seq_len(cfg)
+    batch_size = _long_context_batch_size(batch_size, seq_cap)
+    gen = torch.Generator(device="cpu").manual_seed(int(cfg.training.seed) + 777)
+
+    capacity_curve: dict[str, dict[str, float]] = {}
+    full_vocab_curve: dict[str, dict[str, float]] = {}
+    breaking_points: dict[str, int] = {}
+
+    def resolve_delay(mode: str, seq_needed_without_delay: int) -> int | None:
+        max_delay = seq_cap - seq_needed_without_delay
+        if max_delay < 0:
+            return None
+        if mode == "short":
+            return min(max_delay, max(0, int(getattr(cfg.model, "local_window", 0) or 0) // 2))
+        if mode == "long":
+            return max_delay
+        raise ValueError(f"Unknown MQAR delay mode: {mode}")
+
+    for mode in delay_modes:
+        mode_curve: dict[str, float] = {}
+        mode_full_vocab_curve: dict[str, float] = {}
+        breaking_point = 0
+        for num_pairs in num_pairs_list:
+            num_queries = max(1, int(num_pairs * query_fraction))
+            # Sequence: [k1,v1,...,kN,vN] + [delay] + [q1,a1,q2,a2,...]
+            kv_len = num_pairs * 2
+            qa_len = num_queries * 2
+            delay_tokens = resolve_delay(mode, kv_len + qa_len)
+            if delay_tokens is None:
+                mode_curve[str(num_pairs)] = float("nan")
+                mode_full_vocab_curve[str(num_pairs)] = float("nan")
+                continue
+
+            total_candidate_correct = 0
+            total_full_vocab_correct = 0
+            total = 0
+            for _ in range(batches):
+                vocab = hi - lo
+                if vocab >= num_pairs:
+                    keys = torch.stack(
+                        [torch.randperm(vocab, generator=gen, dtype=torch.long)[:num_pairs] + lo for _ in range(batch_size)]
+                    )
+                    vals = torch.stack(
+                        [torch.randperm(vocab, generator=gen, dtype=torch.long)[:num_pairs] + lo for _ in range(batch_size)]
+                    )
+                else:
+                    keys = torch.randint(lo, hi, (batch_size, num_pairs), generator=gen, dtype=torch.long)
+                    vals = torch.randint(lo, hi, (batch_size, num_pairs), generator=gen, dtype=torch.long)
+                kv = torch.stack([keys, vals], dim=-1).reshape(batch_size, kv_len)
+
+                query_indices = torch.stack(
+                    [torch.randperm(num_pairs, generator=gen)[:num_queries] for _ in range(batch_size)]
+                )
+                query_keys = keys[torch.arange(batch_size).unsqueeze(1), query_indices]
+                query_vals = vals[torch.arange(batch_size).unsqueeze(1), query_indices]
+
+                delay = (
+                    torch.randint(lo, hi, (batch_size, delay_tokens), generator=gen, dtype=torch.long)
+                    if delay_tokens > 0
+                    else kv.new_empty(batch_size, 0)
+                )
+
+                # Interleave query key/answer pairs: [q1,a1,q2,a2,...]
+                qa = torch.stack([query_keys, query_vals], dim=-1).reshape(batch_size, qa_len)
+                seq = torch.cat([kv, delay, qa], dim=1).to(device)
+
+                logits = model(seq)["logits"]
+                ans_start = kv_len + delay_tokens + 1
+                for qi in range(num_queries):
+                    pos = ans_start + qi * 2 - 1  # logit at position before the answer
+                    step_logits = logits[:, pos, :]
+                    label = seq[:, pos + 1]
+                    full_vocab_pred = step_logits.argmax(dim=-1)
+                    candidate_logits = step_logits.gather(1, vals.to(device))
+                    candidate_pred = candidate_logits.argmax(dim=-1)
+                    label_idx = query_indices[:, qi].to(device)
+                    total_full_vocab_correct += int((full_vocab_pred == label).sum().cpu())
+                    total_candidate_correct += int((candidate_pred == label_idx).sum().cpu())
+                    total += batch_size
+
+            acc = total_candidate_correct / max(total, 1)
+            full_vocab_acc = total_full_vocab_correct / max(total, 1)
+            mode_curve[str(num_pairs)] = acc
+            mode_full_vocab_curve[str(num_pairs)] = full_vocab_acc
+            if acc >= 0.5:
+                breaking_point = num_pairs
+        capacity_curve[mode] = mode_curve
+        full_vocab_curve[mode] = mode_full_vocab_curve
+        breaking_points[mode] = breaking_point
+
+    return {
+        "capacity_curve": capacity_curve,
+        "full_vocab_capacity_curve": full_vocab_curve,
+        "breaking_points": breaking_points,
+        "breaking_point": breaking_points.get("long", max(breaking_points.values(), default=0)),
+    }
+
+
+def _real_token_pool(cfg: ExperimentConfig, *, max_docs: int = 8, max_tokens: int = 8192) -> torch.Tensor:
+    """Pool of in-vocabulary token ids drawn from real validation text.
+
+    The synthetic `mqar_probe` samples ids in `0..synthetic_vocab_size`, which are
+    off-manifold for a FineWeb-trained model (Phase A: all such variants floored at
+    breaking-point 0). This pool restricts the recall task to tokens the model has
+    actually seen, so the probe measures real recall ability rather than reaction to
+    alien ids. Falls back to the synthetic range for synthetic/mqar datasets.
+    """
+    if cfg.data.dataset in {"synthetic", "mqar"}:
+        lo, hi = _probe_vocab(cfg)
+        return torch.arange(lo, hi, dtype=torch.long)
+    encoder = build_tokenizer(cfg.data.tokenizer)
+    ids: list[int] = []
+    for text in fineweb_validation_documents(cfg.data, limit=max_docs):
+        ids.extend(encoder.encode(text))
+        if len(ids) >= max_tokens:
+            break
+    if not ids:
+        lo, hi = _probe_vocab(cfg)
+        return torch.arange(lo, hi, dtype=torch.long)
+    uniq = torch.unique(torch.tensor(ids[:max_tokens], dtype=torch.long))
+    return uniq[uniq < cfg.model.vocab_size]
+
+
+@torch.no_grad()
+def text_recall_probe(
+    model: torch.nn.Module,
+    cfg: ExperimentConfig,
+    device: torch.device,
+    *,
+    batches: int = 8,
+    batch_size: int = 8,
+    num_pairs_list: tuple[int, ...] = (16, 32, 64, 128),
+    query_fraction: float = 0.25,
+    delay_modes: tuple[str, ...] = ("short", "long"),
+    token_pool: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """On-manifold multi-query associative recall.
+
+    Identical task structure to `mqar_probe` (plant N key→value pairs, query a
+    fraction at the end, candidate-set scoring) but keys/values/delay are sampled
+    from REAL in-vocabulary tokens (`_real_token_pool`) so a FineWeb-trained model
+    is evaluated on its training manifold. This is the discriminator the Sweep-7
+    eval-validation gate cares about: it can run on FineWeb checkpoints directly.
+    """
+    pool = (token_pool if token_pool is not None else _real_token_pool(cfg)).to(dtype=torch.long)
+    pool_size = int(pool.numel())
+    seq_cap = _eval_seq_len(cfg)
+    batch_size = _long_context_batch_size(batch_size, seq_cap)
+    gen = torch.Generator(device="cpu").manual_seed(int(cfg.training.seed) + 1337)
+
+    capacity_curve: dict[str, dict[str, float]] = {}
+    breaking_points: dict[str, int] = {}
+
+    def resolve_delay(mode: str, seq_needed_without_delay: int) -> int | None:
+        max_delay = seq_cap - seq_needed_without_delay
+        if max_delay < 0:
+            return None
+        if mode == "short":
+            return min(max_delay, max(0, int(getattr(cfg.model, "local_window", 0) or 0) // 2))
+        if mode == "long":
+            return max_delay
+        raise ValueError(f"Unknown text-recall delay mode: {mode}")
+
+    for mode in delay_modes:
+        mode_curve: dict[str, float] = {}
+        breaking_point = 0
+        for num_pairs in num_pairs_list:
+            num_queries = max(1, int(num_pairs * query_fraction))
+            kv_len = num_pairs * 2
+            qa_len = num_queries * 2
+            delay_tokens = resolve_delay(mode, kv_len + qa_len)
+            # Need 2*num_pairs distinct tokens (keys disjoint from values) from the pool.
+            if delay_tokens is None or pool_size < 2 * num_pairs:
+                mode_curve[str(num_pairs)] = float("nan")
+                continue
+
+            total_correct = 0
+            total = 0
+            for _ in range(batches):
+                idx = torch.stack(
+                    [torch.randperm(pool_size, generator=gen)[: 2 * num_pairs] for _ in range(batch_size)]
+                )
+                keys = pool[idx[:, :num_pairs]]
+                vals = pool[idx[:, num_pairs:]]
+                kv = torch.stack([keys, vals], dim=-1).reshape(batch_size, kv_len)
+
+                query_indices = torch.stack(
+                    [torch.randperm(num_pairs, generator=gen)[:num_queries] for _ in range(batch_size)]
+                )
+                query_keys = keys[torch.arange(batch_size).unsqueeze(1), query_indices]
+                query_vals = vals[torch.arange(batch_size).unsqueeze(1), query_indices]
+
+                if delay_tokens > 0:
+                    delay = pool[torch.randint(0, pool_size, (batch_size, delay_tokens), generator=gen)]
+                else:
+                    delay = kv.new_empty(batch_size, 0)
+
+                qa = torch.stack([query_keys, query_vals], dim=-1).reshape(batch_size, qa_len)
+                seq = torch.cat([kv, delay, qa], dim=1).to(device)
+
+                logits = model(seq)["logits"]
+                ans_start = kv_len + delay_tokens + 1
+                for qi in range(num_queries):
+                    pos = ans_start + qi * 2 - 1
+                    step_logits = logits[:, pos, :]
+                    candidate_pred = step_logits.gather(1, vals.to(device)).argmax(dim=-1)
+                    label_idx = query_indices[:, qi].to(device)
+                    total_correct += int((candidate_pred == label_idx).sum().cpu())
+                    total += batch_size
+
+            acc = total_correct / max(total, 1)
+            mode_curve[str(num_pairs)] = acc
+            if acc >= 0.5:
+                breaking_point = num_pairs
+        capacity_curve[mode] = mode_curve
+        breaking_points[mode] = breaking_point
+
+    return {
+        "capacity_curve": capacity_curve,
+        "breaking_points": breaking_points,
+        "breaking_point": breaking_points.get("long", max(breaking_points.values(), default=0)),
+        "pool_size": pool_size,
+    }
+
+
+def _continuation_nll(
+    model: torch.nn.Module, prefix_ids: list[int], cont_ids: list[int], device: torch.device
+) -> float:
+    """Mean NLL of `cont_ids` conditioned on `prefix_ids` (teacher-forced).
+
+    Only the continuation tokens are scored (labels `-100` over the prefix), so
+    this measures how strongly the model predicts the candidate value given the
+    in-context needle — a natural-language likelihood, on the FineWeb manifold.
+    """
+    if not cont_ids:
+        return float("inf")
+    ids = prefix_ids + cont_ids
+    batch = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    labels = batch.clone()
+    labels[:, : len(prefix_ids)] = -100
+    out = model(batch, labels=labels)
+    loss = out["loss"]
+    if loss is None:
+        raise RuntimeError("loss was not computed")
+    return float(loss.cpu())
+
+
+# Natural-language key/value pools for the needle probe. Disjoint so a planted
+# key never collides with a value. Multi-token under the 4k BPE tokenizer is fine
+# because scoring is by continuation NLL, not single-token argmax.
+_NEEDLE_KEYS: tuple[str, ...] = (
+    "river", "garden", "market", "winter", "engine", "letter", "island", "harvest",
+    "candle", "anchor", "planet", "forest", "window", "doctor", "copper", "thunder",
+)
+_NEEDLE_VALUES: tuple[str, ...] = (
+    "mountain", "silver", "yellow", "velvet", "apple", "seven", "blue", "ocean",
+    "iron", "maple", "amber", "north", "quartz", "ember", "willow", "frost",
+)
+
+
+@torch.no_grad()
+def needle_in_text_probe(
+    model: torch.nn.Module,
+    cfg: ExperimentConfig,
+    device: torch.device,
+    *,
+    trials: int = 16,
+    num_pairs_list: tuple[int, ...] = (1, 2, 4, 8),
+    depth_modes: tuple[str, ...] = ("early", "late"),
+    filler_docs: int = 16,
+) -> dict[str, Any]:
+    """On-manifold associative recall: facts planted in real FineWeb prose.
+
+    Each trial writes `N` natural-language facts ("The secret word for X is Y.")
+    separated by real validation text, then queries one fact ("The secret word
+    for X is") and scores which candidate value Y has the lowest continuation NLL.
+    Both the token distribution AND the sentence structure live on the FineWeb
+    manifold, unlike `mqar_probe`/`text_recall_probe` whose synthetic layout is
+    off-manifold (E4: those floor at 0 on every FineWeb checkpoint). `depth`
+    controls where the queried fact sits: "early" (start, easy) vs "late" (just
+    before the query, recency) — and the filler length puts memory under pressure.
+
+    For synthetic/mqar datasets the probe is a no-op (returns empty curves), since
+    it requires a real text tokenizer and validation corpus.
+    """
+    if cfg.data.dataset in {"synthetic", "mqar"}:
+        return {"capacity_curve": {}, "breaking_points": {}, "breaking_point": 0, "skipped": True}
+
+    encoder = build_tokenizer(cfg.data.tokenizer)
+    seq_cap = _eval_seq_len(cfg)
+    rng = torch.Generator(device="cpu").manual_seed(int(cfg.training.seed) + 4242)
+
+    # Real filler sentences from the validation stream (split on periods, keep prose).
+    filler: list[str] = []
+    for text in fineweb_validation_documents(cfg.data, limit=filler_docs):
+        for piece in text.replace("\n", " ").split(". "):
+            piece = piece.strip()
+            if 20 <= len(piece) <= 200:
+                filler.append(piece + ".")
+        if len(filler) >= 512:
+            break
+    if not filler:
+        return {"capacity_curve": {}, "breaking_points": {}, "breaking_point": 0, "skipped": True}
+
+    n_keys = min(len(_NEEDLE_KEYS), len(_NEEDLE_VALUES))
+
+    def fact(k: str, v: str) -> str:
+        return f" The secret word for {k} is {v}."
+
+    capacity_curve: dict[str, dict[str, float]] = {}
+    breaking_points: dict[str, int] = {}
+
+    for mode in depth_modes:
+        mode_curve: dict[str, float] = {}
+        breaking_point = 0
+        for num_pairs in num_pairs_list:
+            if num_pairs > n_keys:
+                mode_curve[str(num_pairs)] = float("nan")
+                continue
+            correct = 0
+            total = 0
+            for _ in range(trials):
+                perm = torch.randperm(n_keys, generator=rng)[:num_pairs].tolist()
+                keys = [_NEEDLE_KEYS[i] for i in perm]
+                vals = [_NEEDLE_VALUES[i] for i in perm]
+                q = int(torch.randint(0, num_pairs, (1,), generator=rng))
+
+                # Order facts; for "early" the queried fact is first, for "late" last.
+                order = list(range(num_pairs))
+                if mode == "early":
+                    order.remove(q)
+                    order = [q] + order
+                elif mode == "late":
+                    order.remove(q)
+                    order = order + [q]
+
+                parts: list[str] = []
+                for j in order:
+                    parts.append(fact(keys[j], vals[j]))
+                    fi = int(torch.randint(0, len(filler), (1,), generator=rng))
+                    parts.append(" " + filler[fi])
+                context = "".join(parts)
+
+                prompt = f" The secret word for {keys[q]} is"
+                prefix_ids = encoder.encode(context + prompt)
+                # Honour the eval budget: keep the most recent context if too long,
+                # but never drop the queried fact for "early" mode.
+                if len(prefix_ids) > seq_cap - 8:
+                    prefix_ids = prefix_ids[-(seq_cap - 8) :]
+
+                nlls = [_continuation_nll(model, prefix_ids, encoder.encode(" " + v), device) for v in vals]
+                if int(torch.tensor(nlls).argmin()) == q:
+                    correct += 1
+                total += 1
+
+            acc = correct / max(total, 1)
+            mode_curve[str(num_pairs)] = acc
+            # Chance is 1/num_pairs; require clearing 0.5 as the breaking-point bar.
+            if acc >= 0.5:
+                breaking_point = num_pairs
+        capacity_curve[mode] = mode_curve
+        breaking_points[mode] = breaking_point
+
+    return {
+        "capacity_curve": capacity_curve,
+        "breaking_points": breaking_points,
+        "breaking_point": breaking_points.get("late", max(breaking_points.values(), default=0)),
+        "num_filler": len(filler),
     }
 
 
@@ -213,7 +628,7 @@ def blimp_mini_probe(
     cfg: ExperimentConfig,
     device: torch.device,
 ) -> dict[str, float | int]:
-    encoder = None if cfg.data.dataset == "synthetic" else build_tokenizer(cfg.data.tokenizer)
+    encoder = None if cfg.data.dataset in {"synthetic", "mqar"} else build_tokenizer(cfg.data.tokenizer)
     correct = 0
     margins: list[float] = []
     skipped = 0
@@ -315,6 +730,7 @@ def run_composite_eval(
     was_training = model.training
     model.eval()
     try:
+        _empty_cuda_cache(device)
         fineweb = evaluate_documents(
             model,
             cfg,
@@ -323,11 +739,22 @@ def run_composite_eval(
             bootstrap=True,
             bootstrap_samples=1000,
         )
+        _empty_cuda_cache(device)
         induction = induction_copy_probe(model, cfg, device)
+        _empty_cuda_cache(device)
         assoc = associative_recall_probe(model, cfg, device)
+        _empty_cuda_cache(device)
+        mqar = mqar_probe(model, cfg, device)
+        _empty_cuda_cache(device)
+        text_recall = text_recall_probe(model, cfg, device)
+        _empty_cuda_cache(device)
+        needle = needle_in_text_probe(model, cfg, device)
+        _empty_cuda_cache(device)
         memory_ablation = memory_ablation_probe(model, cfg, device, doc_limit=min(doc_limit or 32, 32))
+        _empty_cuda_cache(device)
         blimp = blimp_mini_probe(model, cfg, device)
     finally:
+        _empty_cuda_cache(device)
         if was_training:
             model.train()
 
@@ -335,6 +762,12 @@ def run_composite_eval(
         "fineweb_bpb": float(fineweb["bpb"]),
         "induction_copy_loss": float(induction["loss"]),
         "assoc_recall_loss": float(assoc["loss"]),
+        # Bigger breaking_point = better capacity; negate for lower-is-better ranking.
+        "mqar_neg_breaking_point": -float(mqar["breaking_point"]),
+        # On-manifold recall: the FineWeb-valid discriminator (see eval-validation plan).
+        "text_recall_neg_breaking_point": -float(text_recall["breaking_point"]),
+        # Needle-in-real-text: recall where the TASK (not just tokens) is on-manifold.
+        "needle_neg_breaking_point": -float(needle["breaking_point"]),
         # Bigger positive delta means memory helped more, so negate for lower-is-better ranking.
         "memory_ablation_neg_delta_bpb": -float(memory_ablation["delta_bpb"]),
         "blimp_mini_error": 1.0 - float(blimp["accuracy"]),
@@ -347,6 +780,9 @@ def run_composite_eval(
             "fineweb": fineweb,
             "induction_copy": induction,
             "associative_recall": assoc,
+            "mqar": mqar,
+            "text_recall": text_recall,
+            "needle_in_text": needle,
             "memory_ablation": memory_ablation,
             "blimp_mini": blimp,
         },

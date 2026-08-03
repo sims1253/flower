@@ -1,0 +1,115 @@
+# Sweep 13, Phase 0 — Pretrain the ~100M base (vanilla_local), next-gen pipeline.
+#
+# The base becomes the SHARED, FROZEN teacher for every phase-1 arm. Phase
+# separation (vs 12M co-training) removes base-variance from the compactor
+# bake-off: all phase-1 arms see the identical teacher and identical base,
+# so any ppl difference is attributable to the compactor, not to base drift.
+#
+# WHAT CHANGED vs the first draft of this config (all of it is pipeline, not
+# research question — see SWEEP13_PIPELINE.md for the measurements):
+#
+#   init_scheme: scaled   nn.Embedding defaults to N(0,1) and is tied to the LM
+#                         head, so the old config started at loss 565 instead of
+#                         ln(V)=9.7. Every sweep to date burned its opening phase
+#                         just shrinking the embedding norm.
+#   lr_schedule: wsd      `linear_warmup` never decays — it holds peak LR to the
+#                         final step. Every prior sweep trained with no decay
+#                         phase at all.
+#   precision: bf16       Everything before this ran fp32 eager on a Blackwell
+#   compile_model: true   card, with no TF32 and no compile.
+#   qk_norm: true         Muon inflates ||W_Q||,||W_K|| and QK^T multiplies them;
+#                         at 14 layers that is a live MaxLogit-explosion risk.
+#   rmsnorm / swiglu      Modern defaults. SwiGLU width is auto-matched to 2/3 *
+#                         ffn_dim so the parameter count is comparable.
+#   vocab 4096 -> 16384   Measured on held-out FineWeb-Edu: 3.43 -> 4.28
+#                         bytes/token. The old tokenizer packed 25% less text
+#                         into the same context window, which works directly
+#                         against a project studying context compaction.
+#
+# Non-embedding core is 99.11M, unchanged from the 4k-vocab draft; total is
+# 111.70M because the tied embedding grows from 3.15M to 12.58M. The "100M
+# class" claim refers to the core, which is what sets the FLOPs.
+#
+# Launch (local 5090 or vast):
+#   uv run python -m flower.train --config configs/sweep13_100m_phase0.yaml \
+#     --output-dir runs/sweep13_100m_phase0 --device cuda
+#
+#   (single seed — one shared base, not a sweep. On vast use vast_launch_sweep.sh
+#   with VAST_RUN_DIR=runs/sweep13_100m_phase0 or launch train.py in tmux.)
+#
+# After completion, phase-1 configs point still_pretrained_base at:
+#   runs/sweep13_100m_phase0/vanilla_local_step15000.pt
+#
+# IMPORTANT for vast: make_repo_archive excludes runs/ and *.pt, so the phase-0
+# checkpoint will NOT ride the repo tarball. Copy it separately:
+#   scp -i ~/.ssh/id_ed25519 runs/sweep13_100m_phase0/vanilla_local_step15000.pt \
+#       root@<host>:/workspace/flower/runs/sweep13_100m_phase0/
+# build_still_model now FAILS loudly if still_pretrained_base is missing.
+
+model:
+  variant: vanilla_local
+  vocab_size: 16384
+  d_model: 768
+  num_heads: 12
+  num_layers: 14
+  ffn_dim: 3072              # SwiGLU hidden auto-matched to 2048 (2/3 * 3072)
+  max_seq_len: 1024
+  local_window: 256
+  rope_base: 10000.0
+  dropout: 0.0
+  # --- next-gen base ---
+  norm_type: rmsnorm
+  ffn_activation: swiglu
+  ffn_param_match: true
+  qk_norm: true
+  use_bias: false
+  init_scheme: scaled
+  init_std: 0.02
+
+data:
+  dataset: fineweb_edu
+  tokenizer: "custom:tokenizers/fineweb_16k.json"
+  sequence_length: 1024
+  eval_seq_len: 1024
+  # Measured (scripts/analyze_tokenizer.py). Enables val_bpb, which is the
+  # only metric comparable against runs on a different tokenizer.
+  bytes_per_token: 4.279
+
+training:
+  # Effective batch 64, shape chosen by measurement (RTX 5090, bf16+compile):
+  #    8 x 8  ->  103,355 tok/s   6.06 GB
+  #   16 x 4  ->  113,283 tok/s  10.42 GB   <- chosen
+  #   32 x 2  ->  131,817 tok/s  19.17 GB   (16% faster, but ~60% of VRAM)
+  # 32 x 2 is only ~20 min faster over the whole run and leaves much less
+  # headroom. On WSL2 exceeding VRAM does NOT raise — the WDDM manager spills
+  # to host RAM over PCIe and throughput collapses silently, so headroom is
+  # worth more than the last 16%. See scripts/bench_precision.py.
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  steps: 15000              # 983M tokens = 4.2 GB of text at 4.28 bytes/token
+                            # (the 4k tokenizer bought only 3.4 GB for the same
+                            # token budget and the same FLOPs).
+  lr: 0.003
+  warmup_steps: 500
+  lr_schedule: wsd
+  lr_decay_frac: 0.2        # last 3000 steps decay linearly to zero
+  lr_final_frac: 0.0
+  grad_clip: 1.0
+  eval_interval: 1000
+  checkpoint_interval: 1000
+  save_checkpoints: true
+  device: auto
+  seed: 0
+  log_backend: tensorboard
+  composite_eval: false
+  optimizer: muon
+  muon_lr: 0.002            # larger model -> lower muon LR (matches sweep_still_scale)
+  muon_momentum: 0.95
+  weight_decay: 0.01
+  weight_decay_exclude_embeddings: true
+  validation_steps: 20
+  validation_interval: 1000
+  # --- next-gen pipeline ---
+  precision: bf16           # TF32 matmuls + bf16 autocast; fp32 master weights
+  compile_model: true
+  compile_mode: default     # `reduce-overhead` adds CUDA graphs; try after this works

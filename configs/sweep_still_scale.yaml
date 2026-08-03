@@ -1,0 +1,105 @@
+# Scaling sweep: do the flow-matching compactor advantages hold at a larger
+# model size and longer training? Scales the best Still variants from
+# sweep_still_novel up to ~40M params (vs ~12M) and 8000 steps.
+#
+# Baseline (standard Still Perceiver) is compared against the flow-matching
+# family (still_flow, meanflow, OT-coupled, split K/V) plus the spectral and
+# frequency-decay references. Three seeds each for now; expand if promising.
+#
+# NOTE: still_meanflow, still_flow_ot, still_flow_kv (and their config fields
+# still_meanflow_steps / still_ot_epsilon / still_ot_iters) are wired up
+# separately. They are intentionally referenced here ahead of implementation.
+
+sweep:
+  name: sweep_still_scale
+
+  defaults:
+    model:
+      vocab_size: 4096
+      d_model: 512
+      num_heads: 8
+      num_layers: 8
+      ffn_dim: 2048
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128          # 2 * head_dim (64), required by flow_ot/flow_kv
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 2000
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 2000
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+
+    training:
+      batch_size: 32
+      gradient_accumulation_steps: 2   # effective batch size = 64
+      steps: 8000                      # 2000 base warmup + 6000 compactor training
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.002                    # slightly lower for the larger model
+      muon_momentum: 0.95
+
+  variants:
+    # Control: standard Still Perceiver compactor.
+    - name: scale_baseline
+      model:
+        variant: still
+
+    # Best variant from the novel sweep: flow-matching compactor (5 Euler steps).
+    - name: scale_flow
+      model:
+        variant: still_flow
+        still_flow_steps: 5
+
+    # NEW: 1-step inference via MeanFlow average-velocity parameterisation.
+    - name: scale_meanflow
+      model:
+        variant: still_meanflow
+        still_meanflow_steps: 3
+
+    # NEW: OT-coupled flow matching (Sinkhorn coupling in the flow read).
+    - name: scale_flow_ot
+      model:
+        variant: still_flow_ot
+        still_flow_steps: 5
+        still_ot_epsilon: 0.1
+        still_ot_iters: 10
+
+    # NEW: split K/V heads flow compactor.
+    - name: scale_flow_kv
+      model:
+        variant: still_flow_kv
+        still_flow_steps: 5
+
+    # Reference: spectral low-rank KV compression.
+    - name: scale_spectral
+      model:
+        variant: still_spectral
+        still_use_spectral: true
+
+    # Reference: frequency-decay spaced repetition on compact entries.
+    - name: scale_freq
+      model:
+        variant: still_freq
+        still_use_freq_decay: true

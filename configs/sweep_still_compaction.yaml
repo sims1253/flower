@@ -1,0 +1,136 @@
+# Still KV-Cache Compaction: Reproduction + Novel Variants
+#
+# Reproduces the Still architecture (arXiv:2606.07878) on Flower's small-scale
+# models, then tests novel combinations from our wiki ideas.
+#
+# Base model: 6L/384d/6h, seq=512, 4K BPE tokenizer, FineWeb-Edu.
+# Compactor: per-layer Perceiver, d_latent=2*head_dim=128, 2 blocks.
+# Compression ratios: 8x, 16x, 32x, 64x -> compact_len = 256, 128, 64, 32.
+#
+# Variant descriptions:
+# - still_baseline: canonical Still (pure KL distillation, identity init, beta=0)
+# - still_ot: OT-coupled cross-attention read (Sinkhorn plan replaces softmax)
+# - still_energy: energy-based read (log-sum-exp sharpening of compact entries)
+# - still_freq: frequency-decay on compact entries (spaced-repetition prior)
+# - still_all: OT + energy + freq (full novel stack)
+# - still_ce: CE auxiliary loss variant (KL + direct supervision)
+# - vanilla_local_control: no compactor, just the base model for reference
+
+sweep:
+  name: sweep_still
+
+  defaults:
+    model:
+      variant: still
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      # Still compactor defaults
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128  # 2 * head_dim
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 1500
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 1500
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+
+    training:
+      batch_size: 64
+      gradient_accumulation_steps: 1
+      steps: 3000
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 300
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+
+  variants:
+    # === Reproduction ===
+    - name: still_baseline
+      model:
+        variant: still
+        still_compact_len: 64
+
+    # === Novel Variants from Wiki Ideas ===
+
+    # OT-coupled cross-attention (from optimal-transport-attention + flow_ot_memory)
+    - name: still_ot
+      model:
+        variant: still_ot
+        still_compact_len: 64
+        still_use_ot_read: true
+
+    # Energy-based read (from agent-memory-architecture + Sweep 7 B2)
+    - name: still_energy
+      model:
+        variant: still_energy
+        still_compact_len: 64
+        still_use_energy_read: true
+
+    # Frequency decay on compact entries (from frequency_decay_memory)
+    - name: still_freq
+      model:
+        variant: still_freq
+        still_compact_len: 64
+        still_use_freq_decay: true
+
+    # Full novel stack: OT + energy + freq
+    - name: still_all
+      model:
+        variant: still_all
+        still_compact_len: 64
+        still_use_ot_read: true
+        still_use_energy_read: true
+        still_use_freq_decay: true
+
+    # CE auxiliary loss variant
+    - name: still_ce
+      model:
+        variant: still
+        still_compact_len: 64
+        still_ce_weight: 0.5
+
+    # === Compression Ratio Sweep ===
+    - name: still_c16
+      model:
+        variant: still
+        still_compact_len: 128
+
+    - name: still_c32
+      model:
+        variant: still
+        still_compact_len: 64
+
+    - name: still_c8
+      model:
+        variant: still
+        still_compact_len: 256
+
+    # === Control ===
+    - name: vanilla_local_control
+      model:
+        variant: vanilla_local

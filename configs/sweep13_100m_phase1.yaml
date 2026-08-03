@@ -1,0 +1,213 @@
+# Sweep 13, Phase 1 — Compactor bake-off on the frozen ~100M base.
+#
+# Phase 0 pretrains a single shared vanilla base; every arm here freezes that
+# base (still_pretrained_base + still_base_warmup_steps: 0) and trains only its
+# compactor against the full-cache teacher. This is the fix for the 12M
+# confound: at 12M the base was co-trained per arm, so base drift polluted the
+# compactor comparison. Here the teacher is IDENTICAL across arms.
+#
+#   still_base_warmup_steps: 0   -> base frozen from step 0 (already pretrained)
+#   still_compact_from_step: 0   -> distillation from step 0
+#
+# ---------------------------------------------------------------------------
+# SEED BUDGET — why the arms do not all get 3 seeds
+# ---------------------------------------------------------------------------
+# At n=3 per arm the minimum detectable difference at 80% power (two-sided
+# t-test, alpha=0.05) is Cohen's d = 3.07. Against the seed variances actually
+# measured at 12M that is:
+#
+#   sd 0.017 (standard, sweep10/11)  -> 0.052 ppl
+#   sd 0.023 (flow 10-step, sweep12) -> 0.071 ppl
+#   sd 0.047 (flow 5-step,  sweep12) -> 0.144 ppl
+#
+# The effects sweep10 actually observed were 0.024-0.040 ppl. So at 3 seeds the
+# headline D-vs-E question CANNOT resolve, and a null result would mean
+# "underpowered", not "closed". Seeds are therefore allocated by question:
+#
+#   n=8 -> d=1.51 -> 0.026-0.071 ppl detectable  (D/E/F: effects are small)
+#   n=5 -> d=2.02 -> 0.034-0.095 ppl detectable  (A/B/C: TLM predicts ~0.3 ppl)
+#
+# 3 arms x 8 seeds + 3 arms x 5 seeds = 39 runs. If that is too much compute,
+# run --variants D_std_17M,E_flow_5,F_flow_10 first: those three carry the
+# actual research questions, and the taper arms are a cheap follow-up.
+#
+# Key questions (each is a sweep10/12 follow-up at 100M scale):
+#   1. capacity-vs-mechanism: D_std_17M (17.59M) vs E_flow_5 (17.28M) — the
+#      sweep10 critical control, param-matched to 1.8%. Flow wins at 12M only
+#      at ~80% parameter advantage; at matched budget the 100M verdict decides.
+#   2. TLM taper budgets: B_taper_early / C_taper_late vs A_std_uniform, all
+#      exactly 5.29M (budget-preserving schedules sum to 1792 = 14*128). The
+#      12M result (uniform beats all tapers) is predicted to flip at scale
+#      (TLMs paper, arXiv:2606.23670: wider-early wins ~0.3 ppl at fixed budget).
+#      NOTE: the TLM evidence is on the BASE model's ffn_dim, not on a
+#      compactor latent width. Tapering the base is the better-supported
+#      experiment, but it changes the shared base, so it belongs in phase 0
+#      (see configs/sweep13_100m_phase0_taper.yaml).
+#   3. flow step count: F_flow_10 vs E_flow_5 (same params). At 12M doubling
+#      steps halved seed variance (+0.017 mean). Does that hold at 100M?
+#
+# DROPPED vs the first draft: G_flow_velh (6.59M) was to be compared against
+# A_std_uniform (5.29M) — a 25% parameter gap that no seed count resolves into
+# a statement about the flow mechanism. Either param-match it or leave it out.
+#
+# Memory note: 100M still runs a dual forward (teacher full-cache + student
+# compact). bf16 roughly halves activation memory vs the fp32 draft, so batch 8
+# should be comfortable and the flow arms should no longer be the fragile ones
+# (sweep12's B2 crashed at batch 32x2 in fp32). If OOM, drop to batch 4 x accum 16.
+
+sweep:
+  name: sweep13_100m_phase1
+
+  defaults:
+    model:
+      vocab_size: 16384
+      d_model: 768
+      num_heads: 12
+      num_layers: 14
+      ffn_dim: 3072
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      # Base architecture MUST match phase 0 exactly — these fields determine
+      # the state_dict layout that still_pretrained_base is loaded into.
+      norm_type: rmsnorm
+      ffn_activation: swiglu
+      ffn_param_match: true
+      qk_norm: true
+      use_bias: false
+      init_scheme: scaled
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 0
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 0
+      # --- loss geometry (see SWEEP13_PIPELINE.md section 12) ---
+      # Prefix positions run identical local attention through the same frozen
+      # base in both passes, so they are bit-identical to the teacher: at seq
+      # 1024 / compact_len 64 only 64 positions (6.25%) can differ. The legacy
+      # reduction averaged KL over all 1024 anyway, dividing it by 16 — so
+      # still_kl_weight: 1.0 was really 0.0625 against the CE term in every
+      # Still sweep to date. `suffix` restricts KL and CE to the positions that
+      # can actually differ, so the weights below mean what they say.
+      still_loss_positions: suffix
+      # Decouples the evaluated span from the compaction budget. The legacy
+      # coupling (ctx_end = 1024 - 64) scored just 64 positions, 6.25% of the
+      # sequence, because the split point was pinned to compact_len.
+      #
+      # 512 compresses 512 tokens into 64 slots (8x, the low end of the Still
+      # paper's 8x-200x range) and scores 512 positions — 8x more signal per
+      # step. Deliberately not comparable to the 12M sweeps on absolute value;
+      # that was accepted in exchange for a comparison that can actually
+      # resolve the 0.02-0.04 effect sizes.
+      #
+      # Conservative alternative: 256 keeps 12x compression and still gives 4x
+      # the signal of the legacy setting.
+      still_suffix_len: 512
+      # Path to the phase-0 checkpoint. MUST exist — build_still_model now
+      # raises FileNotFoundError instead of silently random-initializing.
+      # On vast, copy it separately (make_repo_archive excludes runs/ and *.pt):
+      #   scp -i ~/.ssh/id_ed25519 \
+      #     runs/sweep13_100m_phase0/vanilla_local_step15000.pt \
+      #     root@<host>:/workspace/flower/runs/sweep13_100m_phase0/
+      still_pretrained_base: runs/sweep13_100m_phase0/vanilla_local_step15000.pt
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+      # Measured (scripts/analyze_tokenizer.py). Enables val_bpb, which is the
+      # only metric comparable against runs on a different tokenizer.
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 8
+      gradient_accumulation_steps: 8
+      steps: 6500
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2, 3, 4]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      # 5x the previous setting. With `suffix` reduction the validation loss is
+      # scored on 64 positions per sequence, so 20 batches x 8 = 10,240 scored
+      # positions — the standard error on that mean is the same order as the
+      # 0.024-0.040 ppl effects being chased. Validation is a rounding error in
+      # runtime; measurement noise is not.
+      validation_steps: 100
+      precision: bf16
+      # Compile is ON and it is the decisive setting here. Measured on the
+      # D_std_17M arm at batch 8 x accum 8 (RTX 5090):
+      #   fp32          10,759 tok/s   6.09 s/step   27.85 GB   <- the sweep12 crash
+      #   bf16          10,863 tok/s   6.03 s/step   26.71 GB   <- bf16 alone buys nothing
+      #   bf16+compile  26,471 tok/s   2.48 s/step   14.99 GB   <- 2.46x
+      # The Still dual forward is launch-bound, not matmul-bound, so autocast on
+      # its own does not help; compile is what fuses away the overhead. It also
+      # halves peak memory, which is what made sweep12's flow arms fragile.
+      # Cost: the module-diagnostics walk is disabled under compile, so the flow
+      # velocity-net scalars (last_diag_*) are unavailable. kl_loss/student_loss/
+      # teacher_loss survive (StillLM sets them after the base forward). If the
+      # velocity diagnostics are wanted, re-run one seed per flow arm with
+      # compile_model: false.
+      compile_model: true
+
+  variants:
+    # --- Taper question: 5 seeds (TLM predicts ~0.3 ppl, detectable at n=5) ---
+
+    # Anchor — uniform budget, 5.29M trainable.
+    - name: A_std_uniform
+      model: { variant: still }
+
+    # Taper early (wide at layer 0) vs late (wide at layer 13) vs steep —
+    # all budget-preserving (sum 1792, same 5.29M as A). TLM hypothesis.
+    - name: B_taper_early
+      model:
+        variant: still
+        still_d_latent_schedule: [168, 162, 156, 150, 143, 137, 131, 125, 119, 113, 106, 100, 94, 88]
+
+    - name: C_taper_late
+      model:
+        variant: still
+        still_d_latent_schedule: [88, 94, 100, 106, 113, 119, 125, 131, 137, 143, 150, 156, 162, 168]
+
+    # --- Mechanism questions: 8 seeds (effects are 0.02-0.04 ppl) ---
+
+    # Capacity control for the flow arms — std at 17.59M (dlat192 + 4 blocks).
+    - name: D_std_17M
+      model:
+        variant: still
+        still_d_latent: 192
+        still_num_blocks: 4
+      training:
+        seeds: [0, 1, 2, 3, 4, 5, 6, 7]
+
+    # Flow, 17.28M — param-matched to D (1.8% diff). The sweep10 verdict.
+    - name: E_flow_5
+      model: { variant: still_flow, still_flow_steps: 5 }
+      training:
+        seeds: [0, 1, 2, 3, 4, 5, 6, 7]
+
+    # Flow, same params, double the Euler steps. Variance-reduction follow-up.
+    - name: F_flow_10
+      model: { variant: still_flow, still_flow_steps: 10 }
+      training:
+        seeds: [0, 1, 2, 3, 4, 5, 6, 7]

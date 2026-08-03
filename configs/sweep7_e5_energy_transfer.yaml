@@ -1,0 +1,94 @@
+# Sweep 7 E5 — FineWeb transfer gate for the energy-read winner.
+#
+# Question: does the energy-read advantage (energy_read=true, energy_beta_init=0.25)
+# that showed up on the synthetic MQAR *curriculum* transfer to real FineWeb LM?
+# Judged on in-distribution discriminators: memory_ablation_delta (primary, the
+# sharpest FineWeb ruler per E4) + val loss, and needle_in_text recall as a
+# guardrail. NOT on zero-shot synthetic MQAR breaking point (E4: floors at 0).
+#
+# Single clean axis: read operator. control (convex/softmax mean-pool read) vs
+# energy read at beta_init 0.25. Everything else fixed to the Phase-A recipe.
+#
+# Load-bearing setup: local_window=64 with eval_seq_len=8192 (128x the window)
+# so the needle/recall path must route through memory, where E4b said the needle
+# becomes a real discriminator. Train seq stays 2048 (proven batch16/accum2 ~18GB
+# on the 32GB 5090; energy arms add ~5GB, still well under).
+#
+# Launch (paste when ready):
+#   FLOWER_DATA_CACHE=data_cache uv run python -m flower.sweep \
+#     --config configs/sweep7_e5_energy_transfer.yaml \
+#     --output-dir runs/sweep7_e5_energy_transfer
+#
+# Smoke first (1 variant, 1 seed, 50 steps) to confirm VRAM/shm before the full run:
+#   FLOWER_DATA_CACHE=data_cache uv run python -m flower.sweep \
+#     --config configs/sweep7_e5_energy_transfer.yaml \
+#     --output-dir runs/sweep7_e5_smoke \
+#     --variants e5_hier_max_16_energy_beta025 --seeds 0 --steps 50
+sweep:
+  name: sweep7_e5_energy_transfer
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 2048
+      eval_seq_len: 8192
+      streaming: true
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 2
+      steps: 10000
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 2500
+      validation_steps: 200
+      checkpoint_interval: 5000
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.003
+      muon_ns_steps: 5
+      muon_momentum: 0.95
+      memory_lr: 0.0
+      seed: 0
+      seeds: [0, 1, 2]
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 2048
+      local_window: 64
+      rope_base: 10000.0
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: true
+      memory_aggregation: max
+      flow_steps: 3
+      energy_read: false
+      energy_beta_init: 0.25
+  variants:
+    # Control: hier_max_16 with the convex/softmax mean-pool read.
+    - name: e5_hier_max_16_control
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        local_window: 64
+        energy_read: false
+
+    # Energy read at beta_init 0.25 (the synthetic-MQAR winner) — same module,
+    # only the read operator changes.
+    - name: e5_hier_max_16_energy_beta025
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        local_window: 64
+        energy_read: true
+        energy_beta_init: 0.25

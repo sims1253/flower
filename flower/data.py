@@ -88,6 +88,68 @@ class SyntheticTokenStream:
             yield data.to(self.device)
 
 
+class MQARTokenStream:
+    """Synthetic multi-query associative-recall stream.
+
+    Each sequence is `[k1,v1,...,kN,vN] + delay + [q1,a1,q2,a2,...]` where
+    `a_i` is the value paired with query key `q_i`. Labels are `-100` except at
+    answer positions, so training is not dominated by unpredictable random
+    keys/values/delay tokens.
+    """
+
+    def __init__(self, config: DataConfig, batch_size: int, device: torch.device, seed: int = 1234) -> None:
+        self.config = config
+        self.batch_size = batch_size
+        self.device = device
+        self.generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    def _sample_unique(self, vocab: int, count: int) -> torch.Tensor:
+        if vocab >= count:
+            return torch.randperm(vocab, generator=self.generator, dtype=torch.long)[:count]
+        return torch.randint(0, vocab, (count,), generator=self.generator, dtype=torch.long)
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        vocab = min(self.config.synthetic_vocab_size, 50257)
+        seq_len = self.config.sequence_length
+        # Keep the task feasible for short smoke configs while scaling with context.
+        max_pairs = max(1, min(128, seq_len // 4, vocab // 2 if vocab > 1 else 1))
+        pair_choices = [p for p in (8, 16, 32, 64, 128) if p <= max_pairs]
+        if not pair_choices:
+            pair_choices = [max_pairs]
+        while True:
+            rows: list[torch.Tensor] = []
+            label_rows: list[torch.Tensor] = []
+            for _ in range(self.batch_size):
+                num_pairs = int(pair_choices[torch.randint(0, len(pair_choices), (), generator=self.generator)])
+                num_queries = max(1, min(num_pairs, seq_len // 8))
+                kv_len = num_pairs * 2
+                qa_len = num_queries * 2
+                delay_len = max(0, seq_len - kv_len - qa_len)
+                keys = self._sample_unique(vocab, num_pairs)
+                vals = self._sample_unique(vocab, num_pairs)
+                kv = torch.stack([keys, vals], dim=-1).reshape(kv_len)
+                query_indices = torch.randperm(num_pairs, generator=self.generator)[:num_queries]
+                query_keys = keys[query_indices]
+                query_vals = vals[query_indices]
+                delay = (
+                    torch.randint(0, vocab, (delay_len,), generator=self.generator, dtype=torch.long)
+                    if delay_len > 0
+                    else kv.new_empty(0)
+                )
+                qa = torch.stack([query_keys, query_vals], dim=-1).reshape(qa_len)
+                row = torch.cat([kv, delay, qa])
+                labels = torch.full((row.numel(),), -100, dtype=torch.long)
+                ans_start = kv_len + delay_len + 1
+                labels[ans_start : ans_start + qa_len : 2] = query_vals
+                if row.numel() < seq_len:
+                    pad = torch.randint(0, vocab, (seq_len - row.numel(),), generator=self.generator, dtype=torch.long)
+                    row = torch.cat([row, pad])
+                    labels = torch.cat([labels, torch.full((pad.numel(),), -100, dtype=torch.long)])
+                rows.append(row[:seq_len])
+                label_rows.append(labels[:seq_len])
+            yield torch.stack(rows, dim=0).to(self.device), torch.stack(label_rows, dim=0).to(self.device)
+
+
 VAL_DOCS = 1024
 """Number of FineWeb-Edu documents reserved for validation. Train iterators skip
 the first VAL_DOCS rows; validation iterators take the first VAL_DOCS rows. This
@@ -282,6 +344,8 @@ def token_batches(
 ) -> Iterator[torch.Tensor]:
     if config.dataset == "synthetic":
         return iter(SyntheticTokenStream(config, batch_size, device, seed=seed))
+    if config.dataset == "mqar":
+        return iter(MQARTokenStream(config, batch_size, device, seed=seed))
     if config.dataset in {"fineweb_edu", "fineweb-edu"}:
         # `split` is interpreted as a role here ("train" or "validation") since
         # FineWeb-Edu's sample-10BT only exposes a single upstream split.
@@ -309,7 +373,7 @@ def validation_token_batches(
     num_workers: int = 1,
     prefetch_factor: int = 2,
 ) -> Iterator[torch.Tensor]:
-    if config.dataset == "synthetic":
+    if config.dataset in {"synthetic", "mqar"}:
         return token_batches(config, batch_size, device, seed=config.validation_seed)
     if config.validation_split is not None and config.validation_split == config.split:
         raise ValueError("data.validation_split must differ from data.split")

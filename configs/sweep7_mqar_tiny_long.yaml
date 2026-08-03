@@ -1,0 +1,67 @@
+# Sweep 7 MQAR tiny long calibration.
+#
+# Same tiny masked-MQAR setup as sweep7_mqar_tiny_calibration, but longer. This
+# checks whether the candidate-set MQAR breaking-point gate is reachable at all.
+sweep:
+  name: sweep7_mqar_tiny_long
+  defaults:
+    data:
+      dataset: mqar
+      sequence_length: 512
+      eval_seq_len: 1024
+      synthetic_vocab_size: 256
+      streaming: true
+    training:
+      batch_size: 32
+      gradient_accumulation_steps: 1
+      steps: 5000
+      lr_schedule: linear_warmup
+      warmup_steps: 200
+      validation_interval: 1000
+      validation_steps: 50
+      checkpoint_interval: 5000
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.003
+      muon_ns_steps: 5
+      muon_momentum: 0.95
+      memory_lr: 0.0
+      seed: 0
+      seeds: [0]
+      composite_eval: true
+    model:
+      vocab_size: 256
+      d_model: 192
+      num_heads: 6
+      num_layers: 4
+      ffn_dim: 768
+      max_seq_len: 512
+      local_window: 64
+      rope_base: 10000.0
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: true
+      memory_aggregation: max
+  variants:
+    - name: vanilla_local
+      model:
+        variant: vanilla_local
+        hierarchical_memory: false
+
+    - name: hier_max_16
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+
+    - name: bloom_memory
+      model:
+        variant: bloom_memory
+        hierarchical_memory: false
+        bloom_num_hashes: 4
+        bloom_temperature: 0.5
+        bloom_summary_points: 16

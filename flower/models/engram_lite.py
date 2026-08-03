@@ -58,7 +58,7 @@ class EngramLiteBlock(nn.Module):
         self.local = CausalSelfAttention(config, config.local_window)
         self.engram = EngramResidual(config)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         x = x + self.local(self.ln1(x))

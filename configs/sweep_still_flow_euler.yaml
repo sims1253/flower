@@ -1,0 +1,75 @@
+# Sweep 12 (focused) — Flow variance reduction via more Euler steps.
+#
+# Sweep 10 found flow compactor is ~2x more seed-variable than standard
+# (val_ppl sd ~0.030 vs ~0.017) even though its MEAN trends better. This
+# focused cut tests the cheapest variance-reduction knob: more Euler steps
+# (finer integration = less trajectory error = less seed sensitivity).
+#
+# 3 arms x 3 seeds = 9 runs. All param-identical to sweep10's B arm (7,110,144).
+# Batch 32x2 (matches sweep10 B exactly; flow B peaked at 19.9GB, safe on 32GB).
+
+sweep:
+  name: sweep_still_flow_euler
+
+  defaults:
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 1500
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 1500
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+
+    training:
+      # batch 32x2 = effective 64. Flow B arm peaked at 19.9GB here (safe).
+      # Matches sweep10 B arm exactly for clean variance comparison.
+      batch_size: 32
+      gradient_accumulation_steps: 2
+      steps: 6500
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+      validation_steps: 20
+
+  variants:
+    # B0 — reference: sweep10's B arm (steps=5). sd ~0.028 in sweep10.
+    - name: B0_steps5
+      model: { variant: still_flow, still_flow_steps: 5 }
+
+    # B1 — more Euler steps (finer dt). Hypothesis: lower variance.
+    - name: B1_steps10
+      model: { variant: still_flow, still_flow_steps: 10 }
+
+    # B2 — even more Euler steps. Linear compute cost, but tests the limit.
+    - name: B2_steps20
+      model: { variant: still_flow, still_flow_steps: 20 }

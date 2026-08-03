@@ -1,0 +1,100 @@
+# Sweep 13, Phase 0b — TLM taper on the BASE model's FFN width.
+#
+# The tapered-language-models result (arXiv:2606.23670) is measured on d_ff of
+# the base transformer, not on a compactor latent width: under a fixed total
+# parameter budget, wider-early beats uniform by ~0.32 ppl and wider-late LOSES
+# by ~1.01 ppl. 8/8 comparisons improved across 3 scales and 4 architectures.
+# The mechanism is that later layers increasingly reinforce rather than
+# transform the residual stream, so they need less capacity.
+#
+# Phase 1's B/C arms test that hypothesis on the compactor's d_latent, which is
+# the analogy rather than the published result. This config tests the actual
+# published claim. It changes the shared base, so it cannot be a phase-1 arm —
+# whichever schedule wins here becomes the base for the phase-1 bake-off.
+#
+# All three arms are budget-preserving: the per-layer ffn_dim schedules sum to
+# 14 * 3072 = 43008, so total parameters are identical and only the ALLOCATION
+# across depth differs. The direction is what the paper says matters.
+#
+#   uv run python -m flower.sweep --config configs/sweep13_100m_phase0_taper.yaml \
+#     --output-dir runs/sweep13_100m_phase0_taper
+#
+# NOTE: requires per-layer ffn_dim support in the base model. If
+# `ffn_dim_schedule` is not yet wired through TransformerBlock, this config will
+# fail loudly at build time rather than silently training uniform arms.
+
+sweep:
+  name: sweep13_100m_phase0_taper
+
+  defaults:
+    model:
+      variant: vanilla_local
+      vocab_size: 16384
+      d_model: 768
+      num_heads: 12
+      num_layers: 14
+      ffn_dim: 3072
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      norm_type: rmsnorm
+      ffn_activation: swiglu
+      ffn_param_match: true
+      qk_norm: true
+      use_bias: false
+      init_scheme: scaled
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+      # Measured (scripts/analyze_tokenizer.py). Enables val_bpb, which is the
+      # only metric comparable against runs on a different tokenizer.
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 4
+      # Shorter than the full phase-0 run: this is a direction test, and the TLM
+      # effect (~0.3 ppl) is large relative to base seed noise. Winner is then
+      # trained for the full 15000 to become the phase-1 teacher.
+      steps: 6000
+      lr: 0.003
+      warmup_steps: 300
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 2000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 20
+      validation_interval: 500
+      precision: bf16
+      compile_model: true
+
+  variants:
+    - name: T0_uniform
+      model: {}
+
+    # Wider-early: 4224 -> 1920, linear, sums to 43008.
+    - name: T1_wider_early
+      model:
+        ffn_dim_schedule: [4224, 4046, 3869, 3692, 3515, 3338, 3161, 2983, 2806, 2629, 2452, 2275, 2098, 1920]
+
+    # Wider-late: the same schedule reversed. The paper's control — it should
+    # be clearly WORSE than uniform (~+1 ppl), which is the sharper prediction
+    # and the better falsification test of the mechanism.
+    - name: T2_wider_late
+      model:
+        ffn_dim_schedule: [1920, 2098, 2275, 2452, 2629, 2806, 2983, 3161, 3338, 3515, 3692, 3869, 4046, 4224]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM
+from flower.models.bloom_memory import build_bloom_memory_model
 from flower.models.engram_lite import build_engram_lite_model
 from flower.models.fla_layer import build_fla_gdn_model
 from flower.models.flow_attention import build_flow_attention_model
@@ -9,11 +10,16 @@ from flower.models.flow_attn_flow import build_fa_fm_model
 from flower.models.flow_attn_summary import build_fa_sm_model
 from flower.models.flow_meanflow import build_flow_meanflow_model
 from flower.models.flow_memory import build_flow_memory_model
+from flower.models.flow_ot_memory import build_flow_ot_memory_model
 from flower.models.flow_pma import build_flow_pma_model
+from flower.models.frequency_decay_memory import build_frequency_decay_memory_model
+from flower.models.hamiltonian_attention import build_hamiltonian_attention_model
 from flower.models.linear_memory import build_linear_memory_model
 from flower.models.partitioned_memory import build_partitioned_memory_model
 from flower.models.phase_memory import build_phase_memory_model
+from flower.models.still_lm import build_still_model
 from flower.models.summary_memory import build_summary_memory_model
+from flower.models.surprise_memory import build_surprise_memory_model
 from flower.models.titans_mac import build_titans_mac_model
 from flower.models.vanilla import build_vanilla_model
 
@@ -48,8 +54,20 @@ def build_model(config: ModelConfig) -> CausalLM:
         return build_engram_lite_model(config)
     if variant == "titans_mac":
         return build_titans_mac_model(config)
+    if variant == "flow_ot_memory":
+        return build_flow_ot_memory_model(config)
+    if variant == "surprise_memory":
+        return build_surprise_memory_model(config)
+    if variant == "frequency_decay_memory":
+        return build_frequency_decay_memory_model(config)
+    if variant == "bloom_memory":
+        return build_bloom_memory_model(config)
+    if variant == "hamiltonian_attention":
+        return build_hamiltonian_attention_model(config)
     if variant in {"fla_gdn", "fla_layer"}:
         return build_fla_gdn_model(config)
+    if variant.startswith("still"):
+        return build_still_model(config)
     raise ValueError(f"Unknown model variant: {variant}")
 
 

@@ -1,0 +1,75 @@
+# Sweep 6 reduced-batch relaunch: all flow-on-Q/K variants.
+#
+# The original sweep6 run OOM'd at batch=16 on every variant that puts a flow on
+# Q/K: EulerFlow (flow_attention_control) and the SympNet hamiltonian variants
+# all materialize extra Q/K tensors on top of the 16 memory slots, spilling past
+# the 5090's 32 GiB into unified memory and thrashing. flow_attention_control was
+# killed manually; hamiltonian_isotropic stalled at step 2500 and was finished
+# off by a reboot. Only vanilla_local_control (no flow -> light) survived.
+#
+# Fix is the same as looped_x2: halve batch, double accum to preserve effective
+# batch size = 32. All other settings match sweep6 defaults exactly so results
+# stay directly comparable to vanilla_local_control (val 3.792, batch=16).
+#
+# Point --output-dir at the existing sweep6 dir; the launcher skips variants
+# with an existing metrics.json, so only these four (re)run.
+sweep:
+  name: sweep6_flow_attention_retest
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 2048
+      streaming: true
+    training:
+      batch_size: 8
+      gradient_accumulation_steps: 4
+      steps: 10000
+      lr: 0.000283
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 2500
+      validation_steps: 200
+      checkpoint_interval: 2500
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: adamw
+      memory_lr: 0.0
+      seed: 0
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 2048
+      local_window: 128
+      rope_base: 10000.0
+      memory_slots: 16
+      flow_steps: 3
+      flow_shared: true
+      flow_mode: euler
+      hamiltonian_mass: isotropic
+      hamiltonian_walnuts: false
+      hamiltonian_energy_threshold: 0.05
+      hamiltonian_max_subdivisions: 2
+  variants:
+    - name: flow_attention_control
+      model:
+        variant: flow_attention
+    - name: hamiltonian_isotropic
+      model:
+        variant: hamiltonian_attention
+        hamiltonian_mass: isotropic
+    - name: hamiltonian_diagonal_mass
+      model:
+        variant: hamiltonian_attention
+        hamiltonian_mass: diagonal
+    - name: hamiltonian_deep
+      model:
+        variant: hamiltonian_attention
+        hamiltonian_mass: isotropic
+        flow_steps: 6

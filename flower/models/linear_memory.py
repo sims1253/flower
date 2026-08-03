@@ -17,7 +17,7 @@ class LinearMemoryBlock(nn.Module):
         self.ln_mem = nn.LayerNorm(config.d_model)
         self.mem_read = MemoryRead(config)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
         self.write = nn.Linear(config.d_model, config.d_model)
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:

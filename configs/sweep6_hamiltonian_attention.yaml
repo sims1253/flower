@@ -1,0 +1,94 @@
+# Sweep 6: symplectic Q/K attention flow bake-off.
+#
+# Focused experiment on the Q/K flow mechanism only (no memory module). Two
+# controls (no flow, Euler flow) vs three SympNet-style symplectic flow
+# variants. Memory slots are left at sweep4/5 defaults but the chosen variants
+# do not consume them -- they only test the attention flow.
+#
+# Variants:
+#   - vanilla_local_control       : no flow, plain local attention with RoPE
+#   - flow_attention_control      : EulerFlow on Q/K (existing variant)
+#   - hamiltonian_isotropic       : SympNet gradient-shear flow, isotropic K
+#   - hamiltonian_diagonal_mass   : + learned diagonal kinetic mass
+#   - hamiltonian_deep            : same as isotropic but flow_steps=6 (depth test)
+#
+# WALNUTS adaptive-dt was prototyped (see WalnutsHamiltonianFlow) and cut from
+# this sweep after a smoke check: a SympNet preserves the shadow Hamiltonian
+# exactly by construction, so the explicit-H drift used by WALNUTS as a
+# refinement signal does not shrink under dt halving. WALNUTS would just
+# saturate at max_subdivisions, paying ~7x leapfrog cost per macro step for no
+# adaptive behaviour. Class kept for a future non-SympNet flow.
+#
+# What we are looking for:
+#   - composite-eval improvements over flow_attention_control (does symplecticity
+#     help, or is the constraint too tight?)
+#   - hamiltonian_energy_drift_{mean,max} should stay bounded across training
+#     for the symplectic variants (it is the "did we get the architectural
+#     guarantee" check)
+#   - hamiltonian_substeps_mean (WALNUTS only) should drift up if the model
+#     learns sharper potentials, indicating real adaptivity rather than uniform
+#     coarse stepping
+sweep:
+  name: sweep6_hamiltonian_attention
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 2048
+      streaming: true
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 2
+      steps: 10000
+      lr: 0.000283
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 2500
+      validation_steps: 200
+      checkpoint_interval: 2500
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: adamw
+      memory_lr: 0.0
+      seed: 0
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 2048
+      local_window: 128
+      rope_base: 10000.0
+      memory_slots: 16
+      flow_steps: 3
+      flow_shared: true
+      flow_mode: euler
+      # Hamiltonian flow defaults (overridable per variant).
+      hamiltonian_mass: isotropic
+      hamiltonian_walnuts: false
+      hamiltonian_energy_threshold: 0.05
+      hamiltonian_max_subdivisions: 2
+  variants:
+    - name: vanilla_local_control
+      model:
+        variant: vanilla_local
+    - name: flow_attention_control
+      model:
+        variant: flow_attention
+    - name: hamiltonian_isotropic
+      model:
+        variant: hamiltonian_attention
+        hamiltonian_mass: isotropic
+    - name: hamiltonian_diagonal_mass
+      model:
+        variant: hamiltonian_attention
+        hamiltonian_mass: diagonal
+    - name: hamiltonian_deep
+      model:
+        variant: hamiltonian_attention
+        hamiltonian_mass: isotropic
+        flow_steps: 6

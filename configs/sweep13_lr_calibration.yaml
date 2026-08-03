@@ -1,0 +1,116 @@
+# Sweep 13, Phase 0a — Learning-rate calibration for the new base.
+#
+# WHY THIS EXISTS
+#
+# The inherited muon_lr (0.002 for the base, 0.003 for compactors) was tuned
+# against a model whose initial loss was 565 instead of 9.7 — the tied N(0,1)
+# embedding defect. With `init_scheme: scaled` the loss landscape at step 0 is
+# completely different, so those values no longer have empirical backing. They
+# are a leftover constant, not a measurement.
+#
+# Nothing downstream is trustworthy until this is re-anchored: phase 0 trains
+# the shared teacher that all 39 phase-1 runs inherit, and a mistuned base LR
+# biases every arm identically but invisibly.
+#
+# Runs 6 LR points at 2500 steps, single seed. LR effects at this spacing are
+# far larger than seed noise, so 1 seed is enough to pick a peak; re-run the
+# winner and its two neighbours at 3 seeds if the curve looks flat.
+#
+#   uv run python -m flower.sweep --config configs/sweep13_lr_calibration.yaml \
+#     --output-dir runs/sweep13_lr_cal
+#
+# Cost: 6 x 2500 x ~0.58 s = ~2.4 h.
+#
+# ---------------------------------------------------------------------------
+# READING THE RESULT — the token-horizon correction
+# ---------------------------------------------------------------------------
+# The winning LR here is NOT the LR to use for the 15000-step phase-0 run.
+# Optimal LR decreases with training duration (Complete(d)P, arXiv:2512.22382);
+# a short probe is systematically biased toward LRs that are too high. Apply:
+#
+#   uv run python -c "from flower.hparams import horizon_correction as h; \
+#       print(0.008 * h(2500, 15000))"        # -> multiply winner by ~0.41
+#
+# This is exactly the failure that broke Delphi's first attempt: clean at small
+# scale, diverged at 1e23 FLOPs, because the LR was too high for a long run.
+#
+# Compare arms on **val_bpb**, not val_perplexity. Both are logged; bpb is the
+# one that stays meaningful if the tokenizer ever changes again.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS AND IS NOT SWEPT
+# ---------------------------------------------------------------------------
+# Swept: muon_lr (the 2D matrices — attention and FFN weights; the bulk).
+# Held:  lr = 0.003 (AdamW group: embeddings, RMSNorm gains). Muon and AdamW
+#        LRs interact only weakly, and a 2D grid costs 36 runs instead of 6.
+#        If the muon curve comes out flat, sweep `lr` next rather than widening
+#        this one.
+
+sweep:
+  name: sweep13_lr_calibration
+
+  defaults:
+    model:
+      variant: vanilla_local
+      vocab_size: 16384
+      d_model: 768
+      num_heads: 12
+      num_layers: 14
+      ffn_dim: 3072
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      norm_type: rmsnorm
+      ffn_activation: swiglu
+      ffn_param_match: true
+      qk_norm: true
+      use_bias: false
+      init_scheme: scaled
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+      bytes_per_token: 4.279     # measured; enables val_bpb
+
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 4
+      steps: 2500
+      lr: 0.003
+      warmup_steps: 150
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      grad_clip: 1.0
+      eval_interval: 250
+      validation_interval: 250
+      validation_steps: 40      # 2x the phase-0 setting: LR curves are read off
+                                # the validation number, so halve its noise
+      checkpoint_interval: 2500
+      save_checkpoints: false   # calibration runs are throwaway
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      optimizer: muon
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      precision: bf16
+      compile_model: true
+
+  variants:
+    - name: lr_0002
+      training: { muon_lr: 0.002 }   # the inherited value, as the anchor
+    - name: lr_0004
+      training: { muon_lr: 0.004 }
+    - name: lr_0008
+      training: { muon_lr: 0.008 }
+    - name: lr_0016
+      training: { muon_lr: 0.016 }
+    - name: lr_0032
+      training: { muon_lr: 0.032 }
+    - name: lr_0064
+      training: { muon_lr: 0.064 }

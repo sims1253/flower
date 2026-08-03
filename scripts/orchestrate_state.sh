@@ -12,12 +12,14 @@
 #   UNKNOWN          — couldn't reach instance
 set -uo pipefail
 
-INSTANCE_ID=36458346
-SSH_HOST=ssh9.vast.ai
-SSH_PORT=18346
-SSH="ssh -o ConnectTimeout=10 -i /home/m0hawk/.ssh/id_ed25519 -o IdentitiesOnly=yes -p $SSH_PORT root@$SSH_HOST"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTANCE_ID="${INSTANCE_ID:-36458346}"
+SSH_HOST="${SSH_HOST:-ssh9.vast.ai}"
+SSH_PORT="${SSH_PORT:-18346}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+SSH="ssh -o ConnectTimeout=10 -i $SSH_KEY -o IdentitiesOnly=yes -p $SSH_PORT root@$SSH_HOST"
 
-instance_status=$(uvx --from vastai python /home/m0hawk/Documents/flower/scripts/vast_instance_info.py status $INSTANCE_ID 2>/dev/null \
+instance_status=$(uvx --from vastai python "$REPO_ROOT/scripts/vast_instance_info.py" status $INSTANCE_ID 2>/dev/null \
   | python3 -c "
 import json, sys, re
 data = re.sub(r'[\\x00-\\x1f\\x7f-\\x9f]', ' ', sys.stdin.read())
@@ -30,7 +32,7 @@ if [[ "$instance_status" != "running" ]]; then
   exit 0
 fi
 
-if [[ -f /home/m0hawk/Documents/flower/runs/local_pull/SWEEP2_COMPLETE ]]; then
+if [[ -f "$REPO_ROOT/runs/local_pull/SWEEP2_COMPLETE" ]]; then
   echo "ALL_PULLED"
   exit 0
 fi

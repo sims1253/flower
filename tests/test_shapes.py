@@ -18,6 +18,11 @@ CPU_VARIANTS = [
     "titans_mac",
     "flow_meanflow",
     "flow_pma",
+    "flow_ot_memory",
+    "surprise_memory",
+    "frequency_decay_memory",
+    "bloom_memory",
+    "hamiltonian_attention",
 ]
 CUDA_ONLY_VARIANTS = ["fla_gdn"]
 

@@ -1,0 +1,55 @@
+# Still Phase 0: Pretrain base models (vanilla_local) for compactor training.
+# One model per seed, to be loaded by Phase 1 compactor training.
+
+sweep:
+  name: sweep_still_phase0
+
+  defaults:
+    model:
+      variant: vanilla_local
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 512
+      local_window: 128
+      rope_base: 10000.0
+      dropout: 0.0
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 512
+      eval_seq_len: 512
+
+    training:
+      batch_size: 32
+      gradient_accumulation_steps: 1
+      steps: 3000
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 300
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+
+  variants:
+    - name: base_s0
+      training:
+        seed: 0
+    - name: base_s1
+      training:
+        seed: 1
+    - name: base_s2
+      training:
+        seed: 2

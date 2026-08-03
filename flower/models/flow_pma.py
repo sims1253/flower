@@ -64,7 +64,7 @@ class FlowPMABlock(nn.Module):
         self.ln_mem = nn.LayerNorm(config.d_model)
         self.mem_read = MemoryRead(config)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
 
         # PMA: learned seed/latent vectors that cross-attend to the token sequence.
         # Each layer has its own seeds (not weight-shared across layers).

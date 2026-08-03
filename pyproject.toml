@@ -71,5 +71,6 @@ include = ["flower*"]
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.13",
+    "torchao>=0.17.0",
     "ty>=0.0.37",
 ]

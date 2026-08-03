@@ -28,13 +28,13 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _checkpoint_config(path: Path) -> dict[str, Any] | None:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     config = payload.get("config")
     return config if isinstance(config, dict) else None
 
 
 def _load_checkpoint_model(model: torch.nn.Module, checkpoint: Path, device: torch.device) -> int | None:
-    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
     state = payload.get("model", payload)
     model.load_state_dict(state)
     step = payload.get("step")
@@ -82,9 +82,13 @@ def evaluate_batches(
     start = time.perf_counter()
     for _ in range(batches_count):
         batch = next(batches)
-        out = model(batch, labels=batch)
+        if isinstance(batch, (tuple, list)) and len(batch) == 2:
+            input_ids, labels = batch
+        else:
+            input_ids, labels = batch, batch
+        out = model(input_ids, labels=labels)
         total_loss += float(out["loss"].cpu())
-        total_tokens += batch.numel()
+        total_tokens += int((labels[:, 1:] != -100).sum().cpu())
     loss = total_loss / max(batches_count, 1)
     return {
         "loss": loss,
@@ -105,7 +109,7 @@ def evaluate_documents(
     bootstrap: bool = False,
     bootstrap_samples: int = 1000,
 ) -> dict[str, Any]:
-    if cfg.data.dataset == "synthetic":
+    if cfg.data.dataset in {"synthetic", "mqar"}:
         batch_metrics = evaluate_batches(model, cfg, device, batches_count=max(1, doc_limit or 10))
         loss = float(batch_metrics["loss"])
         bpb = loss / math.log(2.0)
@@ -121,8 +125,8 @@ def evaluate_documents(
         return metrics
 
     encoder = build_tokenizer(cfg.data.tokenizer)
-    max_len = cfg.data.sequence_length or cfg.model.max_seq_len
-    max_len = min(max_len, cfg.model.max_seq_len)
+    eval_seq_len = getattr(cfg.data, "eval_seq_len", None)
+    max_len = eval_seq_len or cfg.data.sequence_length or cfg.model.max_seq_len
     doc_nlls: list[float] = []
     doc_pred_tokens: list[float] = []
     doc_bytes: list[float] = []

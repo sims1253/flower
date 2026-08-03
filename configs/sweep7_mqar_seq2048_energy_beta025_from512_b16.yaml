@@ -1,0 +1,48 @@
+# Sweep 7 Phase B, beta=0.25 energy-read length curriculum.
+#
+# Resume from solved seq-512/vocab-4096 beta=0.25 energy checkpoints and
+# continue at seq_len=2048 with batch 16.
+data:
+  dataset: mqar
+  sequence_length: 2048
+  eval_seq_len: 4096
+  synthetic_vocab_size: 4096
+  streaming: true
+
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  steps: 10000
+  lr_schedule: linear_warmup
+  warmup_steps: 200
+  validation_interval: 1000
+  validation_steps: 50
+  checkpoint_interval: 5000
+  save_checkpoints: true
+  grad_clip: 1.0
+  device: auto
+  log_backend: tensorboard
+  optimizer: muon
+  muon_lr: 0.003
+  muon_ns_steps: 5
+  muon_momentum: 0.95
+  memory_lr: 0.0
+  seed: 0
+  composite_eval: true
+
+model:
+  variant: summary_memory
+  vocab_size: 4096
+  d_model: 192
+  num_heads: 6
+  num_layers: 4
+  ffn_dim: 768
+  max_seq_len: 2048
+  local_window: 64
+  rope_base: 10000.0
+  memory_slots: 16
+  short_memory_slots: 4
+  hierarchical_memory: true
+  memory_aggregation: max
+  energy_read: true
+  energy_beta_init: 0.25

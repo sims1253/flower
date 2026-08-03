@@ -25,7 +25,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from flower.sweep import load_sweep, select_variants, write_variant_config
+from flower.sweep import expand_seed_variants, load_sweep, parse_seeds, select_variants, write_variant_config
 
 
 def _spawn(
@@ -75,6 +75,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=None, help="Override training.steps")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--variants", type=str, default=None)
+    parser.add_argument("--seeds", type=str, default=None, help="Comma-separated seeds; overrides training.seeds")
     parser.add_argument("--output-dir", type=str, default="runs/sweep_parallel")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument(
@@ -90,6 +91,7 @@ def main() -> None:
 
     sweep_name, variants = load_sweep(args.config)
     selected = select_variants(variants, args.variants, args.limit)
+    selected = expand_seed_variants(selected, parse_seeds(args.seeds))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

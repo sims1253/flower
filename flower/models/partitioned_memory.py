@@ -79,7 +79,7 @@ class PartitionedMemoryBlock(nn.Module):
         self.ln_mem = nn.LayerNorm(config.d_model)
         self.mem_read = PartitionedMemoryRead(config, self.num_banks, self.slots_per_bank)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
 
         # Per-bank update MLPs. Sharing the same head saves params; one set covers all banks.
         self.token_mlp = nn.Sequential(

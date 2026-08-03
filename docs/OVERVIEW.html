@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flower — Memory-Augmented Small LMs: Project Overview</title>
+<style>
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-card: #1a2030;
+    --bg-card-2: #11182a;
+    --border-color: #30363d;
+    --border-soft: #21262d;
+    --text-primary: #e6edf3;
+    --text-secondary: #b1bac4;
+    --text-muted: #7d8590;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --teal: #39d353;
+    --pink: #f778ba;
+    --radius: 14px;
+    --radius-sm: 8px;
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+  }
+
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .container { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- HERO ---------- */
+  header.hero {
+    padding: 88px 0 64px;
+    background:
+      radial-gradient(1200px 500px at 15% -10%, rgba(188,140,255,0.14), transparent 60%),
+      radial-gradient(1000px 500px at 95% 0%, rgba(88,166,255,0.12), transparent 55%),
+      linear-gradient(180deg, #0a0f1d 0%, #0d1117 100%);
+    border-bottom: 1px solid var(--border-color);
+  }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 999px;
+    border: 1px solid var(--purple); color: var(--purple);
+    font-size: 12.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .hero-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--purple); box-shadow: 0 0 10px var(--purple); }
+  h1 {
+    font-size: clamp(2.3rem, 5.4vw, 3.8rem); font-weight: 800;
+    margin: 22px 0 14px; line-height: 1.08; letter-spacing: -0.02em;
+  }
+  h1 .grad {
+    background: linear-gradient(120deg, var(--blue), var(--purple) 60%, var(--pink));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .subtitle { font-size: 1.18rem; color: var(--text-secondary); max-width: 760px; }
+  .hero-meta {
+    margin-top: 30px; display: flex; gap: 28px; flex-wrap: wrap;
+    color: var(--text-muted); font-family: var(--font-mono); font-size: 13px;
+  }
+  .hero-meta span strong { color: var(--text-primary); }
+  .hero-nav {
+    margin-top: 34px; display: flex; gap: 10px; flex-wrap: wrap;
+  }
+  .hero-nav a {
+    font-size: 13px; font-weight: 500; padding: 7px 14px; border-radius: 999px;
+    border: 1px solid var(--border-color); color: var(--text-secondary);
+    text-decoration: none; transition: all .15s ease;
+  }
+  .hero-nav a:hover { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.06); }
+
+  main { padding: 64px 0 96px; }
+  section { margin-bottom: 72px; scroll-margin-top: 24px; }
+  h2 {
+    font-size: 1.85rem; font-weight: 700; margin-bottom: 6px;
+    padding-bottom: 12px; border-bottom: 1px solid var(--border-color);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .sec-num {
+    font-family: var(--font-mono); font-size: 0.95rem; font-weight: 600;
+    color: var(--purple); background: rgba(188,140,255,0.10);
+    border: 1px solid rgba(188,140,255,0.3); padding: 3px 9px; border-radius: 6px;
+  }
+  .lede { font-size: 1.12rem; color: var(--text-secondary); margin-bottom: 18px; max-width: 880px; }
+  h3 { font-size: 1.22rem; font-weight: 600; margin: 30px 0 8px; color: var(--text-primary); }
+  p, ul, ol { margin-bottom: 12px; color: var(--text-secondary); }
+  p { max-width: 900px; }
+  ul, ol { padding-left: 24px; }
+  li { margin-bottom: 6px; }
+  strong { color: var(--text-primary); }
+  code {
+    font-family: var(--font-mono); font-size: 0.88em;
+    background: var(--bg-secondary); padding: 1px 6px; border-radius: 4px; color: var(--teal);
+  }
+
+  /* ---------- CALLOUTS ---------- */
+  .callout {
+    border-left: 3px solid var(--blue);
+    background: rgba(88, 166, 255, 0.05);
+    padding: 16px 20px; border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    margin: 18px 0;
+  }
+  .callout.warn { border-color: var(--orange); background: rgba(210, 153, 34, 0.07); }
+  .callout.ok   { border-color: var(--green);  background: rgba(63, 185, 80, 0.07); }
+  .callout.bad  { border-color: var(--red);    background: rgba(248, 81, 73, 0.07); }
+  .callout.idea { border-color: var(--purple); background: rgba(188, 140, 255, 0.07); }
+  .callout strong { color: var(--text-primary); }
+  .callout .ctitle { display: block; font-weight: 700; margin-bottom: 4px; }
+
+  /* ---------- STAT STRIP ---------- */
+  .stat-strip {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px; margin: 22px 0 8px;
+  }
+  .stat {
+    background: var(--bg-card); border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm); padding: 18px 18px;
+  }
+  .stat .num { font-family: var(--font-mono); font-size: 1.7rem; font-weight: 700; color: var(--blue); }
+  .stat .num.green { color: var(--green); } .stat .num.purple { color: var(--purple); }
+  .stat .num.orange { color: var(--orange); }
+  .stat .lbl { font-size: 12.5px; color: var(--text-muted); margin-top: 2px; }
+
+  /* ---------- TABLES ---------- */
+  .table-wrap { overflow-x: auto; margin: 18px 0 8px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 580px; }
+  th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border-soft); }
+  th { background: var(--bg-secondary); color: var(--text-muted); font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td.mono, th.mono { font-family: var(--font-mono); }
+  tbody tr:hover { background: rgba(88,166,255,0.03); }
+  tbody tr.best td { color: var(--green); font-weight: 600; }
+  tbody tr.best td.mono { color: var(--green); }
+  tbody tr.meh td { color: var(--text-muted); }
+  .tag {
+    display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: 999px; letter-spacing: 0.03em;
+  }
+  .tag-win  { background: rgba(63,185,80,0.14); color: var(--green); }
+  .tag-tie  { background: rgba(125,133,144,0.16); color: var(--text-muted); }
+  .tag-loss { background: rgba(248,81,73,0.14); color: var(--red); }
+  .tag-info { background: rgba(88,166,255,0.14); color: var(--blue); }
+  .tag-key  { background: rgba(188,140,255,0.14); color: var(--purple); }
+  .cap { font-size: 12.5px; color: var(--text-muted); margin-top: 8px; font-style: italic; }
+
+  /* ---------- TIMELINE ---------- */
+  .timeline { position: relative; margin: 28px 0 8px; padding-left: 30px; }
+  .timeline::before {
+    content: ''; position: absolute; left: 9px; top: 6px; bottom: 6px;
+    width: 2px; background: linear-gradient(180deg, var(--blue), var(--purple), var(--pink));
+    opacity: 0.5;
+  }
+  .tl-item { position: relative; margin-bottom: 22px; }
+  .tl-item::before {
+    content: ''; position: absolute; left: -30px; top: 6px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--bg-primary); border: 2px solid var(--blue);
+    box-shadow: 0 0 0 4px rgba(88,166,255,0.12);
+  }
+  .tl-item.win::before { border-color: var(--green); box-shadow: 0 0 0 4px rgba(63,185,80,0.14); }
+  .tl-item.neg::before { border-color: var(--red); box-shadow: 0 0 0 4px rgba(248,81,73,0.12); }
+  .tl-item.method::before { border-color: var(--purple); box-shadow: 0 0 0 4px rgba(188,140,255,0.12); }
+  .tl-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .tl-head .tl-name { font-weight: 700; color: var(--text-primary); font-size: 1.02rem; }
+  .tl-head .tl-date { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+  .tl-body { color: var(--text-secondary); font-size: 0.97rem; }
+  .tl-body .hl { color: var(--text-primary); font-weight: 500; }
+  .tl-body .win-num { color: var(--green); font-family: var(--font-mono); font-weight: 600; }
+  .tl-body .loss-num { color: var(--red); font-family: var(--font-mono); font-weight: 600; }
+
+  /* ---------- CARDS ---------- */
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; margin-top: 18px; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border-color);
+    border-radius: var(--radius); padding: 22px 22px;
+  }
+  .card h4 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .card p { font-size: 0.94rem; color: var(--text-secondary); margin-bottom: 0; }
+  .card .pill { font-family: var(--font-mono); font-size: 11px; padding: 2px 8px; border-radius: 999px; }
+  .card .pill.now { background: rgba(63,185,80,0.14); color: var(--green); }
+  .card .pill.next { background: rgba(88,166,255,0.14); color: var(--blue); }
+  .card .pill.far { background: rgba(188,140,255,0.14); color: var(--purple); }
+
+  /* ---------- ROADMAP ---------- */
+  .road { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr)); gap: 16px; margin-top: 20px; }
+  .road-card {
+    background: var(--bg-card-2); border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm); padding: 20px; position: relative; overflow: hidden;
+  }
+  .road-card::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+  }
+  .road-card.r-now::before { background: var(--green); }
+  .road-card.r-next::before { background: var(--blue); }
+  .road-card.r-later::before { background: var(--purple); }
+  .road-card .stage { font-family: var(--font-mono); font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+  .road-card.r-now .stage { color: var(--green); } .road-card.r-next .stage { color: var(--blue); } .road-card.r-later .stage { color: var(--purple); }
+  .road-card h4 { font-size: 1.1rem; font-weight: 700; margin: 6px 0 8px; }
+  .road-card p { font-size: 0.93rem; color: var(--text-secondary); margin-bottom: 0; }
+  .road-card .axis { display: inline-block; margin-top: 10px; font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+
+  /* ---------- BAR (mini viz) ---------- */
+  .bar-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 13px; }
+  .bar-row .name { width: 150px; font-family: var(--font-mono); color: var(--text-secondary); flex-shrink: 0; }
+  .bar-track { flex: 1; background: var(--bg-secondary); border-radius: 4px; height: 16px; overflow: hidden; min-width: 80px; }
+  .bar-fill { height: 100%; border-radius: 4px; }
+  .bar-fill.good { background: linear-gradient(90deg, #2ea043, #3fb950); }
+  .bar-fill.mid  { background: linear-gradient(90deg, #2f81f7, #58a6ff); }
+  .bar-fill.bad  { background: linear-gradient(90deg, #c93535, #f85149); }
+  .bar-row .val { width: 90px; font-family: var(--font-mono); font-size: 12px; color: var(--text-primary); text-align: right; flex-shrink: 0; }
+
+  footer {
+    border-top: 1px solid var(--border-color);
+    padding: 36px 0; color: var(--text-muted); font-size: 13.5px;
+  }
+  footer a { color: var(--blue); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 720px) { .two-col { grid-template-columns: 1fr; } }
+  .kv { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 16px 18px; }
+  .kv h4 { font-size: 1rem; margin-bottom: 6px; }
+
+  .hr-soft { border: none; border-top: 1px solid var(--border-soft); margin: 28px 0; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="container">
+    <span class="hero-badge"><span class="dot"></span> Research project · active</span>
+    <h1>Flower: teaching <span class="grad">memory</span> to a very small language model</h1>
+    <p class="subtitle">
+      A from-scratch research framework for memory-augmented attention at the 12&ndash;26M-parameter scale.
+      Nine sweeps in, the central question has shifted from "which memory mechanism wins?" to
+      "how do we even <em>measure</em> whether memory is doing anything?" &mdash; and that turned out to be the
+      more interesting problem.
+    </p>
+    <div class="hero-meta">
+      <span><strong>~26M</strong> params</span>
+      <span><strong>RTX 5090</strong> · 32GB Blackwell</span>
+      <span><strong>FineWeb-Edu</strong> · 4K custom BPE</span>
+      <span><strong>Muon</strong> optimizer</span>
+      <span>Started <strong>May 2026</strong></span>
+    </div>
+    <nav class="hero-nav">
+      <a href="#what">What it is</a>
+      <a href="#tried">What was tried</a>
+      <a href="#compare">How they compare</a>
+      <a href="#lessons">What we learned</a>
+      <a href="#still">The Still track</a>
+      <a href="#horizon">Open &amp; on the horizon</a>
+    </nav>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- ============ 1. WHAT IT IS ============ -->
+  <section id="what">
+    <h2><span class="sec-num">01</span> What this project is</h2>
+    <p class="lede">
+      Flower is a single-researcher language-model lab. The premise: at <strong>~25M parameters</strong>
+      you can run dozens of controlled experiments on one GPU in a weekend, so it&rsquo;s the right place
+      to ask whether <strong>external memory mechanisms</strong> &mdash; a small bank of summary slots that
+      survives across a long context &mdash; actually help a transformer, and if so, which kind.
+    </p>
+
+    <p>
+      Every model is a tiny decoder-only transformer (4&ndash;6 layers, d_model 256&ndash;384) with a
+      <strong>local attention window</strong> (64&ndash;128 tokens) plus a pluggable memory module. The
+      memory is the variable under study: hierarchical max-pool summaries, Bloom-hash routing,
+      optimal-transport couplings, energy-based reads, frequency-decay slots, and more. Everything else
+      (data, tokenizer, optimizer, training length) is frozen per sweep so that differences are attributable.
+    </p>
+
+    <div class="stat-strip">
+      <div class="stat"><div class="num">~26M</div><div class="lbl">params per model</div></div>
+      <div class="stat"><div class="num green">10k</div><div class="lbl">steps / variant</div></div>
+      <div class="stat"><div class="num purple">20+</div><div class="lbl">architecture variants built</div></div>
+      <div class="stat"><div class="num orange">3</div><div class="lbl">seeds per comparison</div></div>
+    </div>
+
+    <h3>The actual end goal</h3>
+    <p>
+      The small-model work is a microscope, not the product. The north star, laid out in the research
+      brief and roadmap, is a <strong>personal multilingual assistant</strong>: continued-pretrain a strong
+      open base (Qwen3-4B-Base or Gemma-3-4B) on German&nbsp;+&nbsp;English, then QLoRA&nbsp;+&nbsp;DoRA
+      finetune on personal chat history. Sweeps&nbsp;7&ndash;10 exist to decide <em>whether any memory
+      mechanism is even worth porting</em> into that run &mdash; and just as importantly, to give the writeup
+      its spine: <em>how we learned to measure, and what actually moved the needle.</em>
+    </p>
+
+    <div class="callout idea">
+      <span class="ctitle">Why small-scale at all?</span>
+      The reports converge on a blunt prior: at 1B+, <strong>data quality is 3&ndash;5&times; more impactful
+      than architecture</strong>. So the only way architecture questions are worth asking is at a scale where
+      you can afford to ask them rigorously &mdash; with seeds, gates, and ablations rather than a single
+      loss number.
+    </div>
+  </section>
+
+  <hr class="hr-soft">
+
+  <!-- ============ 2. WHAT WAS TRIED ============ -->
+  <section id="tried">
+    <h2><span class="sec-num">02</span> What has been tried</h2>
+    <p class="lede">
+      The project runs as a sequence of numbered sweeps, each changing <strong>one axis at a time</strong>.
+      Two parallel tracks: the main <em>memory-mechanism</em> track (Sweeps 1&ndash;9) and a newer
+      <em>KV-cache compaction</em> track reproducing the "Still" paper.
+    </p>
+
+    <div class="timeline">
+
+      <div class="tl-item win">
+        <div class="tl-head"><span class="tl-name">Sweep 1 — the first signal</span><span class="tl-date">May 2026</span></div>
+        <div class="tl-body">
+          Hierarchical max-pooled memory appeared to give a <span class="win-num">2.6&times; PPL</span> win over
+          vanilla local attention. <span class="hl">Later proven partly illusory</span> &mdash; the headline
+          "PPL 119.5" was train PPL on a silently-broken validation split. But the architecture was real and became
+          the running baseline (<code>summary_memory</code> / <code>hier_max_16</code>).
+        </div>
+      </div>
+
+      <div class="tl-item method">
+        <div class="tl-head"><span class="tl-name">Sweeps 2–3 — fixing the measurement</span><span class="tl-date">May 2026</span></div>
+        <div class="tl-body">
+          Two bugs found and fixed: the LR scheduler used <code>constant</code> because <code>warmup_steps</code>
+          was never wired into the trainer, and the validation split was leaky. Also swapped the GPT-2 50k tokenizer
+          (80% of params in the embedding!) for a <span class="hl">4K BPE trained on FineWeb-Edu</span>, putting
+          embedding fraction near the scaling-law-optimal ~25%. Real, honest result after fixes:
+          <span class="win-num">val PPL 12.69</span> on a properly held-out split, 25.8M-param hier-max-16 model.
+        </div>
+      </div>
+
+      <div class="tl-item win">
+        <div class="tl-head"><span class="tl-name">Sweep 4 — the optimizer is the headline</span><span class="tl-date">May 2026</span></div>
+        <div class="tl-body">
+          Phase 0 swept <code>muon_lr &times; ns_steps &times; warmup</code> and found the recipe that became
+          the project default: <span class="win-num">muon@lr3e-3 / ns5 / warm1k → val 3.413</span>. Phase 1 retrofitted
+          <strong>RoPE</strong> and bumped training to seq=2048 so memory slots actually have something to compress.
+          This sweep quietly set up the biggest methodological lesson of the project (see Sweep 7).
+        </div>
+      </div>
+
+      <div class="tl-item win">
+        <div class="tl-head"><span class="tl-name">Sweep 5 — novel memory bake-off</span><span class="tl-date">May 2026</span></div>
+        <div class="tl-body">
+          Four original mechanisms vs the hier-max control: <code>bloom_memory</code>, <code>flow_ot_memory</code>,
+          <code>frequency_decay_memory</code>, <code>surprise_memory</code>.
+          Winner: <span class="win-num">bloom_memory val 3.594</span> vs control 3.627 (~2% BPB). But the margin was
+          inside what later turned out to be a recipe confound, and <code>flow_ot</code>'s Sinkhorn plan
+          <span class="loss-num">collapsed to uniform</span> (= mean-pooling, bought nothing).
+        </div>
+      </div>
+
+      <div class="tl-item neg">
+        <div class="tl-head"><span class="tl-name">Sweep 6 — symplectic Q/K attention (clean negative)</span><span class="tl-date">May 2026</span></div>
+        <div class="tl-body">
+          Replaced the query/key projection with a SympNet-style Hamiltonian flow (volume-preserving, bounded
+          energy drift). Result: <span class="loss-num">every flow variant lost badly</span> to plain local attention
+          (vanilla val 3.792; flow variants 4.4&ndash;4.8). Energy drift stayed bounded as the theory promised, but
+          the mechanism was pure overhead at this scale. The whole Q/K-flow direction was falsified.
+        </div>
+      </div>
+
+      <div class="tl-item method">
+        <div class="tl-head"><span class="tl-name">Sweep 7 — &ldquo;fix the lens, then bet&rdquo;</span><span class="tl-date">May–Jun 2026</span></div>
+        <div class="tl-body">
+          The pivotal sweep. Diagnosis: the reason all mechanisms tied was <span class="hl">mostly a measurement
+          problem</span>. Memory is redundant at seq=2048 with window=128; the recall probes were too easy;
+          Sweep 5/6 ran on the wrong (AdamW) recipe; and there were no seeds. Sweep 7 rebuilt the eval suite:
+          a <strong>capacity-curve MQAR probe</strong>, multi-seed, and a <strong>discrimination gate</strong>.
+          Two mechanism bets followed &mdash; load-bearing memory (B1) and the <strong>energy-based read</strong> (B2),
+          which became the first mechanism to show a real, transferable effect.
+        </div>
+      </div>
+
+      <div class="tl-item method">
+        <div class="tl-head"><span class="tl-name">Still track — KV-cache compaction, in parallel</span><span class="tl-date">Jun 2026</span></div>
+        <div class="tl-body">
+          A separate reproduction of the <em>Still</em> paper (arXiv:2606.07878): a per-layer Perceiver trained
+          once to compress the KV cache in a single forward pass via KL distillation. Implemented at ~2M-param
+          scale with four novel variants (OT read, energy read, frequency decay, spectral). Latest 5-seed run:
+          baseline and freq-decay compactor <span class="hl">statistically tied</span> (~2.82 PPL) &mdash; the
+          question is open but the infrastructure is built.
+        </div>
+      </div>
+
+    </div>
+
+    <div class="callout">
+      <span class="ctitle">A note on rigor</span>
+      Every sweep since Sweep 7 is gated: a probe must demonstrably <em>separate known variants across seeds</em>
+      before any new architecture runs on it. No ruler, no experiment. This is the single biggest cultural shift
+      in the project.
+    </div>
+  </section>
+
+  <hr class="hr-soft">
+
+  <!-- ============ 3. HOW THEY COMPARE ============ -->
+  <section id="compare">
+    <h2><span class="sec-num">03</span> How the things tried compare</h2>
+    <p class="lede">
+      Three honest comparisons. The headline across all of them: <strong>architecture/mechanism changes move
+      val loss by &le;0.03 bpb</strong> at this scale &mdash; smaller than the optimizer choice and barely above
+      seed noise. The discriminating signal lives in the probes, not the loss.
+    </p>
+
+    <h3>3.1 — Memory mechanisms on FineWeb-Edu (Muon recipe, seq 2048, 3 seeds)</h3>
+    <p>Validation loss, lower is better. From the Sweep 7 Phase A re-baseline:</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Variant</th><th>Val loss (mean±sd)</th><th>Memory ablation Δbpb</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr class="best"><td class="mono">bloom_memory</td><td>3.3156 ± 0.0087</td><td>0.208</td><td><span class="tag tag-win">best val loss</span></td></tr>
+          <tr><td class="mono">hier_max_16</td><td>3.4055 ± 0.0020</td><td>0.245</td><td><span class="tag tag-info">workhorse</span></td></tr>
+          <tr><td class="mono">vanilla_local (no memory)</td><td>3.4334 ± 0.0010</td><td>0.000</td><td><span class="tag tag-tie">control</span></td></tr>
+          <tr class="meh"><td class="mono">hier_max_16 (AdamW control)</td><td>3.6242 ± 0.0027</td><td>0.556</td><td><span class="tag tag-loss">recipe confound</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap">The AdamW arm reveals the trap: the same architecture is <strong>+0.219 nats worse</strong> on the old Sweep-5 recipe &mdash; a bigger gap than any architecture achieved. This is why Sweep 5's rankings were untrustworthy.</p>
+
+    <h3>3.2 — Where the signal actually lives: calibrated MQAR capacity curve</h3>
+    <p>
+      On FineWeb val loss, all memory variants tie. But train them briefly on a <strong>masked multi-query
+      associative-recall curriculum</strong> and the mechanisms separate cleanly. Breaking point = largest
+      <code>num_pairs</code> with accuracy &ge; 0.5. <code>hier_max_16</code> is the only architecture that solves it.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Variant (3 seeds)</th><th>Long BP</th><th>Long-16 acc</th><th>Long-32</th><th>Long-64</th><th>Long-128</th></tr></thead>
+        <tbody>
+          <tr class="best"><td class="mono">hier_max_16</td><td>64 / 32 / 64</td><td>0.938 ± 0.034</td><td>0.763 ± 0.004</td><td>0.527 ± 0.027</td><td>0.284 ± 0.008</td></tr>
+          <tr class="meh"><td class="mono">bloom_memory</td><td>0 / 0 / 0</td><td>0.070 ± 0.013</td><td>0.039 ± 0.005</td><td>0.022 ± 0.004</td><td>0.012 ± 0.002</td></tr>
+          <tr class="meh"><td class="mono">vanilla_local</td><td>0 / 0 / 0</td><td>0.057 ± 0.012</td><td>0.036 ± 0.003</td><td>0.015 ± 0.004</td><td>0.008 ± 0.002</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap">A striking split: <strong>bloom_memory wins FineWeb val loss but cannot learn MQAR</strong> &mdash; a genuine mechanistic distinction that a loss-only comparison completely hides.</p>
+
+    <h3>3.3 — The one mechanism that transferred: energy-based read (β=0.25)</h3>
+    <p>
+      Sweep 7 B2 replaced the convex softmax mean-pool memory read with a log-sum-exp energy read controlled by a
+      learnable inverse temperature β. On the load-bearing long-context regime (seq 2048, window 64, eval 8192), it
+      became the current winner &mdash; not by raising the ceiling, but by <strong>removing the bad-seed collapse</strong>.
+    </p>
+
+    <div class="two-col">
+      <div class="kv">
+        <h4>Calibrated MQAR (long-recall tail)</h4>
+        <div class="bar-row"><span class="name">hier (control)</span><div class="bar-track"><div class="bar-fill mid" style="width:52%"></div></div><span class="val">0.527 ± .027</span></div>
+        <div class="bar-row"><span class="name">energy β=1.0</span><div class="bar-track"><div class="bar-fill mid" style="width:55%"></div></div><span class="val">0.551 ± .013</span></div>
+        <div class="bar-row"><span class="name">energy β=0.25</span><div class="bar-track"><div class="bar-fill good" style="width:58%"></div></div><span class="val">0.577 ± .016</span></div>
+        <p class="cap">Long-64 accuracy. β=0.25 wins the hard tail and is stable across all seeds.</p>
+      </div>
+      <div class="kv">
+        <h4>FineWeb transfer (E5 gate)</h4>
+        <div class="table-wrap" style="margin:0;border:none">
+          <table style="min-width:0;font-size:13px">
+            <tbody>
+              <tr><td>val bpb (control)</td><td class="mono">1.4227 ± .0034</td></tr>
+              <tr><td>val bpb (energy)</td><td class="mono">1.4229 ± .0022</td></tr>
+              <tr><td>needle BP (control)</td><td class="mono">6.7 ± 1.9</td></tr>
+              <tr class="best"><td>needle BP (energy)</td><td class="mono">8.0 ± 0.0</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="cap">Val loss identical &mdash; the needle-in-real-text probe catches what loss can't.</p>
+      </div>
+    </div>
+
+    <div class="callout ok">
+      <span class="ctitle">The eval-framework conclusion (the real result of Sweep 7)</span>
+      The on-manifold <code>needle_in_text</code> probe reproduced the <em>same directional energy-read effect</em>
+      on real FineWeb that the synthetic ruler showed, while val-loss and even ablation-delta were blind to it.
+      <strong>The calibrated ruler's signal was not a synthetic-task artifact.</strong> That is the success
+      condition the whole pass was after.
+    </div>
+  </section>
+
+  <hr class="hr-soft">
+
+  <!-- ============ 4. LESSONS ============ -->
+  <section id="lessons">
+    <h2><span class="sec-num">04</span> What we actually learned</h2>
+    <p class="lede">Most of the value so far is methodological, not architectural. Five findings that reshaped the project:</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h4><span class="tag tag-key">lesson</span> The null result was a ruler problem</h4>
+        <p>Sweeps 1&ndash;6 produced a consistent "nothing moves val loss." The fix wasn't a better model &mdash; it was
+        a probe that puts memory under pressure (context &raquo; window) and reports a <em>capacity curve</em>, not a point.</p>
+      </div>
+      <div class="card">
+        <h4><span class="tag tag-key">lesson</span> Optimizer &gt; architecture at this scale</h4>
+        <p>The Muon-vs-AdamW recipe gap (~0.2 nats) dwarfed every architecture effect (~0.03 bpb). Comparing mechanisms
+        on a badly-tuned optimizer is measuring noise. LR matters more than optimizer family, too.</p>
+      </div>
+      <div class="card">
+        <h4><span class="tag tag-key">lesson</span> Memory must be load-bearing to matter</h4>
+        <p>At seq=2048 / window=128, local attention already covers the context &mdash; memory is decorative. Mechanisms
+        only separate when train <em>and</em> eval context &raquo; window, forcing cross-window dependencies through memory.</p>
+      </div>
+      <div class="card">
+        <h4><span class="tag tag-key">lesson</span> On-manifold &gt; synthetic probes</h4>
+        <p>Zero-shot synthetic MQAR floors at 0 on FineWeb-trained models &mdash; the task layout is off-manifold, not
+        just the tokens. <code>memory_ablation_delta</code> and <code>needle_in_text</code> are the trustworthy FineWeb rulers.</p>
+      </div>
+      <div class="card">
+        <h4><span class="tag tag-key">lesson</span> Stability beats ceiling</h4>
+        <p>The energy read's win was never a higher peak &mdash; it removed the bad-seed collapse (needle BP 6.7±1.9 → 8.0±0.0).
+        Robustness across seeds may be the more publishable, more honest mechanism signal.</p>
+      </div>
+      <div class="card">
+        <h4><span class="tag tag-key">lesson</span> Vary one axis at a time</h4>
+        <p>Data, optimizer, parameterization, and precision are each deliberately deferred to their own sweep. Bundling
+        them destroys attribution &mdash; the project's roadmap is built around this discipline.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="hr-soft">
+
+  <!-- ============ 5. STILL TRACK ============ -->
+  <section id="still">
+    <h2><span class="sec-num">05</span> The parallel track: KV-cache compaction (Still)</h2>
+    <p class="lede">
+      Alongside the memory-mechanism sweeps, the project reproduces and extends <strong>Still: Amortized KV Cache
+      Compaction in a Single Forward Pass</strong> (arXiv:2606.07878). A small per-layer Perceiver is trained once
+      against a frozen base model; at inference it compresses the full per-layer KV cache into compact latents.
+    </p>
+
+    <h3>What's implemented</h3>
+    <ul>
+      <li><strong>Core</strong> (<code>still.py</code>): Perceiver cross-attention + self-attention compactor with QK-norm, position-free compaction (inverse-RoPE &rarr; re-RoPE), and identity-style init.</li>
+      <li><strong>Training wrapper</strong> (<code>still_lm.py</code>): frozen base + per-layer compactors, teacher (full cache) / student (compact cache) passes, top-k KL distillation.</li>
+      <li><strong>Four novel variants</strong>: OT-coupled read, energy-sharpened read, frequency-decay slots, and spectral &mdash; plus a full-stack combination.</li>
+      <li><strong>Compaction-specific probes</strong> (<code>still_eval.py</code>): compaction-KL curve, needle-through-compaction, iterative-compaction sweep, compression-utility frontier.</li>
+    </ul>
+
+    <h3>Latest result (5 seeds, 6500 steps, 16&times; compression)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Compactor</th><th>Train loss (mean of 5)</th><th>Train PPL</th><th>Params</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">still (baseline)</td><td>~1.043</td><td>~2.83</td><td>1.972M</td><td><span class="tag tag-tie">anchor</span></td></tr>
+          <tr><td class="mono">still_freq (freq-decay)</td><td>~1.035</td><td>~2.82</td><td>1.973M</td><td><span class="tag tag-tie">tied</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap">
+      At this scale the novel variants are <strong>statistically indistinguishable from baseline</strong> &mdash; the same
+      "ruler isn't sharp enough yet" pattern as the main track. Open question: do OT/energy/spectral separate under the
+      iterative-compaction probe, where baseline is expected to degrade?
+    </p>
+
+    <div class="callout warn">
+      <span class="ctitle">Scale caveat</span>
+      The paper uses Qwen3-4B at 8k&ndash;128k context on 8&times;H200. Flower trains compactors on ~2M-param bases at
+      seq 512&ndash;2048. The goal is <strong>not</strong> to match paper numbers &mdash; it's to verify the architecture
+      works and to test whether the novel variants improve on baseline at a scale where iteration is cheap.
+    </div>
+  </section>
+
+  <hr class="hr-soft">
+
+  <!-- ============ 6. HORIZON ============ -->
+  <section id="horizon">
+    <h2><span class="sec-num">06</span> What's open &amp; on the horizon</h2>
+    <p class="lede">
+      The roadmap is deliberately ordered: <em>trust the ruler, then vary one big lever at a time, then scale.</em>
+      Each deferred axis becomes its own sweep so attribution stays clean.
+    </p>
+
+    <div class="road">
+      <div class="road-card r-now">
+        <span class="stage">Now · in flight</span>
+        <h4>Sweep 7 (finishing)</h4>
+        <p>Complete the load-bearing &times; energy-read Phase B matrix on the calibrated MQAR ruler; confirm the E5
+        FineWeb transfer holds. The energy read (β=0.25) is the current designated winner.</p>
+        <span class="axis">axis: read operator + context regime</span>
+      </div>
+      <div class="road-card r-now">
+        <span class="stage">Now · in flight</span>
+        <h4>Still novel variants</h4>
+        <p>Run OT / energy / spectral / full-stack compactors under the iterative-compaction probe, where the baseline
+        should degrade and the variants may separate. Then test compactor transfer to Qwen3-4B / Gemma-3-4B.</p>
+        <span class="axis">axis: compactor variant</span>
+      </div>
+      <div class="road-card r-next">
+        <span class="stage">Next · mini gate</span>
+        <h4>FP8 / NVFP4 precision pass</h4>
+        <p>Re-run 1&ndash;2 Sweep-7 variants in low precision on Blackwell. Ask: does the bf16 ranking and capacity curve
+        reproduce? The energy read's log-sum-exp is exactly the precision-sensitive case, so this is not assumed free.</p>
+        <span class="axis">axis: precision (infra gate)</span>
+      </div>
+      <div class="road-card r-next">
+        <span class="stage">Next · Sweep 8</span>
+        <h4>Data bake-off</h4>
+        <p>Single axis = corpus. FineWeb-Edu (anchor) vs DCLM-Edu vs FineWeb-HQ, best mechanism frozen. The reports rate
+        data 3&ndash;5&times; more impactful than architecture &mdash; likely the highest-leverage lever of all.</p>
+        <span class="axis">axis: pretraining corpus</span>
+      </div>
+      <div class="road-card r-next">
+        <span class="stage">Next · Sweep 9</span>
+        <h4>Optimizer (LR-controlled)</h4>
+        <p>Muon vs AdamW vs Aurora, each at <em>its own best LR</em> (per-optimizer LR sweep first). Aurora claims to fix
+        Muon's MLP neuron death; reality-check says no optimizer beats ~1.4&times; a well-tuned AdamW. Honest bar.</p>
+        <span class="axis">axis: optimizer family</span>
+      </div>
+      <div class="road-card r-later">
+        <span class="stage">Later · Sweep 10</span>
+        <h4>IsoFLOP ladder + CompleteP</h4>
+        <p>The question that started all this: <strong>does the mechanism gap open with scale?</strong> Run the winning
+        mechanism at 25M / 70M / 160M under CompleteP parameterization. Go/no-go for committing to a large run.</p>
+        <span class="axis">axis: scale + parameterization</span>
+      </div>
+      <div class="road-card r-later">
+        <span class="stage">Horizon · the goal</span>
+        <h4>Personal multilingual assistant</h4>
+        <p>Don't pretrain 1&ndash;7B from scratch. Continued-pretrain Qwen3-4B-Base or Gemma-3-4B on DE+EN, then
+        QLoRA+DoRA finetune on personal chat history. Sweeps 7&ndash;10 decide whether any mechanism is worth porting in.</p>
+        <span class="axis">axis: deployment</span>
+      </div>
+    </div>
+
+    <div class="callout idea">
+      <span class="ctitle">The open question everything hinges on</span>
+      Across nine sweeps, no mechanism has beaten the no-memory control by more than seed noise <em>on language-modeling
+      loss</em>. The energy read is a real but modest robustness effect, not a capacity breakthrough. Sweep 10's
+      scale ladder is the decisive test: if the gap stays flat at 70M/160M, the honest conclusion is that external
+      memory isn't worth the complexity at this regime &mdash; and the project's contribution becomes the
+      <strong>methodology</strong> (how to measure memory) rather than a winning architecture. Either outcome is a
+      publishable, honest result.
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <p>
+      Flower &mdash; a memory-augmented small-LM research framework.
+      Numbers above are drawn from the project's sweep reports and run logs
+      (<code>reports/</code>, <code>runs/</code>) and the planning docs
+      (<code>SWEEP*_PLAN.md</code>, <code>KV_CACHE_RESEARCH.md</code>).
+      Generated 2026-06-18.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,113 @@
+# Sweep 7 Phase B — Two bold bets (gated on Phase A discrimination gate passing).
+#
+# B1: Load-bearing memory — extend training seq_len so memory is the only
+#     long-range path (local_window=128, train at seq=4096).
+# B2: Energy read — learnable inverse temperature β sharpens MemoryRead from
+#     mean-pool toward hard-max (energy_read=true, energy_beta_init=1.0).
+# B2×B1: Energy read inside load-bearing regime (the headline comparison).
+#
+# Cost note: seq=4096/batch=16 may OOM on 5090; drop batch_size to 4 and
+# gradient_accumulation_steps to 8 (effective batch stays 32) if needed.
+# Run a 100-step sanity check before launching all seeds.
+sweep:
+  name: sweep7_phase_b
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 4096
+      eval_seq_len: 8192
+      streaming: true
+    training:
+      batch_size: 4
+      gradient_accumulation_steps: 8
+      steps: 10000
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 2500
+      validation_steps: 200
+      checkpoint_interval: 5000
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.003
+      muon_ns_steps: 5
+      muon_momentum: 0.95
+      memory_lr: 0.0
+      seed: 0
+      seeds: [0, 1, 2]
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 4096
+      local_window: 128
+      rope_base: 10000.0
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: true
+      memory_aggregation: max
+      flow_steps: 3
+      energy_read: false
+      energy_beta_init: 1.0
+  variants:
+    # B1: load-bearing memory — no memory baseline (should fail at long range)
+    - name: b1_vanilla_local_seq4k
+      model:
+        variant: vanilla_local
+        hierarchical_memory: false
+
+    # B1: hier_max_16 with local_window=128
+    - name: b1_hier_max_16_w128
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        local_window: 128
+
+    # B1: hier_max_16 with smaller window (more memory pressure)
+    - name: b1_hier_max_16_w64
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        local_window: 64
+
+    # B1: bloom_memory with local_window=128
+    - name: b1_bloom_memory_w128
+      model:
+        variant: bloom_memory
+        hierarchical_memory: false
+        bloom_num_hashes: 4
+        bloom_temperature: 0.5
+        bloom_summary_points: 16
+        local_window: 128
+
+    # B2: energy read on hier_max_16 (standard seq=4k, window=128)
+    - name: b2_hier_max_16_energy_w128
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        local_window: 128
+        energy_read: true
+        energy_beta_init: 1.0
+
+    # B2×B1: energy read + tighter window (headline comparison)
+    - name: b2x1_hier_max_16_energy_w64
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        local_window: 64
+        energy_read: true
+        energy_beta_init: 1.0

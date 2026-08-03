@@ -54,18 +54,11 @@ sweep:
     - {name: muon_lr3e-4_ns7_warm1k, training: {muon_lr: 0.0003, muon_ns_steps: 7, warmup_steps: 1000}}
     - {name: muon_lr3e-4_ns7_warm2k, training: {muon_lr: 0.0003, muon_ns_steps: 7, warmup_steps: 2000}}
     - {name: muon_lr3e-4_ns7_warm4k, training: {muon_lr: 0.0003, muon_ns_steps: 7, warmup_steps: 4000}}
+    # Higher-LR explore: only the dominant ns5/warm1k cell (ns and warmup were
+    # flat/monotone at lower LRs, so no need to re-grid). Drop lr3e-3 too if
+    # lr1e-3 doesn't beat lr3e-4 (=3.787).
     - {name: muon_lr1e-3_ns5_warm1k, training: {muon_lr: 0.001, muon_ns_steps: 5, warmup_steps: 1000}}
-    - {name: muon_lr1e-3_ns5_warm2k, training: {muon_lr: 0.001, muon_ns_steps: 5, warmup_steps: 2000}}
-    - {name: muon_lr1e-3_ns5_warm4k, training: {muon_lr: 0.001, muon_ns_steps: 5, warmup_steps: 4000}}
-    - {name: muon_lr1e-3_ns7_warm1k, training: {muon_lr: 0.001, muon_ns_steps: 7, warmup_steps: 1000}}
-    - {name: muon_lr1e-3_ns7_warm2k, training: {muon_lr: 0.001, muon_ns_steps: 7, warmup_steps: 2000}}
-    - {name: muon_lr1e-3_ns7_warm4k, training: {muon_lr: 0.001, muon_ns_steps: 7, warmup_steps: 4000}}
     - {name: muon_lr3e-3_ns5_warm1k, training: {muon_lr: 0.003, muon_ns_steps: 5, warmup_steps: 1000}}
-    - {name: muon_lr3e-3_ns5_warm2k, training: {muon_lr: 0.003, muon_ns_steps: 5, warmup_steps: 2000}}
-    - {name: muon_lr3e-3_ns5_warm4k, training: {muon_lr: 0.003, muon_ns_steps: 5, warmup_steps: 4000}}
-    - {name: muon_lr3e-3_ns7_warm1k, training: {muon_lr: 0.003, muon_ns_steps: 7, warmup_steps: 1000}}
-    - {name: muon_lr3e-3_ns7_warm2k, training: {muon_lr: 0.003, muon_ns_steps: 7, warmup_steps: 2000}}
-    - {name: muon_lr3e-3_ns7_warm4k, training: {muon_lr: 0.003, muon_ns_steps: 7, warmup_steps: 4000}}
     - name: phase_memory_adamw_retest
       training: {optimizer: adamw, lr: 0.000283, warmup_steps: 1000}
       model: {variant: phase_memory}

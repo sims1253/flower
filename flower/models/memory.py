@@ -22,6 +22,12 @@ class MemoryRead(nn.Module):
             raise ValueError("memory_kernel_bias must be none, positional, or rbf")
         self.slot_bias = nn.Parameter(torch.zeros(config.memory_slots + config.short_memory_slots))
         self.rbf_scale = nn.Parameter(torch.tensor(1.0))
+        # Sweep 7 (B2): log-sum-exp energy read. For small beta this behaves like
+        # a mean read; as beta grows it sharpens toward max-energy retrieval.
+        self.energy_read = getattr(config, "energy_read", False)
+        if self.energy_read:
+            beta_init = float(getattr(config, "energy_beta_init", 1.0))
+            self.energy_log_beta = nn.Parameter(torch.tensor(math.log(max(beta_init, 1e-6))))
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -48,8 +54,19 @@ class MemoryRead(nn.Module):
         bias = self._bias(x.shape[1], memory.shape[1], x.device, scores.dtype)
         if bias is not None:
             scores = scores + bias
-        attn = torch.softmax(scores, dim=-1)
-        out = attn @ v
+        if self.energy_read:
+            beta = self.energy_log_beta.exp().clamp_min(1e-6).to(device=scores.device)
+            scores_f = scores.float()
+            v_f = v.float()
+            log_partition = torch.logsumexp(beta.float() * scores_f, dim=-1).unsqueeze(-1)
+            out = (
+                torch.logsumexp(beta.float() * (scores_f.unsqueeze(-1) + v_f.unsqueeze(2)), dim=-2)
+                - log_partition
+            ) / beta.float()
+            out = out.to(dtype=v.dtype)
+        else:
+            attn = torch.softmax(scores, dim=-1)
+            out = attn @ v
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 

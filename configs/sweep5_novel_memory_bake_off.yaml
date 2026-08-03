@@ -1,0 +1,87 @@
+# Sweep 5: novel memory architectures bake-off.
+#
+# Tests four new memory variants alongside the current sweep4 winner
+# (summary_memory hier-max as control). All variants share the same training
+# recipe and base-model shape so the only axis of variation is the memory
+# write/read mechanism.
+#
+# Variants:
+#   - hier_max_16_control    : sweep4 winner (summary_memory, hier max, slots=16)
+#   - flow_ot_memory         : Sinkhorn-coupled, flow-matched memory writes
+#                              (layer depth as integration time)
+#   - surprise_memory        : per-layer LM-loss-style judge gates writes
+#                              (cheap Titans alternative, no 2nd-order grads)
+#   - frequency_decay_memory : inverse spaced repetition; heavily-written slots
+#                              decay faster within a forward pass
+#   - bloom_memory           : K learned hash projections route writes sparsely
+#                              across slots (Neural Bloom Filter analogue)
+sweep:
+  name: sweep5_novel_memory_bake_off
+  defaults:
+    data:
+      dataset: fineweb-edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 2048
+      streaming: true
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 2
+      steps: 10000
+      lr: 0.000283
+      lr_schedule: linear_warmup
+      warmup_steps: 1000
+      validation_interval: 2500
+      validation_steps: 200
+      checkpoint_interval: 2500
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: adamw
+      memory_lr: 0.0
+      seed: 0
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 2048
+      local_window: 128
+      rope_base: 10000.0
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: false
+      memory_aggregation: max
+      flow_steps: 3
+      # New-variant defaults (overridable per variant).
+      ot_source_points: 16
+      ot_epsilon: 0.1
+      ot_iters: 10
+      bloom_num_hashes: 4
+      bloom_temperature: 0.5
+      bloom_summary_points: 16
+      freq_penalty: 1.0
+      freq_decay_init: -2.0
+      surprise_judge_dim: 64
+      surprise_scale: 1.0
+  variants:
+    - name: hier_max_16_control
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+    - name: flow_ot_memory
+      model:
+        variant: flow_ot_memory
+    - name: surprise_memory
+      model:
+        variant: surprise_memory
+    - name: frequency_decay_memory
+      model:
+        variant: frequency_decay_memory
+    - name: bloom_memory
+      model:
+        variant: bloom_memory

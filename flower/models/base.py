@@ -9,6 +9,97 @@ import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
+from flower.models.attn_res import DepthRouter, routing_sites
+
+
+class RMSNorm(nn.Module):
+    """RMS normalization (Zhang & Sennrich, 2019) with a learnable gain.
+
+    Cheaper than LayerNorm (no mean subtraction, no bias) and the modern default.
+    Accumulates in fp32 so it stays well-behaved under bf16 autocast.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * rms).to(dtype=x.dtype) * self.weight
+
+
+class HeadRMSNorm(nn.Module):
+    """Non-parametric RMSNorm over the head dimension, for QK normalization.
+
+    Applied to Q and K before RoPE. Muon's updates are full-rank, so they inflate
+    the spectral norms of W_Q and W_K; attention then multiplies the two in QK^T
+    and the result is MaxLogit explosion (concepts/qk-stability-under-muon).
+    Normalizing Q/K per head bounds the logits directly. Parameter-free, so
+    enabling it does not change the parameter count.
+    """
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * rms).to(dtype=x.dtype)
+
+
+def build_norm(config: ModelConfig, dim: int) -> nn.Module:
+    """Norm layer selected by `config.norm_type`."""
+    norm_type = getattr(config, "norm_type", "layernorm")
+    if norm_type == "layernorm":
+        return nn.LayerNorm(dim)
+    if norm_type == "rmsnorm":
+        return RMSNorm(dim)
+    raise ValueError(f"norm_type must be 'layernorm' or 'rmsnorm', got {norm_type!r}")
+
+
+def swiglu_hidden_dim(config: ModelConfig, ffn_dim: int | None = None) -> int:
+    """Effective SwiGLU hidden width for a layer of nominal width `ffn_dim`.
+
+    SwiGLU spends three d x h matrices (gate, up, down) where GELU spends two, so
+    reusing `ffn_dim` verbatim would quietly add ~50% FFN parameters and make an
+    activation A/B uninterpretable. With `ffn_param_match` the width is scaled to
+    2/3 * ffn_dim, rounded to a multiple of 64 for kernel friendliness.
+    """
+    nominal = config.ffn_dim if ffn_dim is None else ffn_dim
+    if not getattr(config, "ffn_param_match", True):
+        return nominal
+    target = (nominal * 2) // 3
+    return max(64, round(target / 64) * 64)
+
+
+def layer_attn_windows(config: ModelConfig) -> list[int | None]:
+    """Per-layer attention windows, honouring `attn_window_schedule`.
+
+    `None` in the returned list means that layer attends over the full context.
+    """
+    schedule = getattr(config, "attn_window_schedule", None)
+    if not schedule:
+        return [config.local_window] * config.num_layers
+    if len(schedule) != config.num_layers:
+        raise ValueError(
+            f"attn_window_schedule has {len(schedule)} entries but num_layers is "
+            f"{config.num_layers}; they must match."
+        )
+    return [None if w is None else int(w) for w in schedule]
+
+
+def layer_ffn_dims(config: ModelConfig) -> list[int]:
+    """Per-layer nominal FFN widths, honouring `ffn_dim_schedule`."""
+    schedule = getattr(config, "ffn_dim_schedule", None)
+    if not schedule:
+        return [config.ffn_dim] * config.num_layers
+    if len(schedule) != config.num_layers:
+        raise ValueError(
+            f"ffn_dim_schedule has {len(schedule)} entries but num_layers is "
+            f"{config.num_layers}; they must match."
+        )
+    return [int(d) for d in schedule]
 
 
 def count_parameters(module: nn.Module) -> int:
@@ -40,6 +131,7 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError("RoPE requires even head_dim")
+        self._base = base
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         positions = torch.arange(max_seq_len).float()
         freqs = torch.outer(positions, inv_freq)
@@ -60,29 +152,75 @@ class RotaryEmbedding(nn.Module):
         x2 = x[..., 1::2]
         return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
+    def _extend_cache(self, seq_len: int) -> None:
+        """Extend RoPE buffers to cover seq_len (called lazily when eval exceeds training length)."""
+        head_dim = self.get_buffer("cos").shape[-1]
+        inv_freq = 1.0 / (self._base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        positions = torch.arange(seq_len).float()
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer("cos", freqs.cos().repeat_interleave(2, dim=-1).view(1, 1, seq_len, head_dim), persistent=False)
+        self.register_buffer("sin", freqs.sin().repeat_interleave(2, dim=-1).view(1, 1, seq_len, head_dim), persistent=False)
+
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len = q.shape[-2]
         cos_cache = self.get_buffer("cos")
         sin_cache = self.get_buffer("sin")
         if seq_len > cos_cache.shape[-2]:
-            raise ValueError("input length exceeds RoPE cache")
+            self._extend_cache(seq_len)
+            cos_cache = self.get_buffer("cos")
+            sin_cache = self.get_buffer("sin")
         cos = cos_cache[..., :seq_len, :].to(device=q.device, dtype=q.dtype)
         sin = sin_cache[..., :seq_len, :].to(device=q.device, dtype=q.dtype)
         return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
 
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, ffn_dim: int, dropout: float = 0.0) -> None:
+    """GELU MLP (legacy default) or SwiGLU, selected by `config.ffn_activation`.
+
+    `config` is optional so the many variant modules that construct
+    `FeedForward(d_model, ffn_dim, dropout)` positionally keep working and keep
+    their GELU behaviour.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        ffn_dim: int,
+        dropout: float = 0.0,
+        config: ModelConfig | None = None,
+        ffn_dim_override: int | None = None,
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, d_model),
-        )
+        activation = getattr(config, "ffn_activation", "gelu") if config is not None else "gelu"
+        bias = bool(getattr(config, "use_bias", True)) if config is not None else True
+        if activation not in {"gelu", "swiglu"}:
+            raise ValueError(f"ffn_activation must be 'gelu' or 'swiglu', got {activation!r}")
+        self.activation = activation
+        if activation == "gelu":
+            # Keep the original nn.Sequential layout: the parameter names
+            # (net.0.weight / net.3.weight) are baked into every checkpoint
+            # written before sweep 13, including the phase-0 bases that phase-1
+            # loads via still_pretrained_base.
+            self.net = nn.Sequential(
+                nn.Linear(d_model, ffn_dim, bias=bias),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(ffn_dim, d_model, bias=bias),
+            )
+            self.net[-1]._is_residual_out = True
+        else:
+            hidden = swiglu_hidden_dim(config, ffn_dim_override) if config is not None else ffn_dim
+            self.hidden_dim = hidden
+            self.dropout = nn.Dropout(dropout)
+            self.gate = nn.Linear(d_model, hidden, bias=bias)
+            self.up = nn.Linear(d_model, hidden, bias=bias)
+            self.down = nn.Linear(hidden, d_model, bias=bias)
+            self.down._is_residual_out = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        if self.activation == "gelu":
+            return self.net(x)
+        return self.down(self.dropout(F.silu(self.gate(x)) * self.up(x)))
 
 
 class CausalSelfAttention(nn.Module):
@@ -94,8 +232,12 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.d_model // config.num_heads
         self.local_window = local_window
         self.rope = RotaryEmbedding(self.head_dim, config.max_seq_len, base=config.rope_base)
-        self.qkv = nn.Linear(config.d_model, config.d_model * 3)
-        self.out = nn.Linear(config.d_model, config.d_model)
+        bias = bool(getattr(config, "use_bias", True))
+        self.qkv = nn.Linear(config.d_model, config.d_model * 3, bias=bias)
+        self.out = nn.Linear(config.d_model, config.d_model, bias=bias)
+        self.out._is_residual_out = True  # tagged for depth-scaled init
+        # Parameter-free QK normalization; see HeadRMSNorm.
+        self.qk_norm = HeadRMSNorm() if bool(getattr(config, "qk_norm", False)) else None
         # S2.4: optional RBF distance kernel as additive attention bias.
         # rbf bias = -scale * (i-j)^2 / window^2, learnable scale, per-head.
         self.kernel_bias = getattr(config, "local_attn_kernel_bias", "none")
@@ -117,30 +259,66 @@ class CausalSelfAttention(nn.Module):
         scale = self.rbf_log_scale.exp().to(device=device, dtype=dtype).view(self.num_heads, 1, 1)
         return (-scale * d2).unsqueeze(0)  # (1, H, T, T)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def qkv_heads(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project to per-head (q, k, v), apply QK-norm, then RoPE.
+
+        Single source of truth for the pre-attention pipeline. `still_lm.py`
+        re-implements the block forward in order to intercept the KV cache, so
+        it must call this rather than composing qkv/rope itself — otherwise
+        QK-norm would silently apply in the base model's own forward but not in
+        the Still teacher/student passes, and a base pretrained one way would be
+        evaluated the other.
+
+        Returns q, k, v each shaped (B, H, T, head_dim).
+        """
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q), self._split(k), self._split(v)
+        if self.qk_norm is not None:
+            q, k = self.qk_norm(q), self.qk_norm(k)
         q, k = self.rope(q, k)
-        mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
+        return q, k, v
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q, k, v = self.qkv_heads(x)
+        seq_len = x.shape[1]
+        # Use fused scaled-dot-product attention (flash / mem-efficient kernels).
+        # The previous path materialized a dense (B, H, T, T) fp32 score tensor per
+        # layer; at B16/T2048 that is ~1.6 GB/layer and, with all layers' backward
+        # activations, overflowed the 32 GB card. On WSL2 the overflow does not OOM
+        # — it silently spills into shared host RAM over PCIe and throughput
+        # collapses. SDPA never materializes the T x T scores, so it stays on-card.
+        keep = causal_mask(seq_len, x.device, self.local_window).view(1, 1, seq_len, seq_len)
         if self.kernel_bias == "rbf":
-            scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
-            scores = scores + self._rbf_bias(x.shape[1], x.device, scores.dtype)
-            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-            attn = torch.softmax(scores, dim=-1)
-            out = attn @ v
+            # RBF needs an additive per-head bias; fold the causal/local mask into
+            # the same float attn_mask so SDPA still fuses the softmax+matmul.
+            attn_mask = self._rbf_bias(seq_len, x.device, q.dtype).expand(1, self.num_heads, seq_len, seq_len).clone()
+            attn_mask = attn_mask.masked_fill(~keep, torch.finfo(q.dtype).min)
         else:
-            out = scaled_dot_attention(q, k, v, mask)
+            attn_mask = keep
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig, attention: nn.Module | None = None) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        attention: nn.Module | None = None,
+        ffn_dim: int | None = None,
+    ) -> None:
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.d_model)
+        self.ln1 = build_norm(config, config.d_model)
         self.attn = attention or CausalSelfAttention(config, config.local_window)
-        self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ln2 = build_norm(config, config.d_model)
+        # `ffn_dim` overrides config.ffn_dim for this layer only (TLM taper).
+        self.ff = FeedForward(
+            config.d_model,
+            config.ffn_dim if ffn_dim is None else ffn_dim,
+            config.dropout,
+            config=config,
+            ffn_dim_override=ffn_dim,
+        )
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         attn_out = self.attn(self.ln1(x))
@@ -155,13 +333,70 @@ class CausalLM(nn.Module):
         self.config = config
         self.token = nn.Embedding(config.vocab_size, config.d_model)
         self.blocks = nn.ModuleList(blocks)
-        self.ln = nn.LayerNorm(config.d_model)
+        self.ln = build_norm(config, config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.head.weight = self.token.weight
+        # Depth-axis routing (AttnRes family). None unless explicitly enabled.
+        self.attn_res_sites: list[int] = []
+        self.depth_router: DepthRouter | None = None
+        attn_res = getattr(config, "attn_res", "none")
+        if attn_res not in {"none", "delta_block"}:
+            raise ValueError(f"attn_res must be 'none' or 'delta_block', got {attn_res!r}")
+        if attn_res == "delta_block":
+            if max(1, getattr(config, "loop_count", 1)) > 1:
+                raise ValueError(
+                    "attn_res=delta_block is incompatible with loop_count>1: looping "
+                    "re-enters the same blocks, so block deltas are not well defined."
+                )
+            self.attn_res_sites = routing_sites(len(blocks), int(getattr(config, "attn_res_blocks", 8)))
+            self.depth_router = DepthRouter(
+                config.d_model,
+                num_sites=len(self.attn_res_sites),
+                key_mode=getattr(config, "attn_res_key", "full"),
+                rank=int(getattr(config, "attn_res_rank", 64)),
+            )
+        # Diagnostics are constant per model or require a full module walk; both
+        # were previously recomputed on every forward. Cache the constants and
+        # make the walk opt-out so it stays off inside a compiled graph.
+        self.collect_module_diagnostics = True
+        self._static_diagnostics: dict[str, Any] | None = None
+        init_scheme = getattr(config, "init_scheme", "torch")
+        if init_scheme not in {"torch", "scaled"}:
+            raise ValueError(f"init_scheme must be 'torch' or 'scaled', got {init_scheme!r}")
+        if init_scheme == "scaled":
+            self._apply_scaled_init()
+
+    def _apply_scaled_init(self) -> None:
+        """GPT-2 style initialisation.
+
+        Linear and Embedding weights are drawn from N(0, init_std) and biases
+        zeroed; residual output projections (attention `out`, FFN `down`) are
+        additionally scaled by 1/sqrt(2 * num_layers) so the variance added to
+        the residual stream does not grow with depth.
+
+        Runs after any submodule-specific init (e.g. zero-init velocity heads),
+        so those are re-drawn — enable this only on variants where the generic
+        scheme is what you want, which is the vanilla base and its AttnRes arms.
+        """
+        std = float(getattr(self.config, "init_std", 0.02))
+        depth_scale = 1.0 / math.sqrt(2 * max(1, len(self.blocks)))
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                scale = std * (depth_scale if getattr(module, "_is_residual_out", False) else 1.0)
+                nn.init.normal_(module.weight, mean=0.0, std=scale)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+        # The DepthRouter must stay an exact identity at init; the generic walk
+        # above does not touch its bare Parameters, but re-assert it explicitly.
+        if self.depth_router is not None:
+            nn.init.zeros_(self.depth_router.query)
+            nn.init.zeros_(self.depth_router.gate)
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
-        if input_ids.shape[1] > self.config.max_seq_len:
-            raise ValueError("input length exceeds max_seq_len")
+        # Allow seq_len > max_seq_len during eval (Sweep 7 A1: eval_seq_len > max_seq_len).
+        # RoPE cache extends lazily; local attention mask is computed on-the-fly.
         x = self.token(input_ids)
         memory = None
         diagnostics: dict[str, Any] = {}
@@ -169,13 +404,60 @@ class CausalLM(nn.Module):
         # carries across loops, so the bank acts as a scratchpad / persistent state.
         # loop_count=1 reproduces the standard single-pass behaviour.
         loops = max(1, getattr(self.config, "loop_count", 1))
-        for _ in range(loops):
-            for block in self.blocks:
+        if self.depth_router is None:
+            for _ in range(loops):
+                for block in self.blocks:
+                    x, memory = block(x, memory)
+        else:
+            # Delta Block AttnRes: sources are the embedding plus one delta per
+            # completed block. At each site the router additively mixes the
+            # routed sources back into the stream, then the next delta is
+            # measured from the post-routing state.
+            sources = [x]
+            prev = x
+            site = 0
+            for layer_idx, block in enumerate(self.blocks):
                 x, memory = block(x, memory)
+                if site < len(self.attn_res_sites) and layer_idx == self.attn_res_sites[site]:
+                    sources.append(x - prev)
+                    x = self.depth_router(site, x, sources)
+                    prev = x
+                    site += 1
         logits = self.head(self.ln(x))
         loss = None
         if labels is not None:
             loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:].reshape(-1))
-        diagnostics["parameter_count"] = count_parameters(self)
-        diagnostics["config"] = asdict(self.config)
+        if self._static_diagnostics is None:
+            self._static_diagnostics = {
+                "parameter_count": count_parameters(self),
+                "config": asdict(self.config),
+            }
+        diagnostics.update(self._static_diagnostics)
+        # Generic diagnostic walker. Any submodule can stash a scalar by
+        # setting `self.last_diag_<field> = float(...)` in its forward; we
+        # aggregate across modules (mean and max) and emit as
+        # `<field>_mean` / `<field>_max`. Tensor buffers in the same naming
+        # convention (0-d) are also picked up so symplectic flows can register
+        # buffers without per-instance Python attrs.
+        collected: dict[str, list[float]] = {}
+        modules = self.modules() if self.collect_module_diagnostics else ()
+        for module in modules:
+            for attr_name in dir(module):
+                if not attr_name.startswith("last_diag_"):
+                    continue
+                try:
+                    value = getattr(module, attr_name)
+                except AttributeError:
+                    continue
+                key = attr_name[len("last_diag_"):]
+                if isinstance(value, torch.Tensor):
+                    if value.ndim != 0:
+                        continue
+                    collected.setdefault(key, []).append(float(value.detach().cpu()))
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    collected.setdefault(key, []).append(float(value))
+        for key, values in collected.items():
+            t = torch.tensor(values)
+            diagnostics[f"{key}_mean"] = float(t.mean())
+            diagnostics[f"{key}_max"] = float(t.max())
         return {"logits": logits, "loss": loss, "diagnostics": diagnostics}

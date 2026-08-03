@@ -1,0 +1,78 @@
+# Remaining novel variants (attnmatch needs extra passes, flow needs velocity nets)
+# Reduced batch size to avoid OOM on heavy variants
+
+sweep:
+  name: sweep_still_novel_remaining
+
+  defaults:
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 1500
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 1500
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+
+    training:
+      batch_size: 32
+      gradient_accumulation_steps: 2
+      steps: 6500
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2, 3, 4]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+
+  variants:
+    # Frequency decay (control, matches previous extended sweep)
+    - name: novel_freq
+      model:
+        variant: still_freq
+        still_use_freq_decay: true
+
+    # Attention-matching loss
+    - name: novel_attnmatch
+      model:
+        variant: still
+        still_attn_match_weight: 0.3
+
+    # Flow-matching compressor
+    - name: novel_flow
+      model:
+        variant: still_flow
+        still_flow_steps: 5
+
+    # Combined: spectral + pyramid
+    - name: novel_spec_pyramid
+      model:
+        variant: still_spectral
+        still_use_spectral: true
+        still_layer_adaptive: true

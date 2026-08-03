@@ -69,6 +69,49 @@ def select_variants(variants: list[dict[str, Any]], names: str | None, limit: in
     return selected
 
 
+def parse_seeds(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    seeds = [int(seed.strip()) for seed in raw.split(",") if seed.strip()]
+    if not seeds:
+        raise ValueError("--seeds must contain at least one integer seed")
+    return seeds
+
+
+def expand_seed_variants(variants: list[dict[str, Any]], cli_seeds: list[int] | None = None) -> list[dict[str, Any]]:
+    """Expand sweep variants into one concrete trial per seed.
+
+    The config field `training.seeds` is intentionally treated as a launcher
+    directive, not as something `train()` consumes. Single-seed sweeps keep their
+    original names for backwards-compatible output paths.
+    """
+    expanded: list[dict[str, Any]] = []
+    for variant in variants:
+        config = deepcopy(variant["config"])
+        training = config.setdefault("training", {})
+        raw_seeds = cli_seeds if cli_seeds is not None else training.get("seeds")
+        if raw_seeds is None:
+            raw_seeds = [training.get("seed", 0)]
+        seeds = [int(seed) for seed in raw_seeds]
+        if len(seeds) == 1:
+            seed_config = deepcopy(config)
+            seed_config.setdefault("training", {})["seed"] = seeds[0]
+            expanded.append({"name": variant["name"], "base_name": variant["name"], "seed": seeds[0], "config": seed_config})
+            continue
+        for seed in seeds:
+            seed_config = deepcopy(config)
+            seed_config.setdefault("training", {})["seed"] = seed
+            expanded.append(
+                {
+                    "name": f"{variant['name']}_seed{seed}",
+                    "base_name": variant["name"],
+                    "seed": seed,
+                    "config": seed_config,
+                }
+            )
+    return expanded
+
+
 def write_variant_config(config: dict[str, Any], directory: Path, name: str) -> Path:
     config_path = directory / f"{name}.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -82,12 +125,14 @@ def run_sweep(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--device", type=str, default=None, help="Override training.device for every variant")
     parser.add_argument("--limit", type=int, default=None, help="Run at most this many selected variants")
     parser.add_argument("--variants", type=str, default=None, help="Comma-separated variant names to run")
+    parser.add_argument("--seeds", type=str, default=None, help="Comma-separated seeds; overrides training.seeds")
     parser.add_argument("--output-dir", type=str, default="runs/sweep", help="Directory for metrics and summary JSON")
     parser.add_argument("--smoke", action="store_true", help="Use train smoke settings for quick validation")
     args = parser.parse_args(argv)
 
     sweep_name, variants = load_sweep(args.config)
     selected = select_variants(variants, args.variants, args.limit)
+    selected = expand_seed_variants(selected, parse_seeds(args.seeds))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -120,10 +165,37 @@ def run_sweep(argv: list[str] | None = None) -> dict[str, Any]:
                 train_args.extend(["--device", args.device])
             if args.smoke:
                 train_args.append("--smoke")
-            metrics = train(train_args)
-            summary["variants"].append(
-                {"name": name, "metrics_json": config["training"]["metrics_json"], "metrics": metrics}
-            )
+            try:
+                metrics = train(train_args)
+                summary["variants"].append(
+                    {
+                        "name": name,
+                        "base_name": variant.get("base_name", name),
+                        "seed": variant.get("seed", config["training"].get("seed")),
+                        "metrics_json": config["training"]["metrics_json"],
+                        "metrics": metrics,
+                        "status": "completed",
+                    }
+                )
+            except Exception as exc:
+                print(f"[sweep] VARIANT {name} FAILED: {type(exc).__name__}: {exc}", flush=True)
+                summary["variants"].append(
+                    {
+                        "name": name,
+                        "base_name": variant.get("base_name", name),
+                        "seed": variant.get("seed", config["training"].get("seed")),
+                        "metrics_json": config["training"]["metrics_json"],
+                        "metrics": {},
+                        "status": f"failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+                import gc
+
+                import torch
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     summary["finished_at"] = time.time()
     summary["variant_count"] = len(summary["variants"])

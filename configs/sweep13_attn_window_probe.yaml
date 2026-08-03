@@ -1,0 +1,113 @@
+# Sweep 13, Phase 0d — Hybrid sliding-window attention on the base.
+#
+# WHY THIS EXISTS
+#
+# `vanilla_local` sets local_window=256 on ALL 14 layers at seq 1024. No layer
+# ever attends over the full context. Information can only cross the sequence by
+# hopping upward through depth, one 256-token window per layer.
+#
+# That is an unusual choice for a project whose research question is
+# *long-range reach under a compacted KV cache*, and it quietly confounds the
+# Still results. The Still student lets its suffix queries see a 64-slot summary
+# of the whole 960-token prefix, while the teacher — the same frozen base — only
+# sees the last 256 tokens. So the compactor is not purely "approximating the
+# full cache"; it is partly *granting reach the base never had*. Those are two
+# different claims and the current setup measures a blend of them.
+#
+# Production hybrids interleave a few full-attention layers among the windowed
+# ones: MiMo-v2.5-Pro runs 6:1 at window 128, Laguna-XS 3:1 at window 512.
+# Near-linear cost, but genuine global reach.
+#
+# Zero added parameters — this only changes the attention mask, so any
+# difference is mechanism, not capacity.
+#
+#   uv run python -m flower.sweep --config configs/sweep13_attn_window_probe.yaml \
+#     --output-dir runs/sweep13_attn_window
+#
+# Cost: 4 arms x 3 seeds x 6000 steps. W3_full is slower (quadratic at every
+# layer); the others are close to the W0 baseline. ~14 h total.
+#
+# WHAT THE RESULT MEANS FOR PHASE 1
+#   If a hybrid clearly beats all-local, the phase-0 base should adopt it, and
+#   the Still comparison then measures compaction against a teacher that already
+#   has global reach — which is the cleaner version of the question.
+#   If all-local wins or ties, keep it, but state explicitly in the sweep-13
+#   writeup that the compactor is partly buying reach rather than fidelity.
+
+sweep:
+  name: sweep13_attn_window_probe
+
+  defaults:
+    model:
+      variant: vanilla_local
+      vocab_size: 16384
+      d_model: 768
+      num_heads: 12
+      num_layers: 14
+      ffn_dim: 3072
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      norm_type: rmsnorm
+      ffn_activation: swiglu
+      ffn_param_match: true
+      qk_norm: true
+      use_bias: false
+      init_scheme: scaled
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 4
+      steps: 6000
+      lr: 0.003
+      warmup_steps: 300
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      grad_clip: 1.0
+      eval_interval: 500
+      validation_interval: 500
+      validation_steps: 40
+      checkpoint_interval: 3000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      precision: bf16
+      compile_model: true
+
+  variants:
+    # Incumbent: window 256 everywhere, no global reach at any depth.
+    - name: W0_all_local_256
+      model: {}
+
+    # 3:1 hybrid (Laguna-XS ratio) — full attention every 4th layer.
+    - name: W1_hybrid_3to1
+      model:
+        attn_window_schedule: [256, 256, 256, null, 256, 256, 256, null, 256, 256, 256, null, 256, null]
+
+    # 6:1 hybrid (MiMo-v2.5 ratio) — sparser global layers, cheaper.
+    - name: W2_hybrid_6to1
+      model:
+        attn_window_schedule: [256, 256, 256, 256, 256, 256, null, 256, 256, 256, 256, 256, 256, null]
+
+    # Upper bound: full attention everywhere. At seq 1024 this is affordable and
+    # bounds how much the windowing costs in the first place. If W0 ~= W3 then
+    # global reach is not the binding constraint at this sequence length, and
+    # the whole question is less interesting than it looks.
+    - name: W3_all_full
+      model:
+        local_window: null

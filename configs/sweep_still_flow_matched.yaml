@@ -1,0 +1,106 @@
+# Sweep 10 — Is the flow win real? Parameter-matched flow ablation.
+#
+# The `sweep_still_novel` "flow wins" result (train ppl 2.68 vs 2.84) is a
+# confound: the flow arm has 3.6x more *trainable* compactor params (7.1M vs
+# 2.0M) because count_parameters() only counts trainable params and the base
+# model is frozen. This sweep holds the trainable compactor budget fixed and
+# asks: does the flow *mechanism* beat a bigger standard compactor?
+#
+# Decisive comparisons (all within +/-2.5% trainable-param budget):
+#   B flow_7.1M  vs  C std_7.1M   (high-budget mechanism vs capacity)
+#   D flow_2.4M  vs  E std_2.4M   (low-budget mechanism vs capacity)
+# Non-overlapping seed ranges on val_perplexity = real effect.
+#
+# Every arm also sets validation_steps so we get HELD-OUT val_perplexity (the
+# novel sweep only logged train perplexity, a second confound in the same
+# direction).
+
+sweep:
+  name: sweep_still_flow_matched
+
+  defaults:
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 1500
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 1500
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+
+    training:
+      # batch 16 x accum 4 = effective batch 64. The C arm (std_7M, d_latent=192)
+      # spikes to ~32GB during compaction at batch 32x2 (crashes / risks OOM).
+      # batch 16x4 keeps peak VRAM ~8-10GB with comfortable safety margin.
+      batch_size: 16
+      gradient_accumulation_steps: 4
+      steps: 6500
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+      validation_steps: 20          # FIX train-only confound: log held-out val_perplexity
+
+  variants:
+    # A — anchor: original standard compactor (1,972,224 trainable).
+    - name: A_std_2M
+      model:
+        variant: still
+
+    # B — the original "flow wins" arm, unchanged (7,110,144 trainable).
+    - name: B_flow_7M
+      model:
+        variant: still_flow
+        still_flow_steps: 5
+
+    # C — standard compactor scaled to match B's budget (7,096,320, 0.19% match).
+    #     THE critical control: if C <= B, the original flow win was pure capacity.
+    - name: C_std_7M
+      model:
+        variant: still
+        still_d_latent: 192
+        still_num_blocks: 4
+
+    # D — flow with velocity nets shrunk (hidden=8) to the flow's structural
+    #     minimum (2,446,752). Flow can't go below ~2.4M because of the fixed
+    #     context_proj plumbing; compare against E at the same budget.
+    - name: D_flow_2M
+      model:
+        variant: still_flow
+        still_flow_steps: 5
+        still_velocity_hidden: 8
+
+    # E — standard compactor scaled to match D's budget (2,384,640, 2.5% match).
+    - name: E_std_2M
+      model:
+        variant: still
+        still_d_latent: 144
+        still_num_blocks: 2

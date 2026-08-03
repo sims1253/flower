@@ -1,0 +1,67 @@
+# Sweep 7 probe repair: train directly on MQAR-formatted sequences.
+#
+# Purpose: calibrate whether the MQAR probe can discriminate architectures when
+# the task is on-policy. This is not Phase B and not a language-modeling result.
+sweep:
+  name: sweep7_mqar_curriculum_probe
+  defaults:
+    data:
+      dataset: mqar
+      sequence_length: 2048
+      eval_seq_len: 4096
+      synthetic_vocab_size: 4096
+      streaming: true
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 2
+      steps: 500
+      lr_schedule: linear_warmup
+      warmup_steps: 200
+      validation_interval: 250
+      validation_steps: 50
+      checkpoint_interval: 500
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.003
+      muon_ns_steps: 5
+      muon_momentum: 0.95
+      memory_lr: 0.0
+      seed: 0
+      seeds: [0, 1, 2]
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 2048
+      local_window: 128
+      rope_base: 10000.0
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: true
+      memory_aggregation: max
+  variants:
+    - name: vanilla_local
+      model:
+        variant: vanilla_local
+        hierarchical_memory: false
+
+    - name: hier_max_16
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+
+    - name: bloom_memory
+      model:
+        variant: bloom_memory
+        hierarchical_memory: false
+        bloom_num_hashes: 4
+        bloom_temperature: 0.5
+        bloom_summary_points: 16

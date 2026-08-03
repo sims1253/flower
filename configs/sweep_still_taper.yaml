@@ -1,0 +1,83 @@
+# Sweep 11 — Tapered compactor budgets (does the TLM "wider-early" result
+# apply to KV compaction?). Vary per-layer d_latent under a fixed total budget.
+# Decisive: B taper_early vs A uniform (does it help?) and
+#           B taper_early vs C taper_late (does direction matter? same params).
+# Non-overlapping val_ppl seed ranges = real effect.
+
+sweep:
+  name: sweep_still_taper
+
+  defaults:
+    model:
+      vocab_size: 4096
+      d_model: 384
+      num_heads: 6
+      num_layers: 6
+      ffn_dim: 1536
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      still_compact_len: 64
+      still_num_blocks: 2
+      still_d_latent: 128
+      still_kl_topk: 200
+      still_kl_weight: 1.0
+      still_ce_weight: 0.1
+      still_compact_from_step: 1500
+      still_kl_temperature: 1.0
+      still_base_warmup_steps: 1500
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_4k.json"
+      sequence_length: 1024
+      eval_seq_len: 1024
+
+    training:
+      # batch 64 x accum 1 = effective batch 64. Sweep 11 arms are small
+      # (2M compactor, max layer d_latent=172); the completed A run peaked at
+      # only 6.3GB. Batch 64 uses ~20GB with comfortable headroom and is ~3x
+      # faster than the batch 16x4 needed by sweep10's d_latent=192 C arm.
+      batch_size: 64
+      gradient_accumulation_steps: 1
+      steps: 6500
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: linear_warmup
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 1000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1, 2]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+      validation_steps: 20
+
+  variants:
+    # A — anchor: uniform d_latent=128 (identical to sweep10 arm A; 1,972,224).
+    - name: A_uniform_128
+      model: { variant: still }
+
+    # B — THE hypothesis: wider-early cosine taper (1,979,520, +0.37% vs A).
+    - name: B_taper_early
+      model:
+        variant: still
+        still_d_latent_schedule: [152, 146, 134, 120, 108, 104]
+
+    # C — wrong-direction control: B reversed (1,979,520, IDENTICAL params to B).
+    - name: C_taper_late
+      model:
+        variant: still
+        still_d_latent_schedule: [104, 108, 120, 134, 146, 152]
+
+    # D — steepness probe: steeper cosine (1,956,096, -0.82% vs A).
+    - name: D_taper_steep
+      model:
+        variant: still
+        still_d_latent_schedule: [172, 162, 138, 108, 84, 76]

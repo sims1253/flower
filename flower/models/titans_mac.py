@@ -48,7 +48,7 @@ class TitansMACBlock(nn.Module):
         self.ln_mem = nn.LayerNorm(config.d_model)
         self.mem_read = MemoryRead(config)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
 
         # Inner-loop probe: extract per-slot key/value pairs from the token summary.
         # The inner loss asks whether the memory's content (under a learned key) can

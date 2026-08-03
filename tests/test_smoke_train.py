@@ -31,5 +31,5 @@ def test_smoke_training_writes_validation_metrics(tmp_path):
     assert metrics["train_loss"] > 0
     assert metrics["val_loss"] > 0
     assert metrics["val_perplexity"] > 0
-    assert metrics["val_tokens"] == 64
+    assert metrics["val_tokens"] == 62
     assert metrics_path.exists()

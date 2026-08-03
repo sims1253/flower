@@ -33,6 +33,22 @@ def test_synthetic_dataset_still_produces_batches() -> None:
     assert batch.device.type == "cpu"
 
 
+def test_mqar_dataset_embeds_query_answers() -> None:
+    cfg = DataConfig(dataset="mqar", sequence_length=64, synthetic_vocab_size=128)
+    batches = token_batches(cfg, 2, torch.device("cpu"), seed=123)
+
+    batch, labels = next(batches)
+
+    assert batch.shape == (2, 64)
+    assert labels.shape == (2, 64)
+    # The stream should not degenerate to constant/random-size rows; values stay
+    # inside the configured synthetic vocab.
+    assert int(batch.min()) >= 0
+    assert int(batch.max()) < cfg.synthetic_vocab_size
+    assert int((labels != -100).sum()) > 0
+    assert torch.equal(batch[labels != -100], labels[labels != -100])
+
+
 def test_synthetic_validation_stream_uses_separate_seed() -> None:
     from flower.data import validation_token_batches
 

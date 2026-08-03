@@ -52,7 +52,7 @@ class PhaseAssociativeBlock(nn.Module):
         self.local = CausalSelfAttention(config, config.local_window)
         self.ln_mem = nn.LayerNorm(config.d_model)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
         # Per-layer projections from token reps to (per-slot) complex key/value pairs.
         # We use one linear that emits S * 2P then reshape to (S, 2P) → S complex vectors of dim P.
         self.proj_key = nn.Linear(config.d_model, self.S * 2 * self.P)

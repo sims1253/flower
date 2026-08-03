@@ -1,0 +1,170 @@
+# Sweep 13, Phase 0c — Tokenizer bake-off, decided by training rather than by
+# intrinsic metrics.
+#
+# WHY THIS EXISTS
+#
+# The first pass at this only swept vocabulary SIZE on one recipe (byte-level
+# BPE with GPT-2 pre-tokenization). Sweeping the ALGORITHM axis turned up a
+# result large enough that it should not be adopted on intrinsic metrics alone.
+#
+# Measured on 2000 held-out FineWeb-Edu docs, all trained on the same 40k docs:
+#
+#   algorithm      vocab   bytes/tok  fertility  renyi  unused
+#   bpe_regex      16384       4.279      1.449  0.467     246   <- current
+#   bpe_noregex    16384       4.844      1.280  0.752     135   <- both metrics
+#   unigram        16384       3.926      1.579  0.436     315
+#   wordpiece      16384       4.254      1.457  0.468     543
+#   bpe_regex      32768       4.580      1.354  0.425    1363
+#
+# `bpe_noregex` drops the GPT-2 pre-tokenization split, so BPE merges may span
+# whitespace and one token can cover several words ("superword" tokens). This is
+# the t=0 limit of SuperBPE (arXiv:2503.13423). Two things make it interesting:
+#
+#   1. It wins on compression AND on Renyi efficiency simultaneously. Those two
+#      normally trade off against each other (see the vocab-size table in
+#      SWEEP13_PIPELINE.md, where compression rises as Renyi falls). Winning
+#      both at once is the unusual case.
+#   2. At 16k it compresses BETTER than regex-BPE at 32k (4.844 vs 4.580) while
+#      using half the embedding table. That is a strictly better point, not a
+#      trade.
+#
+# And SuperBPE reports that t=0 is *worse* than a properly tuned two-stage
+# transition, so this is a lower bound on the idea rather than its best form.
+#
+# BUT: bytes/token and Renyi efficiency are not downstream loss. TokSuite (14
+# identical 1B models varying only the tokenizer) found the algorithm matters
+# less than vocabulary size and pre-tokenization rules do. This config exists so
+# the choice is made on val_bpb from an actual run.
+#
+#   uv run python -m flower.sweep --config configs/sweep13_tokenizer_probe.yaml \
+#     --output-dir runs/sweep13_tokenizer_probe
+#
+# Cost: 5 arms x 4000 steps x ~0.58 s = ~3.2 h, single seed.
+#
+# ---------------------------------------------------------------------------
+# HOW TO READ IT
+# ---------------------------------------------------------------------------
+# Compare on **val_bpb**, never val_perplexity. Perplexity is per-token, and
+# these arms have different tokens-per-byte by construction, so ppl would rank
+# them by compression rather than by modelling quality. bpb normalises by text.
+#
+# Also watch `throughput/tokens_per_sec`: vocab changes the tied lm_head matmul
+# (2*d_model*V per token), which is 2.5% of core FLOPs at 4k but 17% at 32k. An
+# arm can win on bpb-per-step while losing on bpb-per-second. Both readings are
+# legitimate; per-second is the one that matters for a fixed GPU budget.
+#
+# ---------------------------------------------------------------------------
+# KNOWN CAVEAT OF SUPERWORD TOKENS
+# ---------------------------------------------------------------------------
+# A token spanning a whitespace boundary means token boundaries no longer align
+# to word boundaries. That is irrelevant for a perplexity/BPB research model,
+# but it complicates constrained decoding, stop-sequences, and prompt/completion
+# splicing. If this repo ever grows a generation harness, revisit.
+
+sweep:
+  name: sweep13_tokenizer_probe
+
+  defaults:
+    model:
+      variant: vanilla_local
+      d_model: 768
+      num_heads: 12
+      num_layers: 14
+      ffn_dim: 3072
+      max_seq_len: 1024
+      local_window: 256
+      rope_base: 10000.0
+      dropout: 0.0
+      norm_type: rmsnorm
+      ffn_activation: swiglu
+      ffn_param_match: true
+      qk_norm: true
+      use_bias: false
+      init_scheme: scaled
+      # vocab_size is set per-arm and MUST match the tokenizer.
+
+    data:
+      dataset: fineweb_edu
+      sequence_length: 1024
+      eval_seq_len: 1024
+      # tokenizer + bytes_per_token set per-arm.
+
+    training:
+      batch_size: 16
+      gradient_accumulation_steps: 4
+      steps: 4000
+      lr: 0.003
+      warmup_steps: 200
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      grad_clip: 1.0
+      eval_interval: 250
+      validation_interval: 250
+      validation_steps: 40
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      precision: bf16
+      compile_model: true
+
+  variants:
+    # Incumbent.
+    - name: T_bpe_regex_16k
+      model: { vocab_size: 16384 }
+      data:
+        tokenizer: "custom:tokenizers/fineweb_16k.json"
+        bytes_per_token: 4.279
+
+    # Superword tokens at the same vocab — the headline comparison.
+    - name: T_bpe_noregex_16k
+      model: { vocab_size: 16384 }
+      data:
+        tokenizer: "custom:tokenizers/algo/bpe_noregex_16384.json"
+        bytes_per_token: 4.844
+
+    # Superword at half the embedding cost.
+    - name: T_bpe_noregex_8k
+      model: { vocab_size: 8192 }
+      data:
+        tokenizer: "custom:tokenizers/algo/bpe_noregex_8192.json"
+        bytes_per_token: 4.206   # measured; ~= regex-BPE at 16k, at half the embedding
+
+    # "Just use more vocab" control: regex-BPE at 32k costs 2x the embedding of
+    # noregex-16k and still compresses worse. If it wins on bpb anyway, the
+    # superword gain was compression-only.
+    - name: T_bpe_regex_32k
+      model: { vocab_size: 32768 }
+      data:
+        tokenizer: "custom:tokenizers/fineweb_32k.json"
+        bytes_per_token: 4.580
+
+    # Superword at 32k. The no-regex advantage GROWS with vocab (+8.3% at 8k,
+    # +13.2% at 16k, +19.9% at 32k) and — unlike regex-BPE — its Renyi
+    # efficiency does not decay with vocab (0.765/0.752/0.741 vs
+    # 0.520/0.467/0.425). So the usual "a big vocab wastes embedding rows"
+    # objection largely does not apply here: at 32k, regex-BPE leaves 1363
+    # merges unused on the sample while no-regex leaves 325. On text-per-FLOP
+    # this is the best point measured (1.23x vs 1.05x for the incumbent).
+    # Costs 25.2M embedding (20% of params) and 17.2% of FLOPs in the head,
+    # which is exactly what the training run is for.
+    - name: T_bpe_noregex_32k
+      model: { vocab_size: 32768 }
+      data:
+        tokenizer: "custom:tokenizers/algo/bpe_noregex_32768.json"
+        bytes_per_token: 5.492
+
+    # Algorithm control. Bostrom & Durrett 2020 argue Unigram beats BPE for LM
+    # pretraining despite worse compression, so intrinsic metrics alone would
+    # wrongly rule it out — that is exactly why it gets a training run.
+    - name: T_unigram_16k
+      model: { vocab_size: 16384 }
+      data:
+        tokenizer: "custom:tokenizers/algo/unigram_16384.json"
+        bytes_per_token: 3.926

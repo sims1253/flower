@@ -17,11 +17,20 @@ data_cache/
 .ruff_cache/
 .claude/
 .codex
+.zcode/
 
-# Model weights
+# Model weights / large checkpoints
 *.pt
 *.pth
 *.ckpt
+*.safetensors
+
+# Tokenizer ablation output (regenerable via scripts/compare_tokenizer_algorithms.py);
+# the fineweb_*.json models in tokenizers/ are tracked for reproducibility.
+tokenizers/algo/
+
+# ZCode / agent scratch
+.t3/
 
 # Environment / secrets
 .env

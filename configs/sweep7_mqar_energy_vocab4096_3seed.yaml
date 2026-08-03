@@ -1,0 +1,59 @@
+# Sweep 7 Phase B, calibrated MQAR energy-read check.
+#
+# Same masked-MQAR full-vocab setup as sweep7_mqar_vocab4096_3seed, adding the
+# energy-read variant. This keeps the ruler on-manifold before moving energy
+# read into the seq-2048 length-curriculum regime.
+sweep:
+  name: sweep7_mqar_energy_vocab4096_3seed
+  defaults:
+    data:
+      dataset: mqar
+      sequence_length: 512
+      eval_seq_len: 1024
+      synthetic_vocab_size: 4096
+      streaming: true
+    training:
+      batch_size: 32
+      gradient_accumulation_steps: 1
+      steps: 5000
+      lr_schedule: linear_warmup
+      warmup_steps: 200
+      validation_interval: 1000
+      validation_steps: 50
+      checkpoint_interval: 5000
+      save_checkpoints: true
+      grad_clip: 1.0
+      device: auto
+      log_backend: tensorboard
+      optimizer: muon
+      muon_lr: 0.003
+      muon_ns_steps: 5
+      muon_momentum: 0.95
+      memory_lr: 0.0
+      seed: 0
+      seeds: [0, 1, 2]
+      composite_eval: true
+    model:
+      vocab_size: 4096
+      d_model: 192
+      num_heads: 6
+      num_layers: 4
+      ffn_dim: 768
+      max_seq_len: 512
+      local_window: 64
+      rope_base: 10000.0
+      memory_slots: 16
+      short_memory_slots: 4
+      hierarchical_memory: true
+      memory_aggregation: max
+      energy_read: false
+      energy_beta_init: 1.0
+  variants:
+    - name: hier_max_16_energy
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+        energy_read: true
+        energy_beta_init: 1.0

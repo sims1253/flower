@@ -17,7 +17,7 @@ class SummaryMemoryBlock(nn.Module):
         self.ln_mem = nn.LayerNorm(config.d_model)
         self.mem_read = memory_read or MemoryRead(config)
         self.ln2 = nn.LayerNorm(config.d_model)
-        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout)
+        self.ff = FeedForward(config.d_model, config.ffn_dim, config.dropout, config=config)
         self.token_mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_model), nn.GELU(), nn.Linear(config.d_model, config.d_model)
         )

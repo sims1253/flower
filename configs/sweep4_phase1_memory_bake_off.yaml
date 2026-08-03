@@ -67,3 +67,27 @@ sweep:
     - name: fla_gdn
       model:
         variant: fla_gdn
+    # --- Phase 0 follow-ups ---
+    # Phase 0 best was muon@lr3e-3 (val 3.413), still monotone improving with LR.
+    # Probe one step further to find where the ladder breaks.
+    - name: muon_lr1e-2_ns5_warm1k_probe
+      training:
+        optimizer: muon
+        muon_lr: 0.01
+        muon_ns_steps: 5
+        muon_momentum: 0.95
+        warmup_steps: 1000
+      model:
+        variant: summary_memory
+        hierarchical_memory: true
+        memory_aggregation: max
+        memory_slots: 16
+    # looped_x2 OOM'd at batch=16 (32 GiB spill on 5090). Halve batch and
+    # double accum to preserve effective batch size = 32.
+    - name: looped_x2_adamw_retest_smallbatch
+      training:
+        batch_size: 8
+        gradient_accumulation_steps: 4
+      model:
+        variant: summary_memory
+        loop_count: 2
