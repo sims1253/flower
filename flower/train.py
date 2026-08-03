@@ -64,6 +64,29 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def configure_vram_limit(device: torch.device, fraction: float = 0.85) -> None:
+    """Cap the CUDA caching allocator so an oversized batch raises a hard OOM
+    instead of silently spilling into host RAM.
+
+    On WSL2 the WDDM memory manager does NOT raise OutOfMemoryError when the
+    GPU runs out — it spills into shared host RAM over PCIe and throughput
+    collapses by an order of magnitude. A run that looks very slow is usually a
+    run that overshot VRAM. Capping the allocator at `fraction` of total VRAM
+    forces a real OOM (which the batch-size comments in the configs and the
+    bench scripts already size against), so the failure mode is loud. No-op on
+    CPU. The default 0.85 leaves headroom for fragmentation and for the small
+    non-tensor allocations PyTorch makes outside the caching allocator.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.set_per_process_memory_fraction(fraction, device.index or 0)
+    except (RuntimeError, ValueError):
+        # Already set (e.g. a parent process configured it) or unsupported —
+        # never let the guard itself crash a run.
+        pass
+
+
 def set_global_seed(seed: int) -> None:
     random.seed(seed)
     try:
@@ -308,6 +331,7 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     cfg = load_config(args.config, overrides)
     set_global_seed(int(cfg.training.seed))
     device = resolve_device(cfg.training.device)
+    configure_vram_limit(device)
     amp_dtype = configure_precision(cfg.training.precision, device)
     model = build_model(cfg.model).to(device)
     # Optimizers are always built on the eager module: torch.compile returns a
