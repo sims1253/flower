@@ -1,0 +1,110 @@
+# Sweep 13, Long-Context Phase 0 — Pretrain the ~100M long-context base.
+#
+# The original sweep13 phase0 trained at seq=1024 with a 256 local window, so
+# every token already saw the whole sequence through full attention and there
+# was nothing for an external memory to carry across. docs/training-speedups.md
+# Section 13 is explicit: for memory mechanisms to show measurable signal,
+# sequence length must exceed the sliding window by >=4x (seq >= 8K at a 2048
+# window). Below that ratio local attention covers most dependencies and
+# external memory adds no information.
+#
+# This config trains the shared base at seq=8192 with a 2048 sliding window —
+# the floor of the regime where the core research question is even testable. It
+# is enabled by the speedups work:
+#
+#   flex_attention: true   The dense causal/local mask at seq=8K is ~268 MB/
+#                          layer in fp32; SDPA materializes it. FlexAttention
+#                          compiles the mask into the kernel and keeps peak
+#                          memory flat across sequence length (measured: 17 GB
+#                          at seq 8K, 18 GB at 16K, 17 GB at 32K — all at the
+#                          same batch). SDPA OOMs at seq 32K with batch 1 on
+#                          this card. See docs/sweeps/SWEEP13_PIPELINE.md
+#                          section "Long-context: what FlexAttention unlocks".
+#   bf16 + compile         The next-gen pipeline base (Section 3 of the
+#                          pipeline doc).
+#   muon + qk_norm + rmsnorm + swiglu + scaled init  Carried over from the
+#                          seq=1024 phase0; these were already validated.
+#
+# Measured on RTX 5090 (flex + compile + bf16, 0.85 memory cap):
+#   batch 4 x seq 8192  ->  17.1 GB peak,  ~113k tok/s
+#   batch 2 x seq 16384 ->  18.2 GB peak,  ~113k tok/s   (phase0_longctx16k)
+#   batch 1 x seq 32768 ->  17.3 GB peak,  ~103k tok/s   (phase0_longctx32k)
+#
+# Non-embedding core is 99.1M (same arch as seq=1024 phase0): d768, L14.
+# Total 111.7M including the tied 16k-vocab embedding. Kept identical so the
+# only variable vs the old phase0 is sequence length and window.
+#
+# Launch:
+#   PYTHONPATH=. uv run python -m flower.train \
+#     --config configs/sweep13_100m_longctx_phase0.yaml \
+#     --output-dir runs/sweep13_longctx_phase0 --device cuda
+#
+# After completion, the long-context bake-off points still_pretrained_base at:
+#   runs/sweep13_longctx_phase0/vanilla_local_step10000.pt
+#
+# IMPORTANT: gradient_accumulation_steps reaches the effective batch. At seq 8192
+# a batch of 4 is 32768 tokens/micro-step; accum 2 gives an effective 65536-token
+# batch, which is in the right range for a 100M model (Chinchilla-ish). On WSL2
+# exceeding VRAM does NOT raise — the WDDM manager spills to host RAM over PCIe
+# and throughput collapses silently. The batch sizes above leave ~15 GB headroom
+# against that; do not raise them without re-measuring with bench_speedups.py.
+
+model:
+  variant: vanilla_local
+  vocab_size: 16384
+  d_model: 768
+  num_heads: 12
+  num_layers: 14
+  ffn_dim: 3072              # SwiGLU hidden auto-matched to 2048 (2/3 * 3072)
+  max_seq_len: 8192
+  local_window: 2048         # seq/window = 4x — the floor where memory can matter
+  rope_base: 10000.0
+  dropout: 0.0
+  # --- next-gen base (same as seq=1024 phase0) ---
+  norm_type: rmsnorm
+  ffn_activation: swiglu
+  ffn_param_match: true
+  qk_norm: true
+  use_bias: false
+  init_scheme: scaled
+  init_std: 0.02
+  # --- long-context enabler (docs/training-speedups.md Section 1) ---
+  flex_attention: true
+
+data:
+  dataset: fineweb_edu
+  tokenizer: "custom:tokenizers/fineweb_16k.json"
+  sequence_length: 8192
+  eval_seq_len: 8192
+  # Measured (scripts/analyze_tokenizer.py). Enables val_bpb.
+  bytes_per_token: 4.279
+
+training:
+  # Measured fit (see header): batch 4 at seq 8192 = 17.1 GB, ~15 GB headroom.
+  batch_size: 4
+  gradient_accumulation_steps: 2   # effective batch 65536 tokens
+  steps: 10000              # ~655M tokens — Chinchilla-light for the base
+  lr: 0.003
+  warmup_steps: 500
+  lr_schedule: wsd
+  lr_decay_frac: 0.2        # last 2000 steps decay linearly to zero
+  lr_final_frac: 0.0
+  grad_clip: 1.0
+  eval_interval: 1000
+  checkpoint_interval: 2000
+  save_checkpoints: true
+  device: auto
+  seed: 0
+  log_backend: tensorboard
+  composite_eval: false
+  optimizer: muon
+  muon_lr: 0.002            # larger model -> lower muon LR (matches sweep_still_scale)
+  muon_momentum: 0.95
+  weight_decay: 0.01
+  weight_decay_exclude_embeddings: true
+  validation_steps: 20
+  validation_interval: 1000
+  # --- next-gen pipeline ---
+  precision: bf16
+  compile_model: true
+  compile_mode: default

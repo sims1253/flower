@@ -617,3 +617,98 @@ Before step 1, run ~200 steps of phase 0 twice (fp32/no-compile vs bf16/compile)
 to get the actual speedup on your card and confirm bf16 is stable at this scale.
 `entities/nanowhale.md` reports bf16 NaN at ~110M — that was MLA+MoE, not a
 dense GPT, but it is cheap to rule out.
+
+---
+
+## 13. Long-context: what FlexAttention unlocks (training-speedups integration)
+
+The original sweep-13 plan above runs at seq=1024 with a 256 sliding window. At
+that ratio every token reaches the whole sequence through the windowed
+attention itself, so there is nothing for an external memory to carry across —
+which is the project's whole reason for existing. `docs/training-speedups.md`
+Section 13 is explicit about this: for memory mechanisms to show measurable
+signal, **sequence length must exceed the sliding window by >=4x** (seq >= 8K
+at a 2048 window). Below that ratio local attention covers most token
+dependencies and external memory adds no information.
+
+The blocker was always the dense causal/local attention mask. SDPA materializes
+a `(1, 1, T, T)` fp32 mask per layer: ~268 MB/layer at seq 8K, ~4 GB/layer at
+seq 32K. At seq 32K that OOMs the 5090's 32 GB before the model even runs.
+
+**FlexAttention** (`docs/training-speedups.md` Section 1) compiles the mask
+pattern into the attention kernel without ever materializing the T x T matrix.
+It is enabled with `model.flex_attention: true` and requires `compile_model:
+true` — **without compile, flex_attention runs unfused and is slower than SDPA**
+(it materializes the full scores matrix and warns). This was the single largest
+implementation caveat; the configs below always pair the two.
+
+### Measured (RTX 5090, flex + compile + bf16 + muon, 0.85 memory cap)
+
+The headline: peak memory stays nearly **flat** as sequence grows, because the
+block mask never materializes. SDPA, by contrast, blows up and OOMs at 32K.
+
+| size | seq | batch | peak GB | tok/s | notes |
+|---|---|---|---|---|---|
+| 100M (d768/L14) | 8192 | 4 | 17.1 | 113k | flex, the longctx_phase0 config |
+| 100M | 16384 | 2 | 18.2 | 113k | flex |
+| 100M | 32768 | 1 | 17.3 | 103k | **flex fits; SDPA OOMs at batch 1** |
+| 350M (d1024/L28) | 8192 | 2 | 23.2 | 33k | flex |
+| 350M | 16384 | 1 | 23.3 | 30k | flex |
+
+The crossover point: at seq <= 4K SDPA (flash kernel) is as fast or faster than
+flex and saves nothing, so the seq=1024 configs above do **not** enable flex.
+From seq 8K upward flex is both faster (where SDPA fits at all) and the only
+thing that fits at 32K. Use `scripts/bench_speedups.py` to re-measure.
+
+### What the speedups work added (and what it did not change)
+
+Implemented from `docs/training-speedups.md`, all behind config flags that
+default to legacy so the seq=1024 results stay reproducible:
+
+- **FlexAttention (S1)** — the long-context enabler above. The win is real and
+  matches the doc: 4.4x throughput at seq 32K and half the VRAM vs SDPA.
+- **FP8 lm_head (S3)** — eval-only. `_scaled_mm` has no backward kernel in torch
+  2.9, so the FP8 head runs in inference and the BF16 head is used during
+  training. The pipeline doc's section 9 verdict ("skip FP8/NVFP4 at this size")
+  stands: only the wide lm_head GEMM wins clearly, and the eval-only path makes
+  it a negligible-end-of-training convenience, not a training speedup.
+- **NorMuon (S5), Cautious WD (S6), Smooth-SwiGLU (S10), Orthogonal init
+  (S12.2)** — roughly cost-neutral on throughput (measured). Their value is
+  sample efficiency / stability, which needs a longer run to show. Not enabled
+  in the overnight configs below; opt in per-arm when re-running a winner.
+- **BF16 CE (S4), EMA eval (S12.4), sliding-window eval (S12.5), MTP (S8), TST
+  (S9)** — available, off by default.
+
+Skipped (need hardware/external deps outside the 5090's reach): **FSDP (S7)**,
+**Triton/Liger/TE kernels (S14)**, **FP4/NVFP4 precision routing (S13)**, the
+**600M @ seq=32K scale-up config** (OOMs the 5090 — needs a rented 8xGPU node,
+see the doc's compute-budget table).
+
+### New configs
+
+The seq=1024 Still-compactor pipeline (phase0/phase1 above) is preserved
+unchanged for comparability with the published 12M/100M results. Two new configs
+add the long-context direction:
+
+- **`configs/sweep13_100m_longctx_phase0.yaml`** — the long-context base.
+  Identical 100M arch (d768/L14), but seq=8192, local_window=2048 (4x ratio),
+  flex_attention. This is the base that makes the memory question testable.
+- **`configs/sweep13_longctx_memory_bakeoff.yaml`** — the core experiment.
+  `vanilla_local` (no memory) vs `bloom_memory` vs `summary_memory` at seq=8192 /
+  window=2048, where tokens past position 4K cannot see the first 2K unless a
+  memory mechanism carries them across the window. 3 arms x 2 seeds, an
+  overnight directional first pass; follow up with 8 seeds on any winner.
+
+### Suggested order (updated)
+
+0. (unchanged) tokenizer probe, LR calibration, taper shake-out.
+1. `configs/sweep13_100m_longctx_phase0.yaml` — the long-context base. ~3-4 h.
+2. `configs/sweep13_longctx_memory_bakeoff.yaml` — the memory bake-off. ~12-18 h.
+3. (optional, separate GPU budget) the seq=1024 Still bake-off (phase0+phase1)
+   and AttnRes probe — preserved for the compactor question, orthogonal to the
+   long-context memory question.
+
+If the overnight bake-off shows a memory arm beating vanilla at long context,
+that is the first positive signal for the project's thesis and the trigger for
+the powered (8-seed) follow-up and the 350M / 600M scale-up.
+

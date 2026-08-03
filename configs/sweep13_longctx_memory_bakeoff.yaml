@@ -1,0 +1,124 @@
+# Sweep 13, Long-Context Memory Bake-off — do memory mechanisms show signal
+# once sequence exceeds the sliding window?
+#
+# This is the core research question from docs/training-speedups.md Section 13,
+# finally testable. The prior sweep13 bake-off (Still compactors) ran at seq=1024
+# with a 256 window; there, every token reached the whole sequence through full
+# attention, so external memory had nothing to carry. Here we run at seq=8192
+# with a 2048 sliding window: tokens in the first 2K of the sequence are
+# invisible to tokens past position 4K UNLESS a memory mechanism carries that
+# information forward across the window boundary. That is Flower's thesis made
+# into a measurement.
+#
+# Minimal form (overnight, ~12-24h on the 5090):
+#   - vanilla_local:  control, no external memory (sliding window only)
+#   - bloom_memory:   K learned hash projections route summaries to slots
+#   - summary_memory: single perceiver summary -> slot write
+#   3 arms x 2 seeds = 6 runs. The question is directional (does ANY memory arm
+#   beat vanilla at long context?), not powered for small effects — that is the
+#   explicit trade for an overnight first pass. If a memory arm wins, follow up
+#   with the powered 8-seed comparison.
+#
+# Smaller than the phase0 base (d512/L8, ~40M) so 6 runs fit overnight and so
+# the memory slots are a meaningful fraction of capacity. Trained from scratch
+# (no frozen teacher — the long-context base from phase0 is for the Still arms;
+# here we want the memory mechanism to be load-bearing during training).
+#
+# Measured on RTX 5090 (flex + compile + bf16, 0.85 cap):
+#   vanilla_local   seq8192 B2 -> 3.3 GB,  finite loss, flex OK
+#   bloom_memory    seq8192 B2 -> 4.3 GB,  finite loss, flex OK
+#   summary_memory  seq8192 B2 -> 4.1 GB,  finite loss, flex OK
+# (smoke at d512/L6; the real config below is d512/L8 but the same shape, so
+# headroom is large — could raise batch, kept conservative for the memory arms.)
+#
+# Launch (all arms, 2 seeds each):
+#   PYTHONPATH=. uv run python -m flower.sweep \
+#     configs/sweep13_longctx_memory_bakeoff.yaml --output-dir runs/sweep13_longctx_bakeoff
+# Or a single arm:
+#   PYTHONPATH=. uv run python -m flower.train \
+#     --config configs/sweep13_longctx_memory_bakeoff.yaml --variant vanilla_local
+
+sweep:
+  name: sweep13_longctx_memory_bakeoff
+
+  defaults:
+    model:
+      vocab_size: 16384
+      d_model: 512
+      num_heads: 8
+      num_layers: 8
+      ffn_dim: 2048
+      max_seq_len: 8192
+      local_window: 2048         # seq/window = 4x: memory can matter
+      rope_base: 10000.0
+      dropout: 0.0
+      norm_type: rmsnorm
+      ffn_activation: swiglu
+      ffn_param_match: true
+      qk_norm: true
+      use_bias: false
+      init_scheme: scaled
+      init_std: 0.02
+      flex_attention: true       # the long-context enabler
+      # Shared memory settings (used by the memory arms; ignored by vanilla).
+      memory_slots: 8
+
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      # Conservative batch: the memory arms are unmeasured at this exact shape.
+      # batch 2 x accum 8 = effective batch 131072 tokens. Headroom is large
+      # (~4 GB peak); raise batch later once steady-state is confirmed.
+      batch_size: 2
+      gradient_accumulation_steps: 8
+      steps: 6000
+      lr: 0.003
+      warmup_steps: 300
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      eval_interval: 500
+      checkpoint_interval: 2000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.003
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 50
+      validation_interval: 500
+      precision: bf16
+      compile_model: true
+      compile_mode: default
+
+  variants:
+    # Control: sliding-window attention only, no external memory. The baseline
+    # against which "memory carries information across the window" is measured.
+    - name: vanilla_local
+      model: { variant: vanilla_local }
+
+    # K learned hash projections route perceiver summaries to slots. Closest to
+    # a counting Bloom filter; the "no false negatives" property means every
+    # summary has positive mass somewhere.
+    - name: bloom_memory
+      model:
+        variant: bloom_memory
+        bloom_num_hashes: 4
+        bloom_summary_points: 16
+        bloom_temperature: 0.5
+
+    # Single perceiver summary -> slot write per chunk. The simplest compression
+    # memory; a clean contrast to bloom's structured addressing.
+    - name: summary_memory
+      model: { variant: summary_memory }

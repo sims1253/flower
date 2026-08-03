@@ -77,6 +77,13 @@ sweep:
       qk_norm: true
       use_bias: false
       init_scheme: scaled
+      # Long-context enabler (docs/training-speedups.md Section 1). The Still
+      # standard-attention branches route through FlexAttention; the compact-path
+      # mixed-length KV stays on SDPA by design (see _standard_attention in
+      # still_lm.py). At seq 1024 this is roughly cost-neutral — kept on for
+      # pipeline consistency with the long-context configs and because it halves
+      # activation memory on the teacher pass.
+      flex_attention: true
       still_compact_len: 64
       still_num_blocks: 2
       still_d_latent: 128

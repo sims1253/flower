@@ -45,6 +45,15 @@
 #   scp -i ~/.ssh/id_ed25519 runs/sweep13_100m_phase0/vanilla_local_step15000.pt \
 #       root@<host>:/workspace/flower/runs/sweep13_100m_phase0/
 # build_still_model now FAILS loudly if still_pretrained_base is missing.
+#
+# NOTE: this config stays at seq=1024 because the Still compactor bake-off
+# (phase1) inherits the base's architecture and state_dict layout — changing
+# sequence length here would invalidate every phase1 arm. For the NEW long-
+# context memory-mechanism direction enabled by the speedups work, use
+# configs/sweep13_100m_longctx_phase0.yaml (seq=8192, flex_attention=true).
+# At seq=1024 FlexAttention is ~18% slower than SDPA and saves no memory, so it
+# is intentionally NOT enabled here. See docs/sweeps/SWEEP13_PIPELINE.md
+# "Long-context: what FlexAttention unlocks".
 
 model:
   variant: vanilla_local
