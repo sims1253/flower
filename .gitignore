@@ -25,8 +25,9 @@ data_cache/
 *.ckpt
 *.safetensors
 
-# Tokenizer ablation output (regenerable via scripts/compare_tokenizer_algorithms.py);
-# the fineweb_*.json models in tokenizers/ are tracked for reproducibility.
+# Tokenizers are regenerable via scripts/train_custom_tokenizer.py and
+# scripts/compare_tokenizer_algorithms.py (see tokenizers/README.md).
+tokenizers/*.json
 tokenizers/algo/
 
 # ZCode / agent scratch

@@ -53,7 +53,7 @@ flower/        # training framework
   sweep.py, sweep_parallel.py
 scripts/       # tokenizers, result aggregation, plotting, Vast.ai automation
 configs/       # experiment YAMLs (sweep definitions + per-variant configs)
-tokenizers/    # fineweb_*.json tokenizer models (4k/8k/16k/32k)
+tokenizers/    # BPE tokenizer models — NOT checked in; regenerate (see tokenizers/README.md)
 tests/         # pytest suite (shapes, causal masks, smoke train, sweeps, scripts)
 docs/          # research notes, sweep plans & results, training roadmap
 ```
