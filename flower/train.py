@@ -214,6 +214,31 @@ def log_learning_rates(writer: ScalarLogger, optims: list[torch.optim.Optimizer]
             writer.add_scalar(f"train/lr/{opt_name}_{opt_index}_group_{group_index}", group["lr"], step)
 
 
+def update_attention_windows(model: torch.nn.Module, step: int, cfg) -> None:
+    """Expand attention windows over training (S2, window warmup).
+
+    Linearly ramps every attention module's local_window from
+    cfg.model.attn_warmup_start to cfg.model.local_window over
+    cfg.model.attn_warmup_steps steps, then holds at local_window.
+    No-op when attn_warmup_steps == 0 (the default: use local_window always).
+    """
+    if getattr(cfg.model, "attn_warmup_steps", 0) == 0:
+        return
+    target = cfg.model.local_window
+    if step >= cfg.model.attn_warmup_steps:
+        target = cfg.model.local_window
+    else:
+        frac = step / max(1, cfg.model.attn_warmup_steps)
+        target = int(round(cfg.model.attn_warmup_start + frac * (cfg.model.local_window - cfg.model.attn_warmup_start)))
+    for module in model.modules():
+        lw = getattr(module, "local_window", None)
+        if lw is not None and lw != target:
+            module.local_window = target
+            # Invalidate the FlexAttention block-mask cache (S1).
+            if hasattr(module, "_cached_block_mask"):
+                module._cached_block_mask = None
+
+
 def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
@@ -299,6 +324,15 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             print("[compile] module diagnostics disabled (untraceable by Dynamo)")
         model = torch.compile(model, mode=cfg.training.compile_mode, dynamic=False)
     optims = optim_or_list if isinstance(optim_or_list, list) else [optim_or_list]
+    # S12.4: EMA weight averaging for evaluation.
+    ema_model: torch.nn.Module | None = None
+    if getattr(cfg.training, "ema_decay", 0.0) > 0:
+        import copy
+
+        ema_model = copy.deepcopy(eager_model)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
     initialize_lr_schedule(optims)
     batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
     val_batches = (
@@ -358,6 +392,7 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     shm_watchdog = start_shm_watchdog()
     try:
         for step in range(resume_step + 1, cfg.training.steps + 1):
+            update_attention_windows(eager_model, step, cfg)
             if hasattr(eager_model, "set_step"):
                 eager_model.set_step(step)
             accum_steps = max(1, int(cfg.training.gradient_accumulation_steps))
@@ -371,6 +406,18 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             last_diagnostics: dict[str, Any] = {}
             for _ in range(accum_steps):
                 input_ids, labels = unpack_batch(next(batches))
+                # S9: Token Superposition Training phase 1 — compress to bags.
+                tst_phase_1 = False
+                if getattr(cfg.training, "tst_enabled", False):
+                    phase_1_steps = int(cfg.training.steps * float(getattr(cfg.training, "tst_phase_ratio", 0.0)))
+                    tst_phase_1 = step <= phase_1_steps
+                if tst_phase_1:
+                    from flower.data import compress_to_bags
+
+                    try:
+                        input_ids = compress_to_bags(input_ids, int(cfg.training.tst_bag_size))
+                    except Exception:
+                        tst_phase_1 = False
                 with autocast_ctx(device, amp_dtype):
                     out = model(input_ids, labels=labels)
                     loss = out["loss"]
@@ -392,6 +439,11 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             )
             for opt in optims:
                 opt.step()
+            if ema_model is not None:
+                with torch.no_grad():
+                    decay = float(cfg.training.ema_decay)
+                    for ema_p, model_p in zip(ema_model.parameters(), eager_model.parameters()):
+                        ema_p.data.mul_(decay).add_(model_p.data, alpha=1.0 - decay)
             last_loss = float(step_loss) / accum_steps
             should_log = step == 1 or step % log_interval == 0 or step == cfg.training.steps
             if writer is not None and should_log:
@@ -430,7 +482,8 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 and step % cfg.training.validation_interval == 0
             ):
                 val_metrics = evaluate(
-                    model, val_batches, cfg.training.validation_steps, device, amp_dtype,
+                    ema_model if ema_model is not None else model,
+                    val_batches, cfg.training.validation_steps, device, amp_dtype,
                     bytes_per_token=cfg.data.bytes_per_token,
                 )
                 if writer is not None:
@@ -485,7 +538,8 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     if val_batches is not None:
         metrics.update(
             evaluate(
-                model, val_batches, cfg.training.validation_steps, device, amp_dtype,
+                ema_model if ema_model is not None else model,
+                val_batches, cfg.training.validation_steps, device, amp_dtype,
                 bytes_per_token=cfg.data.bytes_per_token,
             )
         )

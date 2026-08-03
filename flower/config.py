@@ -209,6 +209,62 @@ class ModelConfig:
     attn_res_blocks: int = 8
     attn_res_key: str = "full"  # full | sliced
     attn_res_rank: int = 64
+    # ------------------------------------------------------------------
+    # docs/training-speedups.md. Each knob defaults to the legacy
+    # behaviour so published runs reproduce; opt in per config.
+    # ------------------------------------------------------------------
+    # S1: FlexAttention. Compiles the causal/local mask into the attention
+    # kernel without materializing the T x T mask — required for seq=32K.
+    # On CPU / when off, the SDPA path is used (flex needs CUDA to be fast
+    # but does run, unfused, for tests).
+    flex_attention: bool = False
+    # S2: attention-window warmup. Linearly ramps every attention module's
+    # local_window from attn_warmup_start to local_window over
+    # attn_warmup_steps training steps. 0 disables (use local_window always).
+    attn_warmup_start: int = 256
+    attn_warmup_steps: int = 0
+    # S3: FP8 matmul for the lm_head projection (Blackwell/Hopper, bf16 only).
+    fp8_lm_head: bool = False
+    # S4: compute cross-entropy in BF16 instead of FP32.
+    bf16_cross_entropy: bool = False
+    # S8: Multi-Token Prediction (final-runs only; changes the loss surface).
+    # Predicts N extra future tokens with untied heads; aux losses weighted by
+    # mtp_weight. 0 disables (standard next-token loss).
+    mtp_extra_heads: int = 0
+    mtp_weight: float = 0.5
+    # S10: Smooth-SwiGLU. Per-channel scale on the `up` projection that makes
+    # the SwiGLU multiply numerically equivalent but with a narrower dynamic
+    # range, stabilising FP8/FP4 training. No-op for GELU FFNs.
+    smooth_swiglu: bool = False
+    # S12.2: orthogonal weight initialisation for 2D matrices (pairs with Muon).
+    orthogonal_init: bool = False
+    # S13: per-component precision routing (scaffolding). The actual FP4/FP8
+    # matmul casting requires NVIDIA's transformer_engine and is NOT
+    # implemented here — these fields are forward-looking config only and must
+    # stay bf16 (memory_precision is bf16-locked by design: Flower's memory
+    # write/read path needs high dynamic range).
+    ffn_precision: str = "bf16"  # bf16 | fp8 | fp4
+    attn_precision: str = "bf16"  # bf16 | fp8
+    memory_precision: str = "bf16"  # bf16 only
+    head_precision: str = "bf16"  # bf16 | fp8
+    bf16_guard_blocks: int = 0
+
+    def __post_init__(self) -> None:
+        # S13: validate the precision-routing fields. Keep the actual FP4/FP8
+        # matmul casting (which requires NVIDIA's transformer_engine) out of
+        # scope; these fields are forward-looking config scaffolding only.
+        if self.ffn_precision not in {"bf16", "fp8", "fp4"}:
+            raise ValueError(f"ffn_precision must be bf16|fp8|fp4, got {self.ffn_precision!r}")
+        if self.attn_precision not in {"bf16", "fp8"}:
+            raise ValueError(f"attn_precision must be bf16|fp8, got {self.attn_precision!r}")
+        if self.memory_precision != "bf16":
+            raise ValueError(
+                f"memory_precision must stay 'bf16' (Flower's memory write/read path "
+                f"needs high dynamic range; low precision collapses routing decisions), "
+                f"got {self.memory_precision!r}"
+            )
+        if self.head_precision not in {"bf16", "fp8"}:
+            raise ValueError(f"head_precision must be bf16|fp8, got {self.head_precision!r}")
 
 
 @dataclass
@@ -337,6 +393,29 @@ class TrainingConfig:
         "cond",
         "flow",
     )
+    # ------------------------------------------------------------------
+    # docs/training-speedups.md — optimizer / training-schedule knobs.
+    # All default to the legacy behaviour.
+    # ------------------------------------------------------------------
+    # S5 (NorMuon, arXiv:2510.05491): normalise the Muon update to unit
+    # Frobenius norm before the LR/aspect-ratio scaling step.
+    norm_update: bool = False
+    # S6 (Cautious Weight Decay): only decay a weight where the optimizer
+    # update is already shrinking it (update * weight > 0). Replaces standard
+    # weight_decay for the Muon group when > 0; for the AdamW group, replaces
+    # decoupled weight decay. 0.0 = disabled.
+    cautious_wd: float = 0.0
+    # S9 (Token Superposition Training, arXiv:2605.06546). Phase 1 compresses
+    # `tst_bag_size` consecutive tokens into bags and trains with multi-hot
+    # cross-entropy; phase 2 reverts to standard next-token prediction. The
+    # final model is architecturally identical to a baseline. Disabled by
+    # default.
+    tst_enabled: bool = False
+    tst_bag_size: int = 4
+    tst_phase_ratio: float = 0.3
+    # S12.4 (EMA weight averaging for evaluation): maintain an EMA copy of
+    # the weights (decay) and use it for validation/final eval. 0.0 disables.
+    ema_decay: float = 0.0
 
 
 @dataclass

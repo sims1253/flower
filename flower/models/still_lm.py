@@ -42,6 +42,34 @@ from flower.models.still_flow2 import StillCompactorFlowOT, StillCompactorMeanFl
 from flower.models.still_flow3 import StillCompactorFlowKV
 
 
+def _standard_attention(attn, q, k, v, seq_len: int, device, x_shape) -> torch.Tensor:
+    """Causal (+optional window) attention used by the Still standard branches.
+
+    Mirrors CausalSelfAttention's own forward but operates on already-projected
+    q/k/v (Still extracts them to cache the teacher KV). Honours
+    `attn.use_flex` (S1): when set, use FlexAttention with the module's cached
+    block mask; otherwise fall back to SDPA + a materialized causal mask.
+
+    The compact-path branches (mixed compact-prefix + causal-suffix KV with a
+    per-layer variable compact_len) intentionally stay on SDPA: that mask
+    structure cannot be expressed as a single BlockMask. Still is a research
+    variant, not the seq=32K throughput path, so this is the right boundary.
+    """
+    if getattr(attn, "use_flex", False):
+        from flower.models.base import _load_flex_attention
+
+        flex_attention, _ = _load_flex_attention()
+        block_mask = attn._get_block_mask(seq_len, device)
+        out = flex_attention(q, k, v, block_mask=block_mask)
+    else:
+        from flower.models.base import causal_mask
+
+        keep = causal_mask(seq_len, device, attn.local_window).view(1, 1, seq_len, seq_len)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+    out = out.transpose(1, 2).contiguous().view(x_shape)
+    return attn.out(out)
+
+
 def _suffix_causal_mask(span: int, device: torch.device, local_window: int | None) -> torch.Tensor:
     """Causal mask over the suffix region, honouring the layer's local window.
 
@@ -354,14 +382,9 @@ class StillLM(nn.Module):
                 out = out.transpose(1, 2).contiguous().view(B_inner, T_inner, D)
                 attn_output = attn.out(out)
             else:
-                # Standard attention path.
-                from flower.models.base import causal_mask
-
+                # Standard attention path (honours attn.use_flex, see _standard_attention).
                 seq_len = x.shape[1]
-                keep = causal_mask(seq_len, device, attn.local_window).view(1, 1, seq_len, seq_len)
-                out = F.scaled_dot_product_attention(q_rot, k_rot, v_h, attn_mask=keep)
-                out = out.transpose(1, 2).contiguous().view(x.shape)
-                attn_output = attn.out(out)
+                attn_output = _standard_attention(attn, q_rot, k_rot, v_h, seq_len, device, x.shape)
 
             # Residual + FFN.
             x = x + attn_output
@@ -377,9 +400,15 @@ class StillLM(nn.Module):
 
         loss = None
         if labels is not None:
+            # Honour the base model's bf16_cross_entropy flag (S4) so the Still
+            # teacher/student CE matches the base model's own loss precision.
+            shift_logits = logits[:, :-1]
+            shift_labels = labels[:, 1:]
+            if getattr(self.base_model, "bf16_cross_entropy", False):
+                shift_logits = shift_logits.to(torch.bfloat16)
             loss = F.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                labels[:, 1:].reshape(-1),
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
             )
 
         diagnostics: dict[str, Any] = {
@@ -545,12 +574,8 @@ class StillLM(nn.Module):
                 out = out.transpose(1, 2).contiguous().view(B_inner, T_inner, D)
                 attn_output = attn.out(out)
             else:
-                from flower.models.base import causal_mask
                 seq_len = x.shape[1]
-                keep = causal_mask(seq_len, device, attn.local_window).view(1, 1, seq_len, seq_len)
-                out = F.scaled_dot_product_attention(q_rot, k_rot, v_h, attn_mask=keep)
-                out = out.transpose(1, 2).contiguous().view(x.shape)
-                attn_output = attn.out(out)
+                attn_output = _standard_attention(attn, q_rot, k_rot, v_h, seq_len, device, x.shape)
 
             x = x + attn_output
             x = x + block.ff(block.ln2(x))

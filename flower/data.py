@@ -365,6 +365,40 @@ def token_batches(
     raise ValueError(f"Unknown dataset: {config.dataset}")
 
 
+def compress_to_bags(token_ids: torch.Tensor, bag_size: int) -> torch.Tensor:
+    """Compress consecutive tokens into bags for TST phase 1 (arXiv:2605.06546).
+
+    Input: (B, T) token IDs (or (T,) 1-D for a single sequence).
+    Output: (B, T // bag_size, bag_size) — each output position holds the
+    `bag_size` original tokens that will be averaged at the embedding level.
+
+    The input is truncated to a multiple of `bag_size` so the reshape is exact.
+    bag_size must be >= 1; bag_size == 1 is an identity (no compression).
+
+    See `docs/training-speedups.md` Section 9 (Token Superposition Training).
+    """
+    if bag_size < 1:
+        raise ValueError(f"bag_size must be >= 1, got {bag_size}")
+
+    was_1d = token_ids.dim() == 1
+    if was_1d:
+        token_ids = token_ids.unsqueeze(0)  # (1, T)
+
+    B, T = token_ids.shape
+    t_compressed = T // bag_size
+    token_ids = token_ids[..., : t_compressed * bag_size]
+
+    if bag_size == 1:
+        # Lossless identity: just add a trailing size-1 dim.
+        out = token_ids.unsqueeze(-1)
+    else:
+        out = token_ids.view(B, t_compressed, bag_size)
+
+    if was_1d:
+        out = out.squeeze(0)  # (T_compressed, bag_size)
+    return out
+
+
 def validation_token_batches(
     config: DataConfig,
     batch_size: int,

@@ -11,6 +11,57 @@ from torch import nn
 from flower.config import ModelConfig
 from flower.models.attn_res import DepthRouter, routing_sites
 
+# FlexAttention (S1) compiles the causal/local mask into the attention kernel
+# without ever materializing the full T x T matrix. At seq=32K a dense mask is
+# ~4GB/layer in fp32, which OOMs the 5090's 32GB; FlexAttention avoids that.
+# Imported lazily so the module still loads on builds without the symbol and so
+# CPU tests that never enable the flag pay no import cost.
+_flex_attention: Any = None
+_create_block_mask: Any = None
+
+
+def _load_flex_attention() -> tuple[Any, Any]:
+    """Return (flex_attention, create_block_mask), importing on first use."""
+    global _flex_attention, _create_block_mask
+    if _flex_attention is None:
+        from torch.nn.attention.flex_attention import (
+            create_block_mask as _cbm,
+            flex_attention as _fa,
+        )
+
+        _flex_attention = _fa
+        _create_block_mask = _cbm
+    return _flex_attention, _create_block_mask
+
+
+def make_causal_local_block_mask(
+    local_window: int | None, seq_len: int, device: torch.device
+) -> Any:
+    """Build a compiled FlexAttention BlockMask for causal + optional window.
+
+    The mask broadcasts over batch and heads (B=None, H=None). When
+    `local_window` is None the mask is pure causal (full context); otherwise
+    each query attends only to keys within `local_window` positions behind it.
+    """
+    flex_attention, create_block_mask = _load_flex_attention()
+
+    window = local_window
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        if window is not None:
+            return causal & ((q_idx - kv_idx) < window)
+        return causal
+
+    return create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
+
 
 class RMSNorm(nn.Module):
     """RMS normalization (Zhang & Sennrich, 2019) with a learnable gain.
@@ -196,6 +247,12 @@ class FeedForward(nn.Module):
         if activation not in {"gelu", "swiglu"}:
             raise ValueError(f"ffn_activation must be 'gelu' or 'swiglu', got {activation!r}")
         self.activation = activation
+        # S10: per-token scale on the SwiGLU `up` projection so the gated
+        # product does not amplify outliers under FP8/FP4. Mathematically
+        # equivalent (w_down is linear, so the scale cancels); the only effect
+        # is a smaller dynamic range on the intermediate fused tensor. Set for
+        # both branches so the attribute always exists; the GELU path ignores it.
+        self.smooth_swiglu = bool(getattr(config, "smooth_swiglu", False)) if config is not None else False
         if activation == "gelu":
             # Keep the original nn.Sequential layout: the parameter names
             # (net.0.weight / net.3.weight) are baked into every checkpoint
@@ -220,7 +277,19 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.activation == "gelu":
             return self.net(x)
-        return self.down(self.dropout(F.silu(self.gate(x)) * self.up(x)))
+        gate = self.gate(x)
+        up = self.up(x)
+        act = F.silu(gate)
+        if self.smooth_swiglu:
+            # Per-token scale on `up`: prevents SwiGLU outlier amplification
+            # under FP8/FP4 (S10). w_down is linear, so the scale cancels and
+            # the result is mathematically identical to the standard path.
+            up_scale = up.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
+            fused = self.dropout(act * (up / up_scale))
+            out = self.down(fused)
+            return out * up_scale
+        fused = self.dropout(act * up)
+        return self.down(fused)
 
 
 class CausalSelfAttention(nn.Module):
@@ -246,6 +315,26 @@ class CausalSelfAttention(nn.Module):
         if self.kernel_bias == "rbf":
             init_scale = float(getattr(config, "local_attn_rbf_scale", 4.0))
             self.rbf_log_scale = nn.Parameter(torch.full((self.num_heads,), math.log(max(init_scale, 1e-3))))
+        # S1 (FlexAttention). Opt-in; the SDPA path stays the default so the
+        # existing (non-flex) tests and published runs reproduce bit-for-bit.
+        self.use_flex = bool(getattr(config, "flex_attention", False))
+        # Block-mask cache: create_block_mask is expensive (it compiles). The
+        # mask only changes when seq_len or local_window changes, so cache it.
+        self._cached_block_mask: Any = None
+        self._cached_seq_len: int = 0
+        self._cached_window: int | None = None
+
+    def _get_block_mask(self, seq_len: int, device: torch.device) -> Any:
+        window = self.local_window
+        if (
+            self._cached_block_mask is None
+            or seq_len != self._cached_seq_len
+            or window != self._cached_window
+        ):
+            self._cached_block_mask = make_causal_local_block_mask(window, seq_len, device)
+            self._cached_seq_len = seq_len
+            self._cached_window = window
+        return self._cached_block_mask
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, dim = x.shape
@@ -281,6 +370,11 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv_heads(x)
         seq_len = x.shape[1]
+        if self.use_flex:
+            return self._forward_flex(x, q, k, v, seq_len)
+        return self._forward_sdpa(x, q, k, v, seq_len)
+
+    def _forward_sdpa(self, x: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_len: int) -> torch.Tensor:
         # Use fused scaled-dot-product attention (flash / mem-efficient kernels).
         # The previous path materialized a dense (B, H, T, T) fp32 score tensor per
         # layer; at B16/T2048 that is ~1.6 GB/layer and, with all layers' backward
@@ -296,6 +390,30 @@ class CausalSelfAttention(nn.Module):
         else:
             attn_mask = keep
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).contiguous().view(x.shape)
+        return self.out(out)
+
+    def _forward_flex(self, x: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_len: int) -> torch.Tensor:
+        # S1: FlexAttention compiles the mask into the kernel. The block mask is
+        # cached (see _get_block_mask); RBF bias becomes a score_mod so no dense
+        # (B, H, T, T) tensor is ever materialized. The fused CUDA kernel is
+        # obtained automatically when the outer model is torch.compiled; in eager
+        # mode flex_attention still runs (unfused) — correct, just not fast.
+        flex_attention, _ = _load_flex_attention()
+        block_mask = self._get_block_mask(seq_len, q.device)
+        if self.kernel_bias == "rbf":
+            # Per-head RBF scale; close over the current parameter value so the
+            # schedule stays differentiable through rbf_log_scale.
+            rbf_scale = self.rbf_log_scale.exp().to(device=q.device, dtype=q.dtype)
+            denom_sq = float(self.local_window) ** 2 if self.local_window is not None else float(seq_len) ** 2
+
+            def rbf_score_mod(score: torch.Tensor, b, h, q_idx, kv_idx) -> torch.Tensor:
+                dist = (q_idx - kv_idx).float()
+                return score - rbf_scale[h] * (dist ** 2) / denom_sq
+
+            out = flex_attention(q, k, v, score_mod=rbf_score_mod, block_mask=block_mask)
+        else:
+            out = flex_attention(q, k, v, block_mask=block_mask)
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
@@ -336,6 +454,23 @@ class CausalLM(nn.Module):
         self.ln = build_norm(config, config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.head.weight = self.token.weight
+        # S3: FP8 matmul for the lm_head projection (Blackwell/Hopper). Off by
+        # default; guarded again in _compute_logits by dtype + CUDA checks.
+        self.fp8_lm_head = bool(getattr(config, "fp8_lm_head", False))
+        # S4: compute the next-token cross-entropy in BF16 instead of FP32.
+        self.bf16_cross_entropy = bool(getattr(config, "bf16_cross_entropy", False))
+        # S8: auxiliary Multi-Token-Prediction heads for t+2, t+3, ... These are
+        # untied heads on the already-normed hidden state; the main tied head
+        # still predicts t+1. None when mtp_extra_heads <= 0 (legacy default).
+        self.mtp_extra_heads = int(getattr(config, "mtp_extra_heads", 0))
+        self.mtp_weight = float(getattr(config, "mtp_weight", 0.5))
+        if self.mtp_extra_heads > 0:
+            self.mtp_heads = nn.ModuleList([
+                nn.Linear(config.d_model, config.vocab_size, bias=False)
+                for _ in range(self.mtp_extra_heads)
+            ])
+        else:
+            self.mtp_heads = None
         # Depth-axis routing (AttnRes family). None unless explicitly enabled.
         self.attn_res_sites: list[int] = []
         self.depth_router: DepthRouter | None = None
@@ -363,7 +498,13 @@ class CausalLM(nn.Module):
         init_scheme = getattr(config, "init_scheme", "torch")
         if init_scheme not in {"torch", "scaled"}:
             raise ValueError(f"init_scheme must be 'torch' or 'scaled', got {init_scheme!r}")
-        if init_scheme == "scaled":
+        # S12.2: orthogonal weight init is a separate, orthogonal flag. It wins
+        # over the generic scaled scheme when both are set (its residual-output
+        # scaling already mirrors _apply_scaled_init). With neither requested
+        # the module keeps whatever init its submodules ran in __init__.
+        if getattr(config, "orthogonal_init", False):
+            self._apply_orthogonal_init()
+        elif init_scheme == "scaled":
             self._apply_scaled_init()
 
     def _apply_scaled_init(self) -> None:
@@ -394,6 +535,91 @@ class CausalLM(nn.Module):
             nn.init.zeros_(self.depth_router.query)
             nn.init.zeros_(self.depth_router.gate)
 
+    def _apply_orthogonal_init(self) -> None:
+        """Orthogonal weight initialisation for 2D matrices (Parameter Golf).
+
+        Synergises with Muon: the Newton-Schulz step preserves orthogonality,
+        so starting orthogonal keeps the optimizer in its ideal regime. Residual
+        output projections (attention `out`, FFN `down`) are scaled by
+        1/sqrt(2*num_layers) like the scaled scheme. Biases zeroed. Embeddings
+        keep a small normal init so the tied lm_head does not start at 1.
+        """
+        depth_scale = 1.0 / math.sqrt(2 * max(1, len(self.blocks)))
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and module.weight.ndim == 2:
+                nn.init.orthogonal_(module.weight)
+                if getattr(module, "_is_residual_out", False):
+                    module.weight.data *= depth_scale
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=float(getattr(self.config, "init_std", 0.02)),
+                )
+        if self.depth_router is not None:
+            nn.init.zeros_(self.depth_router.query)
+            nn.init.zeros_(self.depth_router.gate)
+
+    def _compute_logits(self, x_normed: torch.Tensor) -> torch.Tensor:
+        """LM head projection on an already-normed hidden state (S3).
+
+        When `fp8_lm_head` is set and the activations are BF16 on CUDA, the
+        tied-head matmul runs via `torch._scaled_mm` in float8_e4m3fn
+        (Blackwell/Hopper). Otherwise this is the plain `self.head` matmul.
+
+        FP8 is used in EVAL/INFERENCE only: `torch._scaled_mm` has no backward
+        kernel in current PyTorch, so during training (when the head logits feed
+        the loss and need gradients) we fall back to the BF16 head. This matches
+        how production FP8 heads are used — the expensive logits matmul runs in
+        FP8 for eval, and is recomputed in BF16 for the training loss/backward.
+        """
+        if (
+            self.fp8_lm_head
+            and not self.training
+            and x_normed.dtype == torch.bfloat16
+            and x_normed.is_cuda
+        ):
+            return self._fp8_head(x_normed)
+        return self.head(x_normed)
+
+    def _fp8_head(self, x_normed: torch.Tensor) -> torch.Tensor:
+        """FP8 matmul for the lm_head projection via torch._scaled_mm (S3).
+
+        Requires BF16 activations + CUDA (Blackwell/Hopper). Computes per-row
+        amax scales, casts to float8_e4m3fn, runs `_scaled_mm`, casts logits
+        back to BF16. The cast is on a view of the tied embedding weight -
+        master weights stay BF16.
+        """
+        B, T, D = x_normed.shape
+        x2d = x_normed.reshape(-1, D)  # (B*T, D)
+        w = self.head.weight  # (vocab, D), tied to the embedding
+        x_fp8 = x2d.to(torch.float8_e4m3fn)
+        w_fp8 = w.to(torch.float8_e4m3fn)
+        # Row-wise per-tensor scaling (amax / FP8_E4M3 max = 448.0). _scaled_mm
+        # requires float32 scales; for row-wise scaling scale_a is (M, 1) and
+        # scale_b is (1, N) matching the output (M, N) = (B*T, vocab) shape.
+        scale_a = (x2d.amax(dim=-1, keepdim=True).float() / 448.0)  # (B*T, 1)
+        scale_b = (w.amax(dim=-1, keepdim=True).t().contiguous().float() / 448.0)  # (1, vocab)
+        logits2d = torch._scaled_mm(
+            x_fp8, w_fp8.t(),
+            scale_a=scale_a, scale_b=scale_b,
+            out_dtype=torch.bfloat16,
+        )
+        return logits2d.view(B, T, -1)
+
+    def _cross_entropy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Shifted next-token CE; optionally in BF16 (S4)."""
+        shift_logits = logits[:, :-1]
+        shift_labels = labels[:, 1:]
+        if self.bf16_cross_entropy:
+            shift_logits = shift_logits.to(torch.bfloat16)
+        return F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+        )
+
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
         # Allow seq_len > max_seq_len during eval (Sweep 7 A1: eval_seq_len > max_seq_len).
         # RoPE cache extends lazily; local attention mask is computed on-the-fly.
@@ -423,10 +649,31 @@ class CausalLM(nn.Module):
                     x = self.depth_router(site, x, sources)
                     prev = x
                     site += 1
-        logits = self.head(self.ln(x))
+        x_normed = self.ln(x)
+        logits = self._compute_logits(x_normed)
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:].reshape(-1))
+            loss = self._cross_entropy(logits, labels)
+            # S8: auxiliary Multi-Token-Prediction heads. Each untied head on
+            # the already-normed hidden state predicts t+2, t+3, ... The main
+            # tied head above still handles the t+1 prediction. `x_normed` is
+            # reused verbatim - the FP8 path only affects the tied matmul, the
+            # MTP heads are always plain BF16 Linears.
+            if self.mtp_heads is not None:
+                for i, mtp_head in enumerate(self.mtp_heads):
+                    offset = i + 2  # predict t+2, t+3, ...
+                    mtp_logits = mtp_head(x_normed)
+                    # Align: mtp_logits[:, :T-offset] predicts labels[:, offset:].
+                    if offset < mtp_logits.size(1) and offset < labels.size(1):
+                        mtp_logits = mtp_logits[:, : mtp_logits.size(1) - offset]
+                        mtp_labels = labels[:, offset:]
+                        if self.bf16_cross_entropy:
+                            mtp_logits = mtp_logits.to(torch.bfloat16)
+                        mtp_loss = F.cross_entropy(
+                            mtp_logits.reshape(-1, mtp_logits.size(-1)),
+                            mtp_labels.reshape(-1),
+                        )
+                        loss = loss + self.mtp_weight * mtp_loss
         if self._static_diagnostics is None:
             self._static_diagnostics = {
                 "parameter_count": count_parameters(self),

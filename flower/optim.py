@@ -99,8 +99,18 @@ class Muon(Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         ns_schedule: str = "quintic5",
+        norm_update: bool = False,
+        cautious_wd: float = 0.0,
     ) -> None:
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, ns_schedule=ns_schedule)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            ns_schedule=ns_schedule,
+            norm_update=norm_update,
+            cautious_wd=cautious_wd,
+        )
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -112,6 +122,8 @@ class Muon(Optimizer):
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
             ns_schedule = group["ns_schedule"]
+            norm_update = group["norm_update"]
+            cautious_wd = group["cautious_wd"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -128,9 +140,73 @@ class Muon(Optimizer):
                 buf.mul_(mu).add_(g)
                 update_dir = g.add(buf, alpha=mu) if nesterov else buf
                 ortho = _zeropower_via_newtonschulz5(update_dir, ns_steps, ns_schedule)
+                # NorMuon (arXiv:2510.05491): normalise the orthogonalised update to
+                # unit Frobenius norm before the LR/aspect-ratio scaling step.
+                if norm_update:
+                    ortho = ortho / (ortho.norm() + 1e-7)
                 # Scale step by max(1, sqrt(fan_out/fan_in)) so wide layers still move.
                 scale = max(1.0, (g.size(0) / g.size(1)) ** 0.5)
+                # Cautious Weight Decay: only decay where the update is already
+                # shrinking the weight (ortho . p > 0). `ortho` is the update
+                # direction before the -lr*scale scaling.
+                if cautious_wd > 0:
+                    cautious_mask = (ortho * p.data > 0).to(ortho.dtype)
+                    p.data -= cautious_wd * lr * cautious_mask * p.data
                 p.add_(ortho, alpha=-lr * scale)
+        return loss
+
+
+class CautiousAdamW(torch.optim.AdamW):
+    """AdamW with Cautious Weight Decay (CWD).
+
+    When cautious_wd > 0, replaces decoupled weight decay with cautious decay:
+    only decay a weight coordinate where the optimizer update is already
+    shrinking it (update . weight > 0). When cautious_wd == 0, behaves exactly
+    like torch.optim.AdamW (standard decoupled WD via the weight_decay group).
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=1e-2, amsgrad=False, cautious_wd=0.0, *, maximize=False):
+        super().__init__(params, lr=lr, betas=betas, eps=eps,
+                         weight_decay=weight_decay, amsgrad=amsgrad, maximize=maximize)
+        self.cautious_wd = cautious_wd
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        if self.cautious_wd <= 0:
+            return super().step(closure)
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            cwpd = self.cautious_wd
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = torch.tensor(0.0, dtype=torch.float32)
+                    state["exp_avg"] = torch.zeros_like(g)
+                    state["exp_avg_sq"] = torch.zeros_like(g)
+                state["step"] += 1
+                m, v = state["exp_avg"], state["exp_avg_sq"]
+                m.mul_(beta1).add_(g, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                bias_c1 = 1 - beta1 ** int(state["step"])
+                bias_c2 = 1 - beta2 ** int(state["step"])
+                step_size = lr * (bias_c2 ** 0.5) / bias_c1
+                # AdamW update direction (before lr): m_hat / (sqrt(v_hat) + eps)
+                update = m / (v.sqrt().add_(eps))
+                # CWD mask: decay only where update is shrinking the weight.
+                cautious_mask = (update * p.data > 0).to(update.dtype)
+                # Standard decoupled WD + cautious WD.
+                if wd != 0:
+                    p.data.mul_(1 - lr * wd)
+                p.data -= cwpd * lr * cautious_mask * p.data
+                p.data.add_(update, alpha=-step_size)
         return loss
 
 
@@ -317,6 +393,8 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> Optimizer | list[O
     distinct LR (I8 dual-LR — backbone slow, memory fast).
     """
     name = cfg.optimizer.lower()
+    cautious_wd = float(getattr(cfg, "cautious_wd", 0.0))
+    adamw_cls = CautiousAdamW if cautious_wd > 0 else AdamW
     memory_patterns = tuple(cfg.memory_param_patterns or ())
     use_dual_lr = cfg.memory_lr > 0 and bool(memory_patterns)
     muon_bb, muon_mem, adamw_bb, adamw_mem = _classify_params(model, memory_patterns)
@@ -352,7 +430,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> Optimizer | list[O
             adamw_groups = _split_by_decay(main, cfg.lr) + _split_by_decay(memory, cfg.memory_lr)
         else:
             adamw_groups = _split_by_decay(main + memory, cfg.lr)
-        opts.append(AdamW(adamw_groups))
+        opts.append(adamw_cls(adamw_groups, cautious_wd=cautious_wd) if cautious_wd > 0 else adamw_cls(adamw_groups))
         return opts if use_dual_lr else opts[0]
 
     if name in {"muon", "aurora"}:
@@ -376,6 +454,8 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> Optimizer | list[O
                 momentum=cfg.muon_momentum,
                 ns_steps=cfg.muon_ns_steps,
                 ns_schedule=cfg.muon_ns_schedule,
+                norm_update=getattr(cfg, "norm_update", False),
+                cautious_wd=getattr(cfg, "cautious_wd", 0.0),
             )
 
         if muon_bb:
@@ -389,7 +469,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> Optimizer | list[O
         if adamw_mem:
             adamw_groups.extend(_split_by_decay(adamw_mem, cfg.memory_lr if use_dual_lr else cfg.lr))
         if adamw_groups:
-            opts.append(AdamW(adamw_groups))
+            opts.append(adamw_cls(adamw_groups, cautious_wd=cautious_wd) if cautious_wd > 0 else adamw_cls(adamw_groups))
         if not opts:
             raise ValueError("No trainable parameters found")
         return opts
