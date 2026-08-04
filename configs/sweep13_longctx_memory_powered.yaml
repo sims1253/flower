@@ -79,13 +79,24 @@ sweep:
       compile_mode: default
 
   variants:
-    - name: vanilla_local
-      model: { variant: vanilla_local }
+    # Param-matched vanilla control: d640/L10 = 49.6M non-emb, within 8% of
+    # bloom's 46.1M. The directional pass compared bloom (54.5M) against a
+    # smaller vanilla (33.3M), so the bloom win could be capacity, not
+    # mechanism. This arm isolates the mechanism by matching the param budget.
+    - name: vanilla_matched54M
+      model:
+        variant: vanilla_local
+        d_model: 640
+        num_heads: 10
+        num_layers: 10
+        ffn_dim: 2560
+    # The directional winner, unchanged. 54.5M, 46.1M non-emb.
     - name: bloom_memory
       model:
         variant: bloom_memory
         bloom_num_hashes: 4
         bloom_summary_points: 16
         bloom_temperature: 0.5
-    - name: summary_memory
-      model: { variant: summary_memory }
+    # The smaller vanilla (33.3M) for continuity with the directional pass.
+    - name: vanilla_local
+      model: { variant: vanilla_local }
