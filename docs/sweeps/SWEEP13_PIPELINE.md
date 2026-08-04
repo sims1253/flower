@@ -644,14 +644,39 @@ implementation caveat; the configs below always pair the two.
 
 ### Measured (RTX 5090, flex + compile + bf16 + muon, 0.85 memory cap)
 
-The headline: peak memory stays nearly **flat** as sequence grows, because the
-block mask never materializes. SDPA, by contrast, blows up and OOMs at 32K.
+What FlexAttention actually saves is the **mask**, not the activations. This
+matters and is easy to get wrong, so here is the honest decomposition (100M,
+d768/L14, batch 1, sliding window 2048):
+
+| seq | model+opt | flex block mask | forward (act+logits) | peak |
+|-----|-----------|-----------------|----------------------|------|
+| 8192 | 0.51 GB | ~0 | 3.91 GB | 4.77 GB |
+| 16384 | 0.79 GB | ~0 | 7.57 GB | 8.97 GB |
+| 32768 | 0.90 GB | ~0 | 14.92 GB | 17.0 GB |
+| 65536 | — | — | — | OOM ("tried to allocate 32 GB") |
+
+Two things to read off this table:
+1. The flex block mask is ~0 GB at every seq — that is the win. The SDPA path
+   materializes a `(1,1,T,T)` fp32 causal/local mask per layer, which at seq 32K
+   is ~4 GB/layer and OOMs before the model runs. FlexAttention compiles the
+   mask into the kernel and never holds it.
+2. **Activation memory still scales linearly with tokens-per-batch.** The
+   forward pass holds per-token activations and the `(B*T, vocab)` logits tensor,
+   both of which grow with `B*T`. That is why 65K OOMs: a single logits tensor at
+   batch 1 × seq 65536 × vocab 16384 in bf16 is ~2 GB, and the layered activations
+   on top push the peak past 32 GB.
+
+The practical consequence: batch size must shrink as sequence grows to keep
+`B*T` (and thus peak memory) under the cap. That is exactly what the configs do.
+Per-token memory is roughly flat across seq; per-sequence memory is not.
+
+Throughput and fit at the config batch sizes (flex + compile + bf16):
 
 | size | seq | batch | peak GB | tok/s | notes |
 |---|---|---|---|---|---|
-| 100M (d768/L14) | 8192 | 4 | 17.1 | 113k | flex, the longctx_phase0 config |
+| 100M (d768/L14) | 8192 | 4 | 19.9 | 120k | flex, the longctx_phase0 config (torch 2.13) |
 | 100M | 16384 | 2 | 18.2 | 113k | flex |
-| 100M | 32768 | 1 | 17.3 | 103k | **flex fits; SDPA OOMs at batch 1** |
+| 100M | 32768 | 1 | 17.0 | 103k | **flex fits; SDPA OOMs at batch 1** |
 | 350M (d1024/L28) | 8192 | 2 | 23.2 | 33k | flex |
 | 350M | 16384 | 1 | 23.3 | 30k | flex |
 

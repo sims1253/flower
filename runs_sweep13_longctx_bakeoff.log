@@ -1,3 +1,2 @@
 [compile] module diagnostics disabled (untraceable by Dynamo)
 [data] using 14 local parquet shards from data_cache
-[data] using 14 local parquet shards from data_cache
