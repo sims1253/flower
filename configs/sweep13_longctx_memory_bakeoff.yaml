@@ -71,11 +71,12 @@ sweep:
       bytes_per_token: 4.279
 
     training:
-      # Conservative batch: the memory arms are unmeasured at this exact shape.
-      # batch 2 x accum 8 = effective batch 131072 tokens. Headroom is large
-      # (~4 GB peak); raise batch later once steady-state is confirmed.
-      batch_size: 2
-      gradient_accumulation_steps: 8
+      # batch 8 x accum 2 = effective batch 131072 tokens. Measured fit on torch
+      # 2.13: batch 8 = 22.3 GB peak, ~89k tok/s (batch 2 left the GPU mostly
+      # idle; batch 16 OOMs). Effective batch is held constant so this is
+      # comparable across batch sizes and to the powered follow-up.
+      batch_size: 8
+      gradient_accumulation_steps: 2
       steps: 6000
       lr: 0.003
       warmup_steps: 300
