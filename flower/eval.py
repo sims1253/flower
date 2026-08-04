@@ -33,6 +33,18 @@ def _checkpoint_config(path: Path) -> dict[str, Any] | None:
     return config if isinstance(config, dict) else None
 
 
+def _model_has_sdp_bias(model: torch.nn.Module) -> bool | None:
+    """Whether the model's SDPCrossAttention modules have bias, for the MHA
+    state-dict remap. Returns None if the model has no such module (non-summary /
+    non-bloom), which the remap treats as "keep bias" (the MHA default)."""
+    from flower.models.memory import SDPCrossAttention
+
+    for module in model.modules():
+        if isinstance(module, SDPCrossAttention):
+            return module.q_proj.bias is not None
+    return None
+
+
 def _load_checkpoint_model(model: torch.nn.Module, checkpoint: Path, device: torch.device) -> int | None:
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     state = payload.get("model", payload)
@@ -41,8 +53,18 @@ def _load_checkpoint_model(model: torch.nn.Module, checkpoint: Path, device: tor
     # old artifacts (sweep5/7/13 bloom runs) still load. No-op for new-format /
     # non-bloom state_dicts.
     from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+    from flower.models.memory import remap_legacy_mha_state_dict
 
     state = remap_legacy_bloom_state_dict(state)
+    # S14 Opportunity: summary_memory / bloom_memory replaced their
+    # nn.MultiheadAttention perceiver with a compile-clean SDPCrossAttention.
+    # Remap legacy in_proj_*/out_proj.* MHA keys to the new q/k/v/out_proj
+    # projection layout. `bias` is taken from the target model's SDPCrossAttention
+    # modules (nn.MultiheadAttention always had bias, but SDPCrossAttention
+    # respects config.use_bias, so a use_bias=False checkpoint must drop them).
+    # No-op for new-format / non-summary / non-bloom state_dicts.
+    bias = _model_has_sdp_bias(model)
+    state = remap_legacy_mha_state_dict(state, bias=bias)
     model.load_state_dict(state)
     step = payload.get("step")
     return int(step) if step is not None else None

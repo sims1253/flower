@@ -389,8 +389,17 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             # in-flight bloom run resumed after the upgrade keeps its learned
             # hashes. No-op for new-format / non-bloom state_dicts.
             from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+            from flower.models.memory import remap_legacy_mha_state_dict
 
             state = remap_legacy_bloom_state_dict(payload["model"])
+            # S14 Opportunity: summary_memory / bloom_memory replaced their
+            # nn.MultiheadAttention perceiver with a compile-clean
+            # SDPCrossAttention. Remap legacy MHA in_proj_*/out_proj.* keys to
+            # the new q/k/v/out_proj layout. `bias` comes from the config:
+            # nn.MultiheadAttention always had bias, but SDPCrossAttention
+            # respects use_bias, so a use_bias=False checkpoint must drop them.
+            # No-op for new-format state_dicts.
+            state = remap_legacy_mha_state_dict(state, bias=getattr(cfg.model, "use_bias", True))
             eager_model.load_state_dict(state)
             for opt, opt_state in zip(optims, payload.get("optimizers", []), strict=False):
                 opt.load_state_dict(opt_state)

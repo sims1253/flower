@@ -77,13 +77,25 @@ artefacts.** The long-context infra is now in place and validated; the next step
 that could flip this is the 600M / seq 32K scale-up (Phase 3, needs rented
 8xGPU hardware).
 
-**summary_memory note:** the third arm hit a compile perf issue — its perceiver
-cross-attention (`nn.MultiheadAttention`) graph-breaks under `torch.compile`,
-dropping GPU util to ~25%. It also OOMed at batch 8 from fragmentation (fixed by
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`). Before re-running
-summary_memory at scale, replace the `nn.MultiheadAttention` perceiver with a
-plain scaled-dot-product cross-attention (S14 Opportunity — same class of fix as
-the bloom diagnostics graph-break).
+**summary_memory note:** the third arm's compile perf blocker is **resolved**.
+Its perceiver cross-attention (`nn.MultiheadAttention`) graph-broke under
+`torch.compile` and OOMed at batch 8 / seq 8192 — both fixed by replacing MHA
+with a compile-clean `F.scaled_dot_product_attention` cross-attention
+(`SDPCrossAttention` in `flower/models/memory.py`, shared by `summary_memory`
+and `bloom_memory`, which had the identical pattern). The exact failing config
+(summary_memory, batch 8, seq 8192) now runs to completion at **14.99 GB peak**
+(32 GB 5090) with **zero new graph breaks** vs vanilla (the 3 residual breaks
+live in the shared flex block-mask path, present in all variants). Param-count
+delta is **0** (`4*D*D + 4*D` either way), so the param-matched comparison is
+unconfounded. Legacy checkpoints (sweep7/13 `perceiver.*` / `summary_attn.*`
+`in_proj_weight`/`out_proj`) remap automatically at every load site via
+`remap_legacy_mha_state_dict`. The bake-off's third arm can now be re-run at
+scale.
+
+**Follow-up (not in scope for this fix):** `flow_ot_memory.py` (`source_attn`)
+and `flow_pma.py` (`pma`) also use `nn.MultiheadAttention` but are not part of
+this bake-off and were left untouched; convert them to `SDPCrossAttention` if a
+long-context / compile-perf need arises there.
 
 ## 5. Profiling finding: the Muon optimizer step is the dominant step cost (not the model)
 

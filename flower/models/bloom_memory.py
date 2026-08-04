@@ -41,7 +41,7 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, SDPCrossAttention
 
 
 class BloomMemoryBlock(nn.Module):
@@ -59,7 +59,11 @@ class BloomMemoryBlock(nn.Module):
         self.summary_queries = nn.Parameter(
             torch.randn(1, config.bloom_summary_points, config.d_model) * 0.02
         )
-        self.summary_attn = nn.MultiheadAttention(config.d_model, config.num_heads, batch_first=True)
+        # SDP cross-attention (compile-clean) replaces nn.MultiheadAttention: MHA
+        # graph-breaks under torch.compile and OOMs at long context. Same params,
+        # same cross-attention math (Q=summary queries, K=V=window, no causal
+        # mask). See SDPCrossAttention docstring / NEXT_IDEAS.md section 4.
+        self.summary_attn = SDPCrossAttention(config)
 
         # K independent learned hash projections, stored as a single (K, D, S)
         # tensor so all K projections are one batched matmul instead of a Python
@@ -137,7 +141,7 @@ class BloomMemoryBlock(nn.Module):
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         bsz = x.shape[0]
         queries = self.summary_queries.expand(bsz, -1, -1)
-        items, _ = self.summary_attn(queries, x, x, need_weights=False)  # (B, P, D)
+        items = self.summary_attn(queries, x)  # (B, P, D)
         plan = self._bloom_route(items)  # (B, P, S)
         values = self.write_value(items)  # (B, P, D)
         per_slot_write = plan.transpose(1, 2) @ values  # (B, S, D)

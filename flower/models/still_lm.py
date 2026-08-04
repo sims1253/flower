@@ -765,8 +765,15 @@ def build_still_model(config: ModelConfig) -> StillLM:
         # before the hash_weights refactor, remap its legacy hashes.{i}.weight
         # keys. No-op for non-bloom / new-format state_dicts.
         from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+        from flower.models.memory import remap_legacy_mha_state_dict
 
         cleaned = remap_legacy_bloom_state_dict(cleaned)
+        # S14 Opportunity: summary_memory / bloom_memory replaced their
+        # nn.MultiheadAttention perceiver with a compile-clean SDPCrossAttention.
+        # Remap legacy MHA in_proj_*/out_proj.* keys to the new q/k/v/out_proj
+        # layout. `bias` from config (nn.MultiheadAttention always had bias;
+        # SDPCrossAttention respects use_bias). No-op for new-format state_dicts.
+        cleaned = remap_legacy_mha_state_dict(cleaned, bias=getattr(config, "use_bias", True))
         missing, unexpected = base_model.load_state_dict(cleaned, strict=False)
         if missing:
             print(f"[still] base model missing keys: {len(missing)}")
