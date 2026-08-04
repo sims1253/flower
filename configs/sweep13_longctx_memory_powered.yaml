@@ -64,7 +64,7 @@ sweep:
       save_checkpoints: true
       device: auto
       seed: 0
-      seeds: [0, 1, 2, 3]
+      seeds: [0, 1, 2]
       log_backend: tensorboard
       composite_eval: false
       optimizer: muon
