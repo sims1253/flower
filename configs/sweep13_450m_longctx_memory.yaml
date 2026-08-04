@@ -1,0 +1,123 @@
+# Sweep 13, 450M Long-Context Memory Bake-off — does the mechanism help at scale?
+#
+# The small bake-off (d512/L8, 33-54M) found bloom LOSES to param-matched
+# vanilla by +0.034 bpb: at that scale the memory mechanism's params are better
+# spent on a wider transformer. docs/training-speedups.md Section 13 predicts
+# memory signal needs ~500M+ before the circuits it supports can form. This is
+# the largest scale the 5090 can run at long context (seq=8192, window=2048,
+# 4x ratio). 600M OOMs; 450M is the ceiling.
+#
+# Param-matched pair (the memory bank adds ~17% over the vanilla base):
+#   vanilla_local  d1280/L20  = 413M total (392M non-emb)
+#   bloom_memory   d1024/L20  = 481M total (460M non-emb)  [+17% from memory bank]
+# Both at seq=8192, local_window=2048, flex+compile+bf16+muon, batch 2.
+#
+# Measured fit (RTX 5090, expandable_segments, 0.85 cap):
+#   vanilla batch 2 -> 23.4 GB, 36k tok/s
+#   bloom   batch 2 -> 26.7 GB, 24k tok/s   (tight; under the 27 GB cap)
+#
+# batch 2 x accum 16 = effective batch 262144 tokens. At ~24-36k tok/s,
+# 10000 steps is ~6-9h/run. 2 arms x 2 seeds = 4 runs ~= 1.5-2 days continuous.
+# This is a multi-day commitment; launch only when the GPU is free for that long.
+#
+# Launch (continuous, when heading to bed):
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/sweep13_450m_longctx_memory.yaml \
+#     --output-dir runs/sweep13_450m_longctx
+#
+# IMPORTANT: bloom at batch 2 is at 26.7 GB (83% of the 32 GB card). If it OOMs
+# under the long-run fragmentation that isolated tests don't capture, drop bloom
+# to batch 1 x accum 32 (same effective batch, 15.6 GB, half the throughput).
+# The VRAM cap (train.py configure_vram_limit) will catch an overshoot loudly
+# rather than silently spilling to shared memory.
+
+sweep:
+  name: sweep13_450m_longctx_memory
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16   # effective batch 262144 tokens
+      steps: 10000
+      lr: 0.0025              # slightly lower than the small bake-off (0.003); bigger model
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      eval_interval: 1000
+      checkpoint_interval: 2000
+      save_checkpoints: true
+      device: auto
+      seed: 0
+      seeds: [0, 1]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 1000
+      precision: bf16
+      compile_model: true
+      compile_mode: default
+
+  variants:
+    # Param-matched vanilla control: d1280/L20 = 413M total. The baseline.
+    - name: vanilla_matched
+      model:
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048         # 4x ratio — the floor where memory can matter
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        flex_attention: true
+
+    # bloom_memory: d1024/L20 = 481M total (+17% over vanilla from the memory bank).
+    # The memory mechanism under test.
+    - name: bloom_memory
+      model:
+        variant: bloom_memory
+        vocab_size: 16384
+        d_model: 1024
+        num_heads: 16
+        num_layers: 20
+        ffn_dim: 4096
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        flex_attention: true
+        memory_slots: 8
+        bloom_num_hashes: 4
+        bloom_summary_points: 16
+        bloom_temperature: 0.5
