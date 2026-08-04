@@ -1264,7 +1264,22 @@ ns_kernel = get_kernel("tboissin/newton_schulz_triton")
 
 **Priority**: P0. This is the single highest-leverage kernel change. 1 day of integration work, 2-3x optimizer step speedup.
 
+**STATUS (2026-08-04): the launch-overhead half is DONE via batched `bmm` instead of the Triton kernel.** Profiling showed the optimizer step was launch-bound, not compute-bound (wall-clock 2.7× GPU self-CUDA; GPU starved by per-param Python dispatch). A fused single-matrix Triton kernel still launches once per param, so it would not have moved that wall-clock. Batched `bmm` over same-shape param groups (`flower/optim.py`, `muon_ns_batched: true`) collapses the launches and measured **2.6× full-step / 8.5× optimizer-step** speedup at the d512/L8/seq8192 shape — see `NEXT_IDEAS.md` section 5 update. The compute-fusion half (this Triton kernel) is deferred until profiling shows matmuls themselves, not launches, dominate; at current shapes they do not.
+
 #### 5b: Liger-Kernel (Fused Linear CE, RMSNorm, SwiGLU, RoPE)
+
+**STATUS (2026-08-04): FusedLinearCrossEntropy is DONE** (config flag
+`model.fused_linear_ce`, default off). `liger-kernel>=0.8.1` was already a
+dependency. The fused path never materializes the `(B*T, vocab)` logits tensor
+during training; numerically exact vs eager (fp32 loss diff 4.8e-7, tied-weight
+grad diff 2.2e-8). Measured memory at the 450M/seq=8192/vocab=16K shape:
+**−0.83 GB (−4.1%)** — real but smaller than the >30% projected, because logits
+are ~1 GB of a 20 GB budget at that ratio (the saving scales with B*T*vocab).
+seq=32768 runs under fused CE but still OOMs on the 413M model via the SDPA
+attention *mask*, not the head — fused CE is necessary-but-not-sufficient for
+seq=32K and must pair with the compiled FlexAttention path (the bake-off
+default). Full measurement and rationale: `NEXT_IDEAS.md` §6. RMSNorm/SwiGLU/
+RoPE kernels remain P1 (separate task).
 
 Open-source Triton kernel library for LLM training. ~20% total throughput, ~60% memory reduction.
 

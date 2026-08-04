@@ -29,6 +29,7 @@ from flower.flows.hamiltonian import HamiltonianFlow, WalnutsHamiltonianFlow
 from flower.models.base import (
     CausalLM,
     TransformerBlock,
+    _get_or_build_block_mask,
     _load_flex_attention,
     causal_mask,
     make_causal_local_block_mask,
@@ -78,16 +79,8 @@ class HamiltonianSelfAttention(nn.Module):
         return x.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
     def _get_block_mask(self, seq_len: int, device: torch.device):
-        window = self.local_window
-        if (
-            self._cached_block_mask is None
-            or seq_len != self._cached_seq_len
-            or window != self._cached_window
-        ):
-            self._cached_block_mask = make_causal_local_block_mask(window, seq_len, device)
-            self._cached_seq_len = seq_len
-            self._cached_window = window
-        return self._cached_block_mask
+        # Delegates to the shared, compile-safe cache logic (base.py).
+        return _get_or_build_block_mask(self, seq_len, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)

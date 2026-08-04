@@ -34,6 +34,34 @@ def _load_flex_attention() -> tuple[Any, Any]:
     return _flex_attention, _create_block_mask
 
 
+# S14-5b: Liger FusedLinearCrossEntropy fuses the tied lm_head matmul + CE so
+# the (B*T, vocab) logits tensor is never materialized during training. The
+# kernel is CUDA/Triton-only. Imported lazily so CPU tests / environments
+# without a working CUDA-triton path pay no import cost, mirroring
+# `_load_flex_attention`. `None` = "not yet tried"; a subsequent `False` marks
+# "tried and unavailable, fall back to eager".
+_liger_fce_cls: Any = None
+
+
+def _load_liger_fce() -> Any:
+    """Return the LigerFusedLinearCrossEntropyLoss class, importing on first use.
+
+    Returns None if Liger-Kernel is unavailable or cannot be imported; callers
+    fall back to the eager head+CE path in that case. A separate runtime guard
+    (CUDA-only) is applied at the call site, since the import can succeed even
+    when the Triton kernel cannot run on the current device.
+    """
+    global _liger_fce_cls
+    if _liger_fce_cls is None:
+        try:
+            from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss as _FCE
+
+            _liger_fce_cls = _FCE
+        except Exception:
+            _liger_fce_cls = False
+    return _liger_fce_cls if _liger_fce_cls is not False else None
+
+
 def make_causal_local_block_mask(
     local_window: int | None, seq_len: int, device: torch.device
 ) -> Any:
@@ -61,6 +89,64 @@ def make_causal_local_block_mask(
         KV_LEN=seq_len,
         device=device,
     )
+
+
+def _get_or_build_block_mask(module: nn.Module, seq_len: int, device: torch.device) -> Any:
+    """Cached FlexAttention BlockMask for an attention module, compile-safe.
+
+    Single source of truth for the cache logic that the per-attention-module
+    ``_get_block_mask`` methods (CausalSelfAttention, FlowAttention,
+    HamiltonianAttention) and the Still compact path delegate to. The cache is
+    keyed on ``(local_window, seq_len)``.
+
+    Eager mode: build+cache on miss (the legacy path — ``test_flex_block_mask_
+    cache_invalidates`` pins this). Under ``torch.compile`` (``is_compiling()``
+    is True): pure read — never mutate module state inside the graph, because a
+    ``self._cached_block_mask = ...`` assignment captured by Dynamo aliases the
+    BlockMask's internal tensors across the per-layer reads and raises
+    "accessing tensor output of CUDAGraphs that has been overwritten" under
+    cudagraph mode. Train.py calls ``prebuild_attention_masks`` before compiling
+    so the cache is populated; a cache miss under compile is a wiring error and
+    raises a clear message rather than silently mutating.
+    """
+    window = module.local_window
+    if not torch.compiler.is_compiling():
+        if (
+            module._cached_block_mask is None
+            or seq_len != module._cached_seq_len
+            or window != module._cached_window
+        ):
+            module._cached_block_mask = make_causal_local_block_mask(window, seq_len, device)
+            module._cached_seq_len = seq_len
+            module._cached_window = window
+        return module._cached_block_mask
+    # Under compile: read-only. The mask must have been prebuilt (see
+    # prebuild_attention_masks) so the graph only references a static object.
+    if (
+        module._cached_block_mask is not None
+        and seq_len == module._cached_seq_len
+        and window == module._cached_window
+    ):
+        return module._cached_block_mask
+    raise RuntimeError(
+        f"FlexAttention BlockMask for seq_len={seq_len}, window={window} was not "
+        f"prebuilt before torch.compile. Call prebuild_attention_masks(model, "
+        f"seq_len, device) in the train loop before torch.compile()."
+    )
+
+
+def prebuild_attention_masks(model: nn.Module, seq_len: int, device: torch.device) -> None:
+    """Eagerly populate every flex-attention module's cached BlockMask.
+
+    Call this after ``model.to(device)`` and before ``torch.compile`` so the
+    compiled forward only reads the cached masks (no module-state mutation
+    inside the graph — see ``_get_or_build_block_mask``). No-op for modules
+    without flex enabled (``use_flex`` False/absent) and for seq lengths/windows
+    already cached.
+    """
+    for module in model.modules():
+        if getattr(module, "use_flex", False):
+            _get_or_build_block_mask(module, seq_len, device)
 
 
 class RMSNorm(nn.Module):
@@ -325,16 +411,10 @@ class CausalSelfAttention(nn.Module):
         self._cached_window: int | None = None
 
     def _get_block_mask(self, seq_len: int, device: torch.device) -> Any:
-        window = self.local_window
-        if (
-            self._cached_block_mask is None
-            or seq_len != self._cached_seq_len
-            or window != self._cached_window
-        ):
-            self._cached_block_mask = make_causal_local_block_mask(window, seq_len, device)
-            self._cached_seq_len = seq_len
-            self._cached_window = window
-        return self._cached_block_mask
+        # Delegates to the shared, compile-safe cache logic. See
+        # _get_or_build_block_mask for why the mutation must not happen under
+        # torch.compile (cudagraph aliasing of the cached BlockMask).
+        return _get_or_build_block_mask(self, seq_len, device)
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, dim = x.shape
@@ -459,6 +539,15 @@ class CausalLM(nn.Module):
         self.fp8_lm_head = bool(getattr(config, "fp8_lm_head", False))
         # S4: compute the next-token cross-entropy in BF16 instead of FP32.
         self.bf16_cross_entropy = bool(getattr(config, "bf16_cross_entropy", False))
+        # S14-5b: Liger FusedLinearCrossEntropy. Fuses the tied lm_head matmul +
+        # CE so the (B*T, vocab) logits tensor is never materialized during
+        # training — the binding memory constraint at long seq / large vocab.
+        # Training-time only; _compute_logits (eager, incl. FP8-head eval) is
+        # untouched. Constructed lazily: the Liger class is CUDA/Triton-only, so
+        # defer to first use and fall back to eager if it is unavailable or the
+        # device is not CUDA. See `_fused_cross_entropy`.
+        self.fused_linear_ce = bool(getattr(config, "fused_linear_ce", False))
+        self._liger_fce: Any = None
         # S8: auxiliary Multi-Token-Prediction heads for t+2, t+3, ... These are
         # untied heads on the already-normed hidden state; the main tied head
         # still predicts t+1. None when mtp_extra_heads <= 0 (legacy default).
@@ -620,6 +709,82 @@ class CausalLM(nn.Module):
             shift_labels.reshape(-1),
         )
 
+    def _ensure_liger_fce(self) -> bool:
+        """Lazily build the Liger FusedLinearCrossEntropy loss module (S14-5b).
+
+        Returns True iff the fused path can run on the current device: the
+        Liger class imported successfully AND the model's parameters live on
+        CUDA (the underlying kernel is Triton/CUDA-only). Constructs the
+        stateless loss module once on first success and caches it. Returns
+        False (so `forward` falls back to eager) if Liger is unavailable or the
+        device is not CUDA. Emits a one-time warning on the first such fallback
+        so a user who set `fused_linear_ce=True` does not silently run eager.
+        """
+        if not self.fused_linear_ce:
+            return False
+        if self._liger_fce is not None:
+            return True
+        cls = _load_liger_fce()
+        # The Triton kernel requires CUDA. Resolve via the embedding parameter
+        # rather than an input tensor so this is callable before forward.
+        on_cuda = self.token.weight.is_cuda
+        if cls is None or not on_cuda:
+            if not getattr(self, "_warned_fused_ce_fallback", False):
+                reason = "liger-kernel is unavailable" if cls is None else "the model is not on CUDA"
+                import warnings
+
+                warnings.warn(
+                    f"fused_linear_ce=True is set but {reason}; falling back to the eager "
+                    f"lm_head + cross-entropy path (no memory saving). Set fused_linear_ce=False "
+                    f"to silence this, or move the model to CUDA.",
+                    stacklevel=2,
+                )
+                self._warned_fused_ce_fallback = True
+            return False
+        self._liger_fce = cls()
+        return True
+
+    def _fused_cross_entropy(
+        self,
+        x_normed: torch.Tensor,
+        labels: torch.Tensor,
+        lin_weight: torch.Tensor,
+        *,
+        offset: int = 1,
+    ) -> torch.Tensor:
+        """Fused linear + cross-entropy on a pre-normed hidden state (S14-5b).
+
+        Liger's `LigerFusedLinearCrossEntropyLoss` takes the projection weight
+        and the pre-projection activations directly and fuses the matmul + CE
+        internally, so the `(B*T, vocab)` logits tensor is never materialized.
+        It takes the weight *by reference*, so passing the tied embedding
+        weight keeps the tying load-bearing: the embedding gradient flows back
+        through it as before.
+
+        The shift that the eager path applies *after* projecting
+        (`logits[:, :-1]`, `labels[:, 1:]`) must instead be applied to the
+        activations and labels *before* the fused call, since the fused kernel
+        projects internally. `offset` generalises the shift so the same helper
+        serves the main head (offset=1, predicts t+1) and each MTP head
+        (offset=i+2, predicts t+2, t+3, ...); the aligned slices are
+        `x_normed[:, :T-offset]` -> `labels[:, offset:]`.
+
+        Liger accumulates the softmax/CE internally in fp32 regardless of input
+        dtype, so `bf16_cross_entropy` (S4) is a no-op under this path: the
+        fused kernel is at least as precise as eager bf16 CE (it upcasts), so a
+        user who disabled bf16 CE for numerical reasons is still served a
+        high-precision reduction. CUDA/Triton-only; `forward` checks
+        availability + device before calling this.
+        """
+        T = x_normed.size(1)
+        if offset >= T or offset >= labels.size(1):
+            # Nothing to predict at this offset (sequence shorter than the
+            # horizon); mirror the eager MTP path's guard with a zero loss.
+            return x_normed.new_zeros(())
+        shift_input = x_normed[:, : T - offset].reshape(-1, x_normed.size(-1))
+        shift_labels = labels[:, offset:].reshape(-1)
+        return self._liger_fce(lin_weight, shift_input, shift_labels)
+
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
         # Allow seq_len > max_seq_len during eval (Sweep 7 A1: eval_seq_len > max_seq_len).
         # RoPE cache extends lazily; local attention mask is computed on-the-fly.
@@ -650,30 +815,55 @@ class CausalLM(nn.Module):
                     prev = x
                     site += 1
         x_normed = self.ln(x)
-        logits = self._compute_logits(x_normed)
         loss = None
-        if labels is not None:
-            loss = self._cross_entropy(logits, labels)
-            # S8: auxiliary Multi-Token-Prediction heads. Each untied head on
-            # the already-normed hidden state predicts t+2, t+3, ... The main
-            # tied head above still handles the t+1 prediction. `x_normed` is
-            # reused verbatim - the FP8 path only affects the tied matmul, the
-            # MTP heads are always plain BF16 Linears.
+        # S14-5b: fused lm_head + CE path. Training-time only, CUDA/Triton only.
+        # When active the (B*T, vocab) logits tensor is never materialized, so
+        # `logits` stays None and every eval/logprob consumer (which runs in
+        # eval mode or without labels) keeps the eager path below. Falls back to
+        # eager automatically if Liger is unavailable or the device is not CUDA.
+        use_fused_ce = (
+            self.fused_linear_ce
+            and self.training
+            and labels is not None
+            and self._ensure_liger_fce()
+        )
+        if use_fused_ce:
+            # Main tied head: predict t+1 from x_normed. The tied weight is
+            # passed by reference so the embedding gradient flows back through it.
+            loss = self._fused_cross_entropy(x_normed, labels, self.token.weight, offset=1)
+            # S8 MTP heads: each untied head predicts t+2, t+3, ... The fused
+            # path applies the per-head shift inside `_fused_cross_entropy`.
             if self.mtp_heads is not None:
                 for i, mtp_head in enumerate(self.mtp_heads):
-                    offset = i + 2  # predict t+2, t+3, ...
-                    mtp_logits = mtp_head(x_normed)
-                    # Align: mtp_logits[:, :T-offset] predicts labels[:, offset:].
-                    if offset < mtp_logits.size(1) and offset < labels.size(1):
-                        mtp_logits = mtp_logits[:, : mtp_logits.size(1) - offset]
-                        mtp_labels = labels[:, offset:]
-                        if self.bf16_cross_entropy:
-                            mtp_logits = mtp_logits.to(torch.bfloat16)
-                        mtp_loss = F.cross_entropy(
-                            mtp_logits.reshape(-1, mtp_logits.size(-1)),
-                            mtp_labels.reshape(-1),
-                        )
-                        loss = loss + self.mtp_weight * mtp_loss
+                    mtp_loss = self._fused_cross_entropy(
+                        x_normed, labels, mtp_head.weight, offset=i + 2
+                    )
+                    loss = loss + self.mtp_weight * mtp_loss
+            logits = None
+        else:
+            logits = self._compute_logits(x_normed)
+            if labels is not None:
+                loss = self._cross_entropy(logits, labels)
+                # S8: auxiliary Multi-Token-Prediction heads. Each untied head on
+                # the already-normed hidden state predicts t+2, t+3, ... The main
+                # tied head above still handles the t+1 prediction. `x_normed` is
+                # reused verbatim - the FP8 path only affects the tied matmul, the
+                # MTP heads are always plain BF16 Linears.
+                if self.mtp_heads is not None:
+                    for i, mtp_head in enumerate(self.mtp_heads):
+                        offset = i + 2  # predict t+2, t+3, ...
+                        mtp_logits = mtp_head(x_normed)
+                        # Align: mtp_logits[:, :T-offset] predicts labels[:, offset:].
+                        if offset < mtp_logits.size(1) and offset < labels.size(1):
+                            mtp_logits = mtp_logits[:, : mtp_logits.size(1) - offset]
+                            mtp_labels = labels[:, offset:]
+                            if self.bf16_cross_entropy:
+                                mtp_logits = mtp_logits.to(torch.bfloat16)
+                            mtp_loss = F.cross_entropy(
+                                mtp_logits.reshape(-1, mtp_logits.size(-1)),
+                                mtp_labels.reshape(-1),
+                            )
+                            loss = loss + self.mtp_weight * mtp_loss
         if self._static_diagnostics is None:
             self._static_diagnostics = {
                 "parameter_count": count_parameters(self),

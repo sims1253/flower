@@ -227,6 +227,14 @@ class ModelConfig:
     fp8_lm_head: bool = False
     # S4: compute cross-entropy in BF16 instead of FP32.
     bf16_cross_entropy: bool = False
+    # S14-5b: Liger FusedLinearCrossEntropy. Fuses the tied lm_head matmul + CE
+    # so the (B*T, vocab) logits tensor is never materialized during training —
+    # the binding memory constraint at seq=8192/vocab=16K and the blocker for
+    # seq=32K on the 32GB 5090. Training-time only; eval keeps the eager logits
+    # path so FP8-head / logprob consumers are untouched. CUDA-only (Triton
+    # kernel); the forward falls back to the eager path automatically when the
+    # flag is on but CUDA is unavailable. False reproduces old runs exactly.
+    fused_linear_ce: bool = False
     # S8: Multi-Token Prediction (final-runs only; changes the loss surface).
     # Predicts N extra future tokens with untied heads; aux losses weighted by
     # mtp_weight. 0 disables (standard next-token loss).
@@ -365,6 +373,16 @@ class TrainingConfig:
     #   cubic5   = 5x cubic (1.5,-0.5,0), 10 matmuls (-33% orth compute, ~1e-3 val loss per arXiv:2606.00371)
     #   hybrid_v4 = 8x quintic + 2x stabilize (2,-1.5,0.5) pinning singular values to 1 (DeepSeek-V4)
     muon_ns_schedule: str = "quintic5"
+    # S14 Opportunity 1/5a (NEXT_IDEAS.md section 5): batch the Newton-Schulz
+    # iteration over same-shape params — one `bmm` per NS line per shape group
+    # instead of one `mm` per param. The optimizer step is launch-bound (GPU idle
+    # ~40% of step wall-clock waiting on per-param Python dispatch), so fusing
+    # launches is the win, not fusing the per-matrix matmuls. Batched NS is
+    # mathematically identical to the per-matrix path (a `bmm` over a stack
+    # reduces slice-for-slice to looping the legacy `mm`), so it only differs by
+    # bf16 kernel-selection noise. False reproduces the exact legacy dispatch and
+    # is the fallback for reproducing runs made before this flag existed.
+    muon_ns_batched: bool = True
     # Aurora (optimizer: "aurora"). `aurora_pp_iterations` is the number of
     # row-oblique rebalancing passes around the polar step; 2 is the released
     # default. Square matrices reduce exactly to Muon, so this only changes

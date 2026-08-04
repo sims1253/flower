@@ -59,6 +59,12 @@ def _zeropower_via_newtonschulz5(g: torch.Tensor, steps: int, schedule: str = "q
     (3.4445, -4.7750, 2.0315) used by the speedrun community; see `_ns_schedule`
     for alternatives. Operates in bf16 for speed; the polynomial is numerically
     robust there.
+
+    This is the per-matrix (legacy) path. The batched path
+    `_zeropower_newtonschulz5_batched` is mathematically identical — a `bmm` over a
+    stack of same-shape matrices reduces slice-for-slice to looping this function
+    — but collapses N `mm` launches into one, which is the dominant win when the
+    optimizer step is launch-bound (see NEXT_IDEAS.md section 5).
     """
     assert g.ndim == 2
     coeffs = _ns_schedule(schedule, steps)
@@ -76,6 +82,36 @@ def _zeropower_via_newtonschulz5(g: torch.Tensor, steps: int, schedule: str = "q
     if transposed:
         x = x.T
     return x.to(g.dtype)
+
+
+def _zeropower_newtonschulz5_batched(
+    stack: torch.Tensor, coeffs: list[tuple[float, float, float]]
+) -> torch.Tensor:
+    """Batched Newton-Schulz over a stack of same-shape 2D matrices.
+
+    `stack` is (B, m, n); every slice gets the same `coeffs` schedule applied via
+    `bmm`, so this is exactly `_zeropower_via_newtonschulz5` run on every slice at
+    once — the only numerical difference vs the per-matrix path is bf16 kernel
+    selection noise, not a different algorithm. Per-slice Frobenius normalisation
+    (`x / x.norm()` for each slice independently) is what makes batching safe: the
+    legacy normaliser is per-matrix, so a grouped norm (one scalar per slice) is
+    the correct generalisation, not an approximation.
+
+    The transpose-when-rows>cols step is the caller's responsibility — callers
+    build `stack` already oriented (smaller side on the left), so every slice in a
+    stack shares one orientation and one set of matmul shapes.
+    """
+    assert stack.ndim == 3
+    x = stack.to(torch.bfloat16)
+    # Per-slice Frobenius norm: one scalar per matrix, keeping the leading batch dim.
+    x = x / (x.flatten(1).norm(dim=1, keepdim=True).unsqueeze(-1) + 1e-7)
+    for a, b, c in coeffs:
+        # x @ x.T over the batch: (B,m,n) @ (B,n,m) -> (B,m,m). Identical reductions
+        # to per-matrix `x @ x.T`; bmm just fuses the B dispatches into one launch.
+        a_mat = torch.bmm(x, x.transpose(-2, -1))
+        b_mat = b * a_mat + c * torch.bmm(a_mat, a_mat)
+        x = a * x + torch.bmm(b_mat, x)
+    return x
 
 
 class Muon(Optimizer):
@@ -101,6 +137,7 @@ class Muon(Optimizer):
         ns_schedule: str = "quintic5",
         norm_update: bool = False,
         cautious_wd: float = 0.0,
+        ns_batched: bool = True,
     ) -> None:
         defaults = dict(
             lr=lr,
@@ -110,6 +147,7 @@ class Muon(Optimizer):
             ns_schedule=ns_schedule,
             norm_update=norm_update,
             cautious_wd=cautious_wd,
+            ns_batched=ns_batched,
         )
         super().__init__(params, defaults)
 
@@ -124,6 +162,12 @@ class Muon(Optimizer):
             ns_schedule = group["ns_schedule"]
             norm_update = group["norm_update"]
             cautious_wd = group["cautious_wd"]
+            ns_batched = group["ns_batched"]
+
+            # Pass 1: momentum buffer update + build the per-param update-direction
+            # buffers. Same as the legacy loop up to the NS call; done per-param
+            # because the momentum buffer is persistent optimizer state.
+            active: list[tuple] = []  # (p, g, update_dir) per active param
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -139,7 +183,49 @@ class Muon(Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(mu).add_(g)
                 update_dir = g.add(buf, alpha=mu) if nesterov else buf
-                ortho = _zeropower_via_newtonschulz5(update_dir, ns_steps, ns_schedule)
+                active.append((p, g, update_dir))
+
+            # Pass 2: orthogonalise. The batched path groups same-shape update_dirs
+            # into one bmm per NS line (NEXT_IDEAS.md section 5); the per-matrix path
+            # is the exact legacy behaviour and the reproducibility fallback.
+            orthos: dict[int, torch.Tensor] = {}
+            if ns_batched and len(active) > 1:
+                coeffs = _ns_schedule(ns_schedule, ns_steps)
+                # Group active params by oriented shape. Orientation puts the smaller
+                # side on the left so every slice in a stack shares one matmul shape;
+                # the per-shape transpose flag is recorded to undo it on the way out.
+                groups: dict[tuple[int, int, bool], list[int]] = {}
+                for i, (_p, _g, u) in enumerate(active):
+                    transposed = u.size(0) > u.size(1)
+                    key = (max(u.size(0), u.size(1)), min(u.size(0), u.size(1)), transposed)
+                    groups.setdefault(key, []).append(i)
+                for (rows, cols, transposed), idxs in groups.items():
+                    if len(idxs) == 1:
+                        # A lone shape has nothing to batch; run the exact legacy path
+                        # so single-param groups aren't exposed to bf16 stack noise.
+                        i = idxs[0]
+                        orthos[i] = _zeropower_via_newtonschulz5(
+                            active[i][2], ns_steps, ns_schedule
+                        )
+                        continue
+                    # Orient every slice the same way, stack, batch-NS, scatter back.
+                    slices = [active[i][2] for i in idxs]
+                    if transposed:
+                        slices = [s.T.contiguous() for s in slices]
+                    stack = torch.stack(slices, dim=0)
+                    out = _zeropower_newtonschulz5_batched(stack, coeffs)
+                    out = out.to(active[idxs[0]][2].dtype)
+                    for j, i in enumerate(idxs):
+                        orthos[i] = out[j].T.contiguous() if transposed else out[j]
+            else:
+                coeffs = None  # unused; silence linters about the per-matrix branch
+                for i, (_p, _g, u) in enumerate(active):
+                    orthos[i] = _zeropower_via_newtonschulz5(u, ns_steps, ns_schedule)
+
+            # Pass 3: NorMuon + spectral scaling + cautious WD + the param update.
+            # Unchanged from the legacy loop; `ortho` is whatever Pass 2 produced.
+            for i, (p, g, _u) in enumerate(active):
+                ortho = orthos[i]
                 # NorMuon (arXiv:2510.05491): normalise the orthogonalised update to
                 # unit Frobenius norm before the LR/aspect-ratio scaling step.
                 if norm_update:
@@ -251,6 +337,13 @@ class Aurora(Optimizer):
 
     Source: github.com/tilde-research/aurora-release (MIT), vendored rather than
     pip-installed because the project ships no package.
+
+    Note: Aurora stays on the per-matrix `_polar_simple_quintic` path even when
+    `muon_ns_batched` is set. The row-oblique rebalancing loop recomputes a
+    per-row-scaled `d * g32` and re-runs the polar step each iteration, so the NS
+    input changes between rebalancing passes and the per-pass scaling is per-matrix
+    — there is no stable same-shape stack to batch across. The win is also smaller
+    here (Aurora is not the sweep default), so the cuBLAS path is retained.
     """
 
     def __init__(
@@ -456,6 +549,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> Optimizer | list[O
                 ns_schedule=cfg.muon_ns_schedule,
                 norm_update=getattr(cfg, "norm_update", False),
                 cautious_wd=getattr(cfg, "cautious_wd", 0.0),
+                ns_batched=getattr(cfg, "muon_ns_batched", True),
             )
 
         if muon_bb:

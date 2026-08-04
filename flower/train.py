@@ -15,7 +15,7 @@ import torch
 from flower.config import load_config
 from flower.data import token_batches, validation_token_batches
 from flower.models import build_model
-from flower.models.base import count_parameters
+from flower.models.base import count_parameters, prebuild_attention_masks
 from flower.optim import build_optimizer
 from flower.shm_guard import start_shm_watchdog
 
@@ -346,6 +346,13 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         if getattr(eager_model, "collect_module_diagnostics", False):
             eager_model.collect_module_diagnostics = False
             print("[compile] module diagnostics disabled (untraceable by Dynamo)")
+        # Eagerly build every flex-attention BlockMask before compiling so the
+        # compiled forward only reads the cached masks. Building them inside the
+        # graph mutates module state, which cudagraph mode flags as tensor
+        # aliasing across the per-layer reads ("accessing tensor output of
+        # CUDAGraphs that has been overwritten"). No-op when flex is off.
+        if device.type == "cuda":
+            prebuild_attention_masks(eager_model, cfg.data.sequence_length, device)
         model = torch.compile(model, mode=cfg.training.compile_mode, dynamic=False)
     optims = optim_or_list if isinstance(optim_or_list, list) else [optim_or_list]
     # S12.4: EMA weight averaging for evaluation.

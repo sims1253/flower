@@ -130,3 +130,137 @@ NS).** This is the highest-leverage speedup left: a 2-3x faster optimizer step
 (`muon_ns_schedule: cubic5`) is already wired and cuts NS matmuls 15 -> 10
 (-33% optimizer compute) at a documented ~1e-3 val-loss cost (arXiv:2606.00371)
 — a config-level experiment worth running before writing any kernel.
+
+**Update (2026-08-04): batched NS is implemented and measured. The win is
+batching, not the Triton kernel.** S14-5a proposed vendoring
+`tboissin/newton_schulz_triton` to fuse the three per-iteration matmuls into
+Triton (the ~2.8× figure is on NS *compute*). Before building it, profiling
+showed the bottleneck was not compute but launch overhead. At the
+`summary_memory` d512/L8 seq8192 shape (the committed `profile_longctx_step.py`
+target):
+
+  - legacy (per-param `mm`): 166.6 ms/step, optimizer 114.4 ms (69% of step),
+    GPU self-CUDA ~61 ms/step → **wall-clock 2.7× the GPU time**. The GPU sat
+    idle waiting on the per-param Python dispatch loop (7038 `aten::mm` calls,
+    ~13 µs of CUDA work each, paying full launch overhead every time).
+  - batched (`bmm` over same-shape param groups, `muon_ns_batched: true`):
+    **64.0 ms/step, optimizer 13.4 ms (21%)**, 255k tok/s (+160%), `mm` calls
+    7038 → 1008 (-86%), replaced by 270 `bmm`. GPU self-CUDA (~54 ms) now
+    matches wall-clock — the GPU is no longer starved.
+
+Net: **full step 2.6× faster (166 → 64 ms), optimizer step 8.5× faster (114 →
+13 ms)** — well past the ~36% step-cut target above. This is why batching beat
+the Triton path here: a fused single-matrix kernel still launches once per param,
+so it would not have moved a launch-bound wall-clock. Batching collapses the
+launches, which is the actual bottleneck.
+
+Batching is also numerically free: a `bmm` over a same-shape stack reduces
+slice-for-slice to looping the legacy `mm` (bit-identical at these shapes —
+`tests/test_newton_schulz.py` asserts rel error 0.00 on the spec shapes and the
+50-step smoke-train loss curves agree to 4 decimals). So there is no coefficient-
+matching problem and no new dependency; the `cublas` fallback
+(`muon_ns_batched: false`) reproduces the exact legacy dispatch for any run that
+predates the flag. Aurora stays on the per-matrix `_polar_simple_quintic` path
+(its row-oblique rebalancing loop recomputes a per-matrix-scaled NS input each
+pass, so there is no stable stack to batch) — see `optim.py` Aurora docstring.
+
+S14 Opportunity 5a (Triton kernel) remains open as a *compute-bound* win for a
+later regime (much wider matrices where the matmuls themselves, not launches,
+dominate); at the current d512–d1024 shapes it would not have helped. Marking
+the launch-overhead half of S14-1/5a done; the compute-fusion half is deferred
+until profiling shows it is the bottleneck.
+
+## 6. S14-5b: Liger FusedLinearCrossEntropy (fused lm_head + CE) — implemented, modest win at the bake-off shape
+
+**Status: DONE (implemented + validated; memory win measured and smaller than spec hoped).**
+
+Adopted `LigerFusedLinearCrossEntropyLoss` (link-org/Liger-Kernel) so the tied
+`lm_head` projection + CE loss never materializes the full `(B*T, vocab)` logits
+tensor during training. `liger-kernel>=0.8.1` was already a dependency. The
+flag is `model.fused_linear_ce` (default False; old runs reproduce).
+
+**What runs fused / what stays eager.** When `fused_linear_ce` is on, the model
+is training, and CUDA is available, `CausalLM.forward` skips `_compute_logits`
+entirely: the Liger kernel takes the pre-normed hidden state and the tied
+embedding weight *by reference* and returns only the scalar loss (+ input/weight
+grads), so the `(B*T, vocab)` logits tensor is never allocated. The shift is
+applied to the activations and labels *before* the fused call (the kernel
+projects internally), generalised to `offset` so the same helper serves the main
+head (offset=1) and each untied MTP head (offset=i+2). Eval / inference /
+logprob consumers are untouched: they run in eval mode or without labels, so the
+eager `_compute_logits` path (including the FP8-head eval path) still runs and
+`out["logits"]` is a real tensor there. `train.py` reads only `out["loss"]` in
+its training step, so `logits=None` under fused training breaks nothing. On CPU
+the Triton kernel cannot run, so the forward falls back to eager automatically.
+Liger accumulates the softmax/CE internally in fp32 regardless of input dtype,
+so `bf16_cross_entropy` (S4) is a no-op under the fused path — strictly *more*
+precise than eager bf16 CE.
+
+**Numerical equivalence (RTX 5090, CUDA).** fp32 eager vs fused loss diff
+`4.8e-7`; tied-embedding weight-grad max diff `2.2e-8`. Well inside the spec's
+1e-4 (loss) / 1e-3 (grad) tolerance — essentially exact. Covered by
+`tests/test_training_speedups.py` (S14-5b section, CUDA-gated like the FP8 and
+Flex tests). Full suite (240 tests) green.
+
+**Measured memory reduction (the spec asked for >30%; the real number is
+smaller, and the reason is informative).** At the 450M `vanilla_matched`
+config (d1280/L20, vocab=16K, bf16, SDPA), `torch.cuda.max_memory_allocated`
+for one fwd+bwd+step:
+
+| shape            | eager   | fused   | Δ         |
+|------------------|---------|---------|-----------|
+| seq=8192, B=1    | 20.18 GB| 19.35 GB| **−0.83 GB (−4.1%)** |
+
+That is a real, reproducible saving but far below the >30% the spec projected.
+The reason: at this model/seq ratio the logits tensor that gets eliminated is
+`8192 × 16384 × 2 B (bf16) ≈ 256 MB`, plus its backward grad ≈ 256 MB, plus
+CE's internal fp32 log-sum-exp ≈ 512 MB — i.e. ~1 GB out of a 20 GB budget. The
+413M params + optimizer states + attention activations dominate. The >30%
+figure would hold where logits *do* dominate: much larger `B*T` (big batch or
+seq) and/or much larger vocab, or once the attention path stops competing for
+the budget (see the seq=32K note below). The saving scales linearly with
+`B*T*vocab`, so it grows at the bake-off's effective batch (B=2 → ~1.7 GB saved)
+and would be the dominant term at vocab=50K+.
+
+**seq=32768 (S14-5b's "does it fit now?" claim).** The fused CE path itself
+runs cleanly at seq=32768 — verified on a tiny d128/L2 model (13.37 GB peak,
+loss finite, `logits is None`). But the 413M model at seq=32768 still OOMs on
+this box, and the blocker is **not** the head: it is the SDPA path's dense
+`(1,1,32768,32768)` causal mask (~4 GB fp32), which is exactly the problem
+FlexAttention (S1) was added to solve. The measurement had to use the SDPA path
+because FlexAttention's unfused math fallback hit a WSL2 driver glitch under
+`torch.compile`-less eager; under the real bake-off config (`compile_model:
+true`, `flex_attention: true`) FlexAttention compiles the mask away and the
+fused CE's −0.83 GB becomes the marginal win that matters. **Net: fused CE is
+necessary-but-not-sufficient for seq=32K; it must be paired with the compiled
+FlexAttention path, which is already the bake-off default.** Re-measure both
+flags on together (and at B=2) once the WSL2 driver is stable or on rented
+H100/B200 hardware where the driver doesn't degrade under repeated ~20 GB
+allocations — the per-run B=2 numbers were not captured this session because the
+WSL2 GPU driver entered a degraded "device not ready" state after several
+near-capacity allocations.
+
+**Scope.** `CausalLM` only. The four `CausalLM` subclasses that override
+`forward` (`flow_pma`, `flow_meanflow`, `frequency_decay_memory`, `engram_lite`)
+and `StillLM` are untouched — they have their own head/CE paths. The bake-off's
+`vanilla_local` and `bloom_memory` both inherit `CausalLM.forward`, so both get
+the fused path automatically.
+
+**torch.compile interaction (operational caveat).** The bake-off runs
+`compile_model: true`. Under compile, the fused path adds **one graph break
+inside the Liger library** (`liger_kernel/ops/fused_linear_cross_entropy.py`,
+caused by a `.item()` sync on the non-ignore token count) on top of the
+pre-existing graph break the baseline already has at `base.py:871` (the
+diagnostic-walker `for module in self.modules()` loop, which deopts the forward
+frame to eager in *both* fused-on and fused-off configs). Net: enabling
+`fused_linear_ce` does not change the number of *Flower*-owned graph breaks —
+the new break is library-internal and cannot be removed without forking Liger.
+The compiled fused forward+backward still produces a loss equivalent to compiled
+eager (verified at rtol 5e-2 on bf16, `test_fused_linear_ce_matches_eager_under_compile`),
+which is the property that matters for a training run. The lazy Liger init is
+primed before the first compiled call (the bake-off's `train.py` runs one
+warmup forward), so the import path is not traced. A user who sets
+`fused_linear_ce=True` on a non-CUDA model gets a one-time warning that the
+forward is falling back to eager (no silent fallback).
+
+
