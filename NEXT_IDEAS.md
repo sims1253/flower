@@ -84,3 +84,37 @@ dropping GPU util to ~25%. It also OOMed at batch 8 from fragmentation (fixed by
 summary_memory at scale, replace the `nn.MultiheadAttention` perceiver with a
 plain scaled-dot-product cross-attention (S14 Opportunity — same class of fix as
 the bloom diagnostics graph-break).
+
+## 5. Profiling finding: the Muon optimizer step is the dominant step cost (not the model)
+
+**Source:** full-step profile via `scripts/profile_bloom_step.py` (RTX 5090,
+bloom_memory d=384 L=4 seq=512 B=8, bf16, Muon).
+
+A full training step at this config is **93.5 ms/step**, split:
+- **forward+backward: 39.4 ms (42%)**
+- **Muon optimizer step: 54.2 ms (58%)**
+
+The optimizer dominates. Inside it, `_zeropower_via_newtonschulz5` issues
+**15 matmuls × 45 two-D params = 675 `aten::mm` calls** per step (the profiler
+shows 696 incl. the model's fwd/bwd). `Muon.step` alone is 65.3 ms of the
+103.9 ms profiler CUDA total (63%). The per-param Python loop dispatches each
+2D weight through NS individually.
+
+The 45 Muon params have only **6 distinct shapes**, and 24/45 are the identical
+`(384,384)` — so the NS iterations are highly batchable in principle (a single
+batched `bmm` over all same-shape params per NS line, instead of 45 separate
+`mm`s). But the spectral-norm normalization (`x / x.norm()`) is per-matrix, so
+batching needs a grouped/batched norm first.
+
+**S14 Opportunity 2 (bloom routing) is done and not worth more time:** the hash
+einsum + softmax + diagnostics are **0.5% of profiled CUDA** (0.57 ms of
+103.9 ms). The single BloomMemoryBlock fwd+bwd is 2.49 ms CUDA, of which
+attention (cutlass fmha) is 27% and cuBLAS sgemm (FFN/linears) is 56% — both
+already optimal. No further bloom-path change will move the wall-clock needle.
+
+**Next real win = S14 Opportunity 1 / 5a (Turbo-Muon Triton kernel, or batched
+NS).** This is the highest-leverage speedup left: a 2-3x faster optimizer step
+(~54 ms -> ~20 ms) would cut total step time by ~36%. The `cubic5` schedule
+(`muon_ns_schedule: cubic5`) is already wired and cuts NS matmuls 15 -> 10
+(-33% optimizer compute) at a documented ~1e-3 val-loss cost (arXiv:2606.00371)
+— a config-level experiment worth running before writing any kernel.
