@@ -1,3 +1,249 @@
 [compile] module diagnostics disabled (untraceable by Dynamo)
 [data] using 14 local parquet shards from data_cache
 [data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 20061841408,
+  "loss": 3.223944664001465,
+  "parameter_count": 33300992,
+  "perplexity": 25.127042770385742,
+  "seed": 0,
+  "steps": 6000,
+  "tokens_per_sec": 394445.29911507666,
+  "train_loss": 3.223944664001465,
+  "train_perplexity": 25.127042770385742,
+  "val_batches": 50,
+  "val_bpb": 1.1034783175307892,
+  "val_loss": 3.2728910732269285,
+  "val_perplexity": 26.387517417140817,
+  "val_tokens": 3276400,
+  "validation_split": null,
+  "variant": "vanilla_local"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 20065839104,
+  "loss": 3.233262538909912,
+  "parameter_count": 33300992,
+  "perplexity": 25.362268447875977,
+  "seed": 1,
+  "steps": 6000,
+  "tokens_per_sec": 403153.1650437104,
+  "train_loss": 3.233262538909912,
+  "train_perplexity": 25.362268447875977,
+  "val_batches": 50,
+  "val_bpb": 1.106521662071309,
+  "val_loss": 3.2819175624847414,
+  "val_perplexity": 26.626782296019833,
+  "val_tokens": 3276400,
+  "validation_split": null,
+  "variant": "vanilla_local"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 25003006976,
+  "loss": 3.216391086578369,
+  "parameter_count": 54526568,
+  "perplexity": 24.937957763671875,
+  "seed": 0,
+  "steps": 6000,
+  "tokens_per_sec": 255333.98106594197,
+  "train_loss": 3.216391086578369,
+  "train_perplexity": 24.937957763671875,
+  "val_batches": 50,
+  "val_bpb": 1.1006083189623563,
+  "val_loss": 3.2643787240982056,
+  "val_perplexity": 26.163850970260533,
+  "val_tokens": 3276400,
+  "validation_split": null,
+  "variant": "bloom_memory"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 25474587648,
+  "loss": 3.209300994873047,
+  "parameter_count": 54526568,
+  "perplexity": 24.76177215576172,
+  "seed": 1,
+  "steps": 6000,
+  "tokens_per_sec": 263747.52105310047,
+  "train_loss": 3.209300994873047,
+  "train_perplexity": 24.76177215576172,
+  "val_batches": 50,
+  "val_bpb": 1.0986423100806382,
+  "val_loss": 3.2585475873947143,
+  "val_perplexity": 26.011729928893708,
+  "val_tokens": 3276400,
+  "validation_split": null,
+  "variant": "bloom_memory"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8] torch._dynamo hit config.recompile_limit (8)
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]    function: 'forward' (/home/m0hawk/Documents/flower/flower/models/base.py:623)
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]    last reason: 0/7: self._modules['blocks']._modules['0']._modules['local']._cached_block_mask is None  # self._cached_block_mask is None  # flower/models/base.py:330 in _get_block_mask
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8] User stack trace:
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]   File "/home/m0hawk/Documents/flower/flower/models/base.py", line 636, in forward
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]     x, memory = block(x, memory)
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]   File "/home/m0hawk/Documents/flower/flower/models/summary_memory.py", line 98, in forward
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]     x = x + self.local(self.ln1(x))
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]   File "/home/m0hawk/Documents/flower/flower/models/base.py", line 374, in forward
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]     return self._forward_flex(x, q, k, v, seq_len)
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]   File "/home/m0hawk/Documents/flower/flower/models/base.py", line 403, in _forward_flex
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]     block_mask = self._get_block_mask(seq_len, q.device)
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]   File "/home/m0hawk/Documents/flower/flower/models/base.py", line 330, in _get_block_mask
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8]     self._cached_block_mask is None
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0804 06:16:52.949000 373893 .venv/lib/python3.13/site-packages/torch/_dynamo/convert_frame.py:1994] [0/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+/home/m0hawk/Documents/flower/.venv/lib/python3.13/site-packages/torch/nn/attention/flex_attention.py:2481: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+
+SOLUTION: Use torch.compile(flex_attention)(...)
+
+If you want to debug your score_mod/mask_mod, you can set:
+torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+
+This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+  _warn_once(
+[sweep] VARIANT summary_memory_seed0 FAILED: OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 31.84 GiB of which 9.98 GiB is free. 27.07 GiB allowed; Of the allocated memory 19.80 GiB is allocated by PyTorch, and 295.32 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[sweep] VARIANT summary_memory_seed1 FAILED: OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 31.84 GiB of which 10.11 GiB is free. 27.07 GiB allowed; Of the allocated memory 4.17 GiB is allocated by PyTorch, and 15.79 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+{
+  "config": "configs/sweep13_longctx_memory_bakeoff.yaml",
+  "finished_at": 1785817017.89613,
+  "output_dir": "runs/sweep13_longctx_bakeoff",
+  "started_at": 1785806562.1311677,
+  "sweep": "sweep13_longctx_memory_bakeoff",
+  "variant_count": 6,
+  "variants": [
+    {
+      "base_name": "vanilla_local",
+      "metrics": {
+        "device": "cuda",
+        "gpu_memory_allocated": 20061841408,
+        "loss": 3.223944664001465,
+        "parameter_count": 33300992,
+        "perplexity": 25.127042770385742,
+        "seed": 0,
+        "steps": 6000,
+        "tokens_per_sec": 394445.29911507666,
+        "train_loss": 3.223944664001465,
+        "train_perplexity": 25.127042770385742,
+        "val_batches": 50,
+        "val_bpb": 1.1034783175307892,
+        "val_loss": 3.2728910732269285,
+        "val_perplexity": 26.387517417140817,
+        "val_tokens": 3276400,
+        "validation_split": null,
+        "variant": "vanilla_local"
+      },
+      "metrics_json": "runs/sweep13_longctx_bakeoff/vanilla_local_seed0.metrics.json",
+      "name": "vanilla_local_seed0",
+      "seed": 0,
+      "status": "completed"
+    },
+    {
+      "base_name": "vanilla_local",
+      "metrics": {
+        "device": "cuda",
+        "gpu_memory_allocated": 20065839104,
+        "loss": 3.233262538909912,
+        "parameter_count": 33300992,
+        "perplexity": 25.362268447875977,
+        "seed": 1,
+        "steps": 6000,
+        "tokens_per_sec": 403153.1650437104,
+        "train_loss": 3.233262538909912,
+        "train_perplexity": 25.362268447875977,
+        "val_batches": 50,
+        "val_bpb": 1.106521662071309,
+        "val_loss": 3.2819175624847414,
+        "val_perplexity": 26.626782296019833,
+        "val_tokens": 3276400,
+        "validation_split": null,
+        "variant": "vanilla_local"
+      },
+      "metrics_json": "runs/sweep13_longctx_bakeoff/vanilla_local_seed1.metrics.json",
+      "name": "vanilla_local_seed1",
+      "seed": 1,
+      "status": "completed"
+    },
+    {
+      "base_name": "bloom_memory",
+      "metrics": {
+        "device": "cuda",
+        "gpu_memory_allocated": 25003006976,
+        "loss": 3.216391086578369,
+        "parameter_count": 54526568,
+        "perplexity": 24.937957763671875,
+        "seed": 0,
+        "steps": 6000,
+        "tokens_per_sec": 255333.98106594197,
+        "train_loss": 3.216391086578369,
+        "train_perplexity": 24.937957763671875,
+        "val_batches": 50,
+        "val_bpb": 1.1006083189623563,
+        "val_loss": 3.2643787240982056,
+        "val_perplexity": 26.163850970260533,
+        "val_tokens": 3276400,
+        "validation_split": null,
+        "variant": "bloom_memory"
+      },
+      "metrics_json": "runs/sweep13_longctx_bakeoff/bloom_memory_seed0.metrics.json",
+      "name": "bloom_memory_seed0",
+      "seed": 0,
+      "status": "completed"
+    },
+    {
+      "base_name": "bloom_memory",
+      "metrics": {
+        "device": "cuda",
+        "gpu_memory_allocated": 25474587648,
+        "loss": 3.209300994873047,
+        "parameter_count": 54526568,
+        "perplexity": 24.76177215576172,
+        "seed": 1,
+        "steps": 6000,
+        "tokens_per_sec": 263747.52105310047,
+        "train_loss": 3.209300994873047,
+        "train_perplexity": 24.76177215576172,
+        "val_batches": 50,
+        "val_bpb": 1.0986423100806382,
+        "val_loss": 3.2585475873947143,
+        "val_perplexity": 26.011729928893708,
+        "val_tokens": 3276400,
+        "validation_split": null,
+        "variant": "bloom_memory"
+      },
+      "metrics_json": "runs/sweep13_longctx_bakeoff/bloom_memory_seed1.metrics.json",
+      "name": "bloom_memory_seed1",
+      "seed": 1,
+      "status": "completed"
+    },
+    {
+      "base_name": "summary_memory",
+      "metrics": {},
+      "metrics_json": "runs/sweep13_longctx_bakeoff/summary_memory_seed0.metrics.json",
+      "name": "summary_memory_seed0",
+      "seed": 0,
+      "status": "failed: OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 31.84 GiB of which 9.98 GiB is free. 27.07 GiB allowed; Of the allocated memory 19.80 GiB is allocated by PyTorch, and 295.32 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)"
+    },
+    {
+      "base_name": "summary_memory",
+      "metrics": {},
+      "metrics_json": "runs/sweep13_longctx_bakeoff/summary_memory_seed1.metrics.json",
+      "name": "summary_memory_seed1",
+      "seed": 1,
+      "status": "failed: OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 31.84 GiB of which 10.11 GiB is free. 27.07 GiB allowed; Of the allocated memory 4.17 GiB is allocated by PyTorch, and 15.79 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)"
+    }
+  ]
+}

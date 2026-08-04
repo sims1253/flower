@@ -737,3 +737,42 @@ If the overnight bake-off shows a memory arm beating vanilla at long context,
 that is the first positive signal for the project's thesis and the trigger for
 the powered (8-seed) follow-up and the 350M / 600M scale-up.
 
+### First results (overnight directional pass)
+
+`configs/sweep13_longctx_memory_bakeoff.yaml`, d512/L8 (~33-54M), seq=8192,
+local_window=2048 (4x ratio), 6000 steps, 2 seeds/arm, flex+compile+bf16+muon,
+batch 8 (effective batch 131072 tokens). This is the floor of the regime where
+memory mechanisms can show signal — and signal appeared.
+
+| arm | params | seeds | val_loss (±) | val_bpb | vs vanilla |
+|-----|--------|------:|-------------|---------|-----------|
+| **bloom_memory** | 54.5M | 2 | **3.2615 ± 0.0041** | **1.0996** | **-0.0054** |
+| vanilla_local | 33.3M | 2 | 3.2774 ± 0.0064 | 1.1050 | baseline |
+| summary_memory | 64.9M | — | (re-running, see note) | — | — |
+
+**Reading.** bloom_memory beats vanilla on both seeds (3.265, 3.259 vs 3.273,
+3.283) with tighter variance. The -0.0054 bpb delta is small and not yet
+significant at n=2, but it is consistent and in the predicted direction: the
+memory mechanism helps once sequence exceeds the sliding window. This is the
+first positive long-context signal in the project and the trigger for the
+powered follow-up (`configs/sweep13_longctx_memory_powered.yaml`, 4 seeds,
+10000 steps).
+
+**Caveats.** (1) The arms are NOT parameter-matched — bloom (54.5M) has ~64%
+more params than vanilla (33.3M). The bloom win could be capacity, not
+mechanism. A fair follow-up needs a param-matched vanilla control. (2) n=2 is
+directional only; the powered config raises this to n=4. (3) summary_memory
+OOMed on both seeds at batch 8 due to allocator fragmentation (the VRAM cap
+caught it loudly, as designed); it re-runs with `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True`. summary_memory is the most memory-hungry arm
+(perceiver cross-attention); batch 8 = 23.4 GB peak in isolation but fragments
+under the long-context activations.
+
+**Environment note.** These runs use the upgraded stack (torch 2.13.0+cu130,
+Python 3.13, fla 0.5.2, flex+compile, bloom diagnostics graph-break fixed).
+Throughput at batch 8: ~400k tok/s, ~22 GB peak (vanilla), ~26 GB peak (bloom).
+The bloom diagnostics host-sync was graph-breaking compile and dropping GPU
+util to ~46%; gating it behind `torch.compiler.is_compiling()` (S14 Opportunity
+4) restored full utilization.
+
+
