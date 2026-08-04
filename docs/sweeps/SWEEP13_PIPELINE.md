@@ -775,4 +775,38 @@ The bloom diagnostics host-sync was graph-breaking compile and dropping GPU
 util to ~46%; gating it behind `torch.compiler.is_compiling()` (S14 Opportunity
 4) restored full utilization.
 
+### Verdict: the directional bloom win was capacity, not mechanism
+
+The directional pass's -0.0054 bpb bloom "win" was confounded: bloom (54.5M)
+had ~64% more params than vanilla (33.3M). The powered follow-up resolves this
+by comparing bloom against a **param-matched vanilla control** (d640/L10,
+49.6M non-emb, within 8% of bloom's 46.1M), both at 10000 steps:
+
+| arm | non-emb params | seeds | val_loss (±) | val_bpb | vs matched vanilla |
+|-----|---------------|------:|-------------|---------|-------------------|
+| **vanilla_matched54M** | 49.6M | 2 | **3.0803 ± 0.0023** | **1.0385** | baseline |
+| bloom_memory | 46.1M | 1 | 3.1818 | 1.0728 | **+0.0343 bpb (worse)** |
+| vanilla_local (small) | 24.9M | 2 (6k) | 3.2774 ± 0.0064 | 1.1050 | (different step count) |
+
+**At matched parameters and matched steps, plain sliding-window attention beats
+bloom memory by +0.034 bpb** — a gap ~15x the seed noise (0.0023). The memory
+mechanism is *hurting* at this scale: the params bloom spends on hash
+projections / perceiver summaries / slot writes return less than spending the
+same params on a wider vanilla transformer.
+
+This is the expected null result at 33-54M / seq 8192, and it matches
+`docs/training-speedups.md` Section 13's explicit prediction: memory mechanisms
+need ~500M+ params (and seq >= 8K) before the circuits they support can form.
+The positive reading: the experiment worked — it produced a clean, decisive
+mechanism-vs-capacity separation at the smallest scale where the question was
+testable, and the answer is "not yet." The scale-up that could flip this
+(600M / seq 32K) is the doc's Phase 3 target and needs rented 8xGPU hardware.
+
+**What this means for the project.** Do not chase memory-mechanism wins below
+~500M — they are capacity artefacts. The long-context infrastructure
+(FlexAttention, the bake-off configs) is now in place and validated; the next
+step that could show real memory signal is the 600M scale-up, not more
+small-model variants.
+
+
 

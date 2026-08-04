@@ -1,3 +1,47 @@
 [compile] module diagnostics disabled (untraceable by Dynamo)
 [data] using 14 local parquet shards from data_cache
 [data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 26696294400,
+  "loss": 3.1239027976989746,
+  "parameter_count": 60060800,
+  "perplexity": 22.734935760498047,
+  "seed": 0,
+  "steps": 10000,
+  "tokens_per_sec": 252110.59890215733,
+  "train_loss": 3.1239027976989746,
+  "train_perplexity": 22.734935760498047,
+  "val_batches": 50,
+  "val_bpb": 1.0390824391860989,
+  "val_loss": 3.0818943929672242,
+  "val_perplexity": 21.79966042779828,
+  "val_tokens": 3276400,
+  "validation_split": null,
+  "variant": "vanilla_local"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 26696294400,
+  "loss": 3.1187827587127686,
+  "parameter_count": 60060800,
+  "perplexity": 22.61882972717285,
+  "seed": 1,
+  "steps": 10000,
+  "tokens_per_sec": 253946.9810270258,
+  "train_loss": 3.1187827587127686,
+  "train_perplexity": 22.61882972717285,
+  "val_batches": 50,
+  "val_bpb": 1.0380082449537968,
+  "val_loss": 3.078708357810974,
+  "val_perplexity": 21.730316468085917,
+  "val_tokens": 3276400,
+  "validation_split": null,
+  "variant": "vanilla_local"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[data] using 14 local parquet shards from data_cache

@@ -54,21 +54,28 @@ Cost: reuse the Sweep 10 infrastructure (matched-budget variants).
 - If Sweep 10 B≥C (flow win was capacity): the flow direction is dead at this
   scale; pivot to #1 (tapering) as the next cheap, orthogonal "free win" probe.
 
-## 4. Long-context memory bake-off — bloom shows signal; needs param-matched control
+## 4. Long-context memory bake-off — bloom "win" was capacity, not mechanism (resolved)
 
 **Source:** `docs/training-speedups.md` Section 13 + `docs/sweeps/SWEEP13_PIPELINE.md`
 section 13. The long-context direction enabled by FlexAttention.
 
-At seq=8192 / window=2048 (4x ratio, the floor where memory can matter), a 2-seed
-directional pass found **bloom_memory beats vanilla_local by -0.0054 bpb** (val_bpb
-1.0996 vs 1.1050), consistently across both seeds. This is the first positive
-long-context memory signal in the project.
+At seq=8192 / window=2048 (4x ratio), a 2-seed directional pass found bloom_memory
+beat a smaller vanilla by -0.0054 bpb — but bloom had ~64% more params. The
+powered follow-up resolved the confound with a **param-matched vanilla control**
+(d640/L10, 49.6M non-emb vs bloom's 46.1M), both at 10000 steps:
 
-**The confound:** bloom (54.5M) had ~64% more params than vanilla (33.3M), so
-the win could be capacity, not mechanism. The powered follow-up
-(`configs/sweep13_longctx_memory_powered.yaml`) adds a **param-matched vanilla
-control** (d640/L10, 49.6M non-emb, within 8% of bloom's 46.1M). If bloom still
-beats the matched vanilla, the mechanism is real; if not, it was capacity.
+- **vanilla_matched54M: val_bpb 1.0385 ± 0.0023** (2 seeds)
+- **bloom_memory: val_bpb 1.0728** (1 seed)
+
+**At matched params and steps, plain sliding-window attention beats bloom by
++0.034 bpb** (~15x the seed noise). The memory mechanism is *hurting* at this
+scale: params spent on hash/summary/routing machinery return less than spending
+them on a wider vanilla transformer. This is the expected null at 33-54M and
+matches Section 13's prediction that memory mechanisms need ~500M+ to show real
+signal. **Do not chase memory-mechanism wins below ~500M — they are capacity
+artefacts.** The long-context infra is now in place and validated; the next step
+that could flip this is the 600M / seq 32K scale-up (Phase 3, needs rented
+8xGPU hardware).
 
 **summary_memory note:** the third arm hit a compile perf issue — its perceiver
 cross-attention (`nn.MultiheadAttention`) graph-breaks under `torch.compile`,
