@@ -91,12 +91,18 @@ class BloomMemoryBlock(nn.Module):
         # Diagnostics: routing entropy (low = sharp Bloom-like routing, high =
         # softmax mush) and pairwise hash divergence (KL between heads; low =
         # hashes have collapsed onto the same routing -- K>1 buys nothing).
-        with torch.no_grad():
-            entropy = -(plan.clamp_min(1e-9) * plan.clamp_min(1e-9).log()).sum(dim=-1).mean()
-            mean_routing = stacked.mean(dim=0, keepdim=True)
-            kl = (stacked.clamp_min(1e-9) * (stacked.clamp_min(1e-9).log() - mean_routing.clamp_min(1e-9).log())).sum(dim=-1).mean()
-            self.last_diag_bloom_routing_entropy = float(entropy.cpu())
-            self.last_diag_bloom_hash_divergence = float(kl.cpu())
+        # Skipped under torch.compile: the host sync (float(...cpu())) graph-
+        # breaks the compiled region and tanks GPU utilisation. The values are
+        # only read by the diagnostic walker, which is itself disabled under
+        # compile (CausalLM.collect_module_diagnostics), so dropping them there
+        # loses nothing. (docs/training-speedups.md S14 Opportunity 4.)
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                entropy = -(plan.clamp_min(1e-9) * plan.clamp_min(1e-9).log()).sum(dim=-1).mean()
+                mean_routing = stacked.mean(dim=0, keepdim=True)
+                kl = (stacked.clamp_min(1e-9) * (stacked.clamp_min(1e-9).log() - mean_routing.clamp_min(1e-9).log())).sum(dim=-1).mean()
+                self.last_diag_bloom_routing_entropy = float(entropy.cpu())
+                self.last_diag_bloom_hash_divergence = float(kl.cpu())
         return plan
 
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
