@@ -36,6 +36,13 @@ def _checkpoint_config(path: Path) -> dict[str, Any] | None:
 def _load_checkpoint_model(model: torch.nn.Module, checkpoint: Path, device: torch.device) -> int | None:
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     state = payload.get("model", payload)
+    # S14 Opportunity 2 Part A: bloom_memory's K-hash ModuleList became a single
+    # `hash_weights` Parameter. Remap legacy `hashes.{i}.weight` checkpoints so
+    # old artifacts (sweep5/7/13 bloom runs) still load. No-op for new-format /
+    # non-bloom state_dicts.
+    from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+
+    state = remap_legacy_bloom_state_dict(state)
     model.load_state_dict(state)
     step = payload.get("step")
     return int(step) if step is not None else None

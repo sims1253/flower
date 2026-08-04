@@ -1165,7 +1165,7 @@ Total: ~5K + 7 kernel launches per layer per step. With K=4 and 28 layers: ~644 
 
 **Two-part fix**:
 
-Part A (easy, do immediately): Replace the Python loop over hashes with a single batched matmul. Instead of `nn.ModuleList` of K separate Linear layers, store the hashes as a single `(K, d_model, memory_slots)` weight tensor and compute all K projections in one `torch.einsum('bd,kds->bks', x, weights)`:
+Part A (easy, do immediately) — **DONE** (see `flower/models/bloom_memory.py`, `tests/test_bloom_memory.py`, commit on branch `training-speedups`): Replace the Python loop over hashes with a single batched matmul. Instead of `nn.ModuleList` of K separate Linear layers, store the hashes as a single `(K, d_model, memory_slots)` weight tensor and compute all K projections in one `torch.einsum('bd,kds->bks', x, weights)`:
 
 ```python
 # Instead of K separate nn.Linear:

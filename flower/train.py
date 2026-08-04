@@ -384,7 +384,14 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             latest = ckpts[-1]
             print(f"[resume] loading checkpoint {latest}")
             payload = torch.load(latest, map_location=device, weights_only=True)
-            eager_model.load_state_dict(payload["model"])
+            # S14 Opportunity 2 Part A: bloom_memory's K-hash ModuleList became a
+            # single `hash_weights` Parameter. Remap legacy checkpoints so an
+            # in-flight bloom run resumed after the upgrade keeps its learned
+            # hashes. No-op for new-format / non-bloom state_dicts.
+            from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+
+            state = remap_legacy_bloom_state_dict(payload["model"])
+            eager_model.load_state_dict(state)
             for opt, opt_state in zip(optims, payload.get("optimizers", []), strict=False):
                 opt.load_state_dict(opt_state)
             resume_step = int(payload.get("step", 0))

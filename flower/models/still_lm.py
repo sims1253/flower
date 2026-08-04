@@ -761,6 +761,12 @@ def build_still_model(config: ModelConfig) -> StillLM:
         state = payload.get("model", payload)
         # Strip "base_model." prefix if present (from a previous StillLM checkpoint).
         cleaned = {k.replace("base_model.", ""): v for k, v in state.items()}
+        # S14 Opportunity 2 Part A: if the base is a bloom_memory checkpoint from
+        # before the hash_weights refactor, remap its legacy hashes.{i}.weight
+        # keys. No-op for non-bloom / new-format state_dicts.
+        from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+
+        cleaned = remap_legacy_bloom_state_dict(cleaned)
         missing, unexpected = base_model.load_state_dict(cleaned, strict=False)
         if missing:
             print(f"[still] base model missing keys: {len(missing)}")

@@ -26,6 +26,7 @@ import yaml
 
 from flower.config import load_config
 from flower.models import build_model
+from flower.models.bloom_memory import remap_legacy_bloom_state_dict
 
 
 def _embedded_config(payload: dict[str, Any], ckpt: Path) -> dict[str, Any] | None:
@@ -62,6 +63,14 @@ def audit_one(ckpt: Path) -> dict[str, Any]:
         row["step"] = payload.get("step") if isinstance(payload, dict) else None
         model = build_model(cfg.model)
         state = payload.get("model", payload) if isinstance(payload, dict) else payload
+        # S14 Opportunity 2 Part A: bloom_memory's K-hash ModuleList became a
+        # single `hash_weights` Parameter. Remap legacy checkpoints so they
+        # aren't false-flagged as mismatches (eval.py/train.py already remap
+        # on load). No-op for new-format / non-bloom state_dicts.
+        if cfg.model.variant == "bloom_memory":
+            state = remap_legacy_bloom_state_dict(
+                state, num_hashes=cfg.model.bloom_num_hashes
+            )
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing or unexpected:
             row["status"] = "shape-or-key-mismatch"
