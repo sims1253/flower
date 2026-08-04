@@ -11,6 +11,7 @@ wheels/
 
 # Run outputs and artifacts
 runs/
+runs_*.log
 reports/
 data_cache/
 .pytest_cache/
