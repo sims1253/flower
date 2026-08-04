@@ -53,3 +53,27 @@ Cost: reuse the Sweep 10 infrastructure (matched-budget variants).
 - If Sweep 10 B<C (flow mechanism wins): go to #2.
 - If Sweep 10 B≥C (flow win was capacity): the flow direction is dead at this
   scale; pivot to #1 (tapering) as the next cheap, orthogonal "free win" probe.
+
+## 4. Long-context memory bake-off — bloom shows signal; needs param-matched control
+
+**Source:** `docs/training-speedups.md` Section 13 + `docs/sweeps/SWEEP13_PIPELINE.md`
+section 13. The long-context direction enabled by FlexAttention.
+
+At seq=8192 / window=2048 (4x ratio, the floor where memory can matter), a 2-seed
+directional pass found **bloom_memory beats vanilla_local by -0.0054 bpb** (val_bpb
+1.0996 vs 1.1050), consistently across both seeds. This is the first positive
+long-context memory signal in the project.
+
+**The confound:** bloom (54.5M) had ~64% more params than vanilla (33.3M), so
+the win could be capacity, not mechanism. The powered follow-up
+(`configs/sweep13_longctx_memory_powered.yaml`) adds a **param-matched vanilla
+control** (d640/L10, 49.6M non-emb, within 8% of bloom's 46.1M). If bloom still
+beats the matched vanilla, the mechanism is real; if not, it was capacity.
+
+**summary_memory note:** the third arm hit a compile perf issue — its perceiver
+cross-attention (`nn.MultiheadAttention`) graph-breaks under `torch.compile`,
+dropping GPU util to ~25%. It also OOMed at batch 8 from fragmentation (fixed by
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`). Before re-running
+summary_memory at scale, replace the `nn.MultiheadAttention` perceiver with a
+plain scaled-dot-product cross-attention (S14 Opportunity — same class of fix as
+the bloom diagnostics graph-break).
