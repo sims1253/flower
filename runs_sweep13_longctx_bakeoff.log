@@ -1,3 +1,25 @@
 [compile] module diagnostics disabled (untraceable by Dynamo)
 [data] using 14 local parquet shards from data_cache
 [data] using 14 local parquet shards from data_cache
+{
+  "device": "cuda",
+  "gpu_memory_allocated": 5474641920,
+  "loss": 3.222093105316162,
+  "parameter_count": 33300992,
+  "perplexity": 25.0805606842041,
+  "seed": 0,
+  "steps": 6000,
+  "tokens_per_sec": 389814.92344990926,
+  "train_loss": 3.222093105316162,
+  "train_perplexity": 25.0805606842041,
+  "val_batches": 50,
+  "val_bpb": 1.1072116440873567,
+  "val_loss": 3.283964033126831,
+  "val_perplexity": 26.681329019378946,
+  "val_tokens": 819100,
+  "validation_split": null,
+  "variant": "vanilla_local"
+}
+[compile] module diagnostics disabled (untraceable by Dynamo)
+[data] using 14 local parquet shards from data_cache
+[data] using 14 local parquet shards from data_cache
