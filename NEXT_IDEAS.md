@@ -729,4 +729,39 @@ The exception is ops that change the *memory* profile (FusedLinearCE eliminates
 the logits materialization) — those remain worth adopting regardless of kernel
 speed. Benchmark: `scripts/bench_liger_kernels.py`.
 
+## 13. Why there's no kernel win at seq=32K: GPU-saturated at 67% MFU
+
+**Source:** the question "could a better kernel make 400M@32K faster?" — it's
+compute-bound, so worth checking whether the compute is efficient.
+
+**Profiled (RTX 5090, bf16, compile+flex+Muon+ffn-checkpoint, 400M d1024/L24,
+seq32768/b1):** the step is genuinely GPU-saturated and near-optimal. No kernel
+or dispatch fix recovers more than noise.
+
+- **bf16 matmul MFU = 67%** (215 / 318 TFLOPS peak on an isolated 8192² GEMM).
+  Near the cuBLAS ceiling on dense matmul (~70% typical). The `cutlass_80_*`
+  kernel names are a red herring — that's a cutlass template tag, not an
+  architecture target; the kernels run on sm_120 at near-peak. No hand-written
+  GEMM beats cuBLAS here.
+- **GPU saturated — zero dispatch bubbles.** GPU-event time (660ms/micro-step)
+  ≈ wall-clock (648ms); the gap is −1.9% (timer jitter). So `reduce-overhead` /
+  CUDA graphs recover nothing — the compiled path already overlaps CPU dispatch
+  with GPU compute. (reduce-overhead also OOMs at this scale, as it did at 450M
+  — CUDA-graph private pools don't fit alongside 21 GB of activations.)
+- **Flex-attention honors the local window.** Block mask is 93.6% sparse
+  (= 1 − 2048/32768), and local-window flex is 7.4× faster than full-causal in
+  both forward (1.4ms) and backward (7.1ms/layer). It's doing O(T·window), not
+  O(T²). The 20% of step spent in flex-backward (120ms / 24 layers = 5ms/layer)
+  is irreducible for this mask pattern; PyTorch's Triton kernel is already fused.
+- **The "extra" compute is FFN-checkpoint recompute** — the price of the 36%
+  memory saving, not inefficiency.
+
+**The ~13% MFU headroom (67% → 80%) is matmul efficiency on these shapes**
+(rectangular GEMMs, fp32 accumulate), not dispatch or kernel choice. The only
+thing that closes it is **lower precision (FP8/FP4 ≈ 2× throughput)** — which is
+blocked on sm_120 software support (§11). So **57k tok/s at 400M / 35k at 600M
+is about as fast as bf16 + checkpointing + local-window flex gets on the 5090.**
+No kernel work is the lever; the lever is upstream FP8 support for consumer
+Blackwell, or renting datacenter Blackwell where TE's FP8 path works.
+
 
