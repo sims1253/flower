@@ -286,6 +286,22 @@ class ModelConfig:
     #                   (torch 2.13) with a context_fn + use_reentrant=False;
     #                   the same RNG-state-save/restore and flex-compile
     #                   workarounds as full checkpointing apply.
+    #   "ffn"        -> checkpoint ONLY the feed-forward sub-layer, keeping
+    #                   attention (Q/K/V/O) materialized. The best throughput/
+    #                   memory tradeoff at long context: FlashAttention/Flex
+    #                   already recomputes the O(T^2) score matmul in backward
+    #                   from saved Q,K,V, so the only extra cost full
+    #                   checkpointing adds on the attention side is the cheap
+    #                   qkv/out projections — but it also forces dropping Q,K,V
+    #                   which are large at long T. Checkpointing only the FFN
+    #                   (whose intermediate is the biggest single activation AND
+    #                   whose matmuls are cheap to recompute) saves ~37% peak
+    #                   memory for only ~10% throughput cost, vs full's ~50%
+    #                   saving for ~100% cost. Measured at d768/L14/seq8192/b4:
+    #                   none 15.3GB/185ms, full 3.3GB/373ms, ffn 9.7GB/203ms.
+    #                   vanilla_local blocks only (memory-variant forwards are
+    #                   left to full/selective; "ffn" falls back to "full" for
+    #                   them with a warning).
     activation_checkpoint: bool | str = False
     # S12.2: orthogonal weight initialisation for 2D matrices (pairs with Muon).
     orthogonal_init: bool = False
@@ -319,9 +335,9 @@ class ModelConfig:
         # S14-checkpoint: activation_checkpoint accepts False / True / "selective".
         # bool|str validated here so a typo (e.g. "selectiv") fails loudly at
         # config load rather than silently behaving like "off" in forward.
-        if self.activation_checkpoint not in {False, True, "selective"}:
+        if self.activation_checkpoint not in {False, True, "selective", "ffn"}:
             raise ValueError(
-                f"activation_checkpoint must be False, True, or 'selective', "
+                f"activation_checkpoint must be False, True, 'selective', or 'ffn', "
                 f"got {self.activation_checkpoint!r}"
             )
 

@@ -923,6 +923,35 @@ class CausalLM(nn.Module):
                             use_reentrant=False,
                             context_fn=context_fn,
                         )
+                elif self.activation_checkpoint == "ffn":
+                    # FFN-only: checkpoint ONLY the feed-forward sub-layer of
+                    # each vanilla block, keeping attention (Q/K/V/O) live.
+                    # FlashAttention/Flex already recomputes the O(T^2) score
+                    # matmul in backward, so the only thing full checkpointing
+                    # buys on the attention side is dropping Q/K/V — which are
+                    # large at long T but cheap to keep. The FFN intermediate is
+                    # both the biggest single activation AND cheap to recompute
+                    # (dense matmuls), making it the efficient checkpoint target.
+                    # Measured: ~37% memory saving for ~10% throughput cost, vs
+                    # full's ~50% saving for ~100% cost (see config docstring).
+                    # Vanilla blocks only; memory-variant blocks fall back to
+                    # full (their forward interleaves memory ops with attention,
+                    # so there is no clean FFN-only boundary).
+                    for block in self.blocks:
+                        if isinstance(block, TransformerBlock):
+                            attn_out = block.attn(block.ln1(x))
+                            x = x + attn_out
+                            x = x + checkpoint(block.ff, block.ln2(x), use_reentrant=False)
+                            # memory is unchanged by vanilla blocks (passed through).
+                        else:
+                            if not getattr(self, "_warned_ffn_fallback", False):
+                                print(
+                                    "[checkpoint] activation_checkpoint='ffn' is only "
+                                    "supported on vanilla blocks; falling back to full "
+                                    "checkpointing for memory-variant blocks."
+                                )
+                                self._warned_ffn_fallback = True
+                            x, memory = checkpoint(block, x, memory, use_reentrant=False)
                 else:
                     for block in self.blocks:
                         # memory=None on the first block; checkpoint requires at

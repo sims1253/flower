@@ -575,37 +575,109 @@ beat full on throughput at these shapes.
 
 **When to use which.**
 - `false` — default; seq≤8K that already fits, throughput-sensitive.
-- `true` — maximum memory saving (the seq=32K enabler); accept the full
-  recompute cost.
-- `"selective"` — middle ground when memory is tight but you have ~50% more
-  headroom than full needs and want to keep the small activations live; not a
-  throughput win over full at these shapes.
+- `"ffn"` — **the recommended long-context mode** (§10b): checkpoint only the
+  FFN, keep attention live. ~36% memory saving for only ~16% throughput cost.
+  The best tradeoff for seq=32K / 600M runs that need headroom without halving
+  throughput. Used by `sweep13_100m_longctx32k_checkpoint.yaml`.
+- `"selective"` — byte-threshold policy; middle ground on memory but, as
+  measured, only ~5-9% faster than full (it drops the FFN intermediate, which is
+  both the big activation AND the expensive recompute, so it still recomputes
+  the heavy ops). Superseded by `"ffn"` for the throughput/memory tradeoff.
+- `true` — maximum memory saving (lowest peak) but ~114% throughput cost; use
+  only when memory is the hard wall and `"ffn"` doesn't fit.
 
-## 11. FP8 training via Transformer Engine — blocked on this box (no sm_120 wheel)
+### 10b. FFN-only checkpointing — the throughput/memory sweet spot
 
-**Source:** §13 precision routing. FP8 FFN/attn matmuls are the biggest
-remaining throughput lever on Blackwell (~2× the BF16 throughput on the FFN,
-which is ~60% of compute). The eval-only `torch._scaled_mm` FP8 head (§3) cannot
-extend to training: `_scaled_mm` has **no backward kernel** in torch 2.13
-(verified: `derivative for aten::_scaled_mm is not implemented`). FP8 *training*
-needs Transformer Engine (TE), which handles the autocast + backward.
+**Source:** the "harsh pill" — full checkpointing (§10) at seq=32K halves
+throughput (measured +101-114% step time), which makes 600M@32K painfully slow
+even though it fits. The question: can we get memory headroom without the 2×
+throughput tax?
 
-**Blocked.** `transformer-engine[pytorch]` v2.17 has no prebuilt wheel for
-torch 2.13+cu130 (very new; TE's wheels lag) — `pip install` triggers a C++
-source build ("Error compiling objects for extension"), and the meta-package
-stays empty. A full source build (CMake + ninja) is what OOM'd the entire WSL2
-machine on the first attempt (pegged all cores + thrashed the WDDM driver) and
-required a WSL restart. So FP8-via-TE is not viable on this WSL2+sm_120 box
-without either (a) a controlled, ninja-job-capped source build in a fresh
-session, or (b) a different host with a prebuilt wheel / more RAM.
+**Key insight (validated empirically).** Full checkpointing recomputes the
+*whole* block, including attention. But FlashAttention/Flex **already
+recomputes the O(T²) score matmul in backward** from saved Q,K,V + logsumexp —
+so the only thing full checkpointing buys on the attention side is dropping
+Q/K/V/O, which are large at long T but *cheap to keep*. Meanwhile the FFN
+intermediate `(B, T, ffn_dim)` is both the biggest single activation AND cheap
+to recompute (dense gate/up/down matmuls, no O(T²)). So the efficient policy is
+the opposite of full: **keep attention live, checkpoint only the FFN.** (This
+also explains why "selective" underperformed — its byte-threshold drops the
+biggest tensor = the FFN intermediate, but it still wraps the whole block and
+thus still drops attention.)
 
-**Recommendation.** Revisit on a non-WSL host or when TE ships a cu130/sm_120
-wheel. The §13 precision-routing config scaffolding (`ffn_precision`,
-`attn_precision`) is already in place; only the TE-backed matmul casting is
-missing. When TE is available, the work is: swap `nn.Linear`→`te.Linear` in
-`FeedForward`/`CausalSelfAttention` behind `ffn_precision="fp8"`, keep memory
-modules bf16 (§13 rule), validate TE+`torch.compile`+Muon coexist, gate loss
-delta <0.02. Estimated ~1 day once the dependency installs.
+**Implemented.** `activation_checkpoint: "ffn"`. `CausalLM.forward` runs each
+vanilla `TransformerBlock` inline with only `block.ff` wrapped in
+`checkpoint(..., use_reentrant=False)` — attention (`block.attn(block.ln1(x))`)
+runs live, its activations retained. Memory-variant blocks (bloom/summary/etc.,
+whose forward interleaves memory ops with attention) have no clean FFN-only
+boundary, so they fall back to full checkpointing with a one-time warning. Same
+gates as the other modes (training, `loop_count==1`, `depth_router is None`).
+The flex-compile workaround applies (ffn recomputes flex too). Correctness:
+loss bit-identical to no-checkpoint with dropout>0 (RNG preserved), and the
+ffn-mode forward is structurally identical to `TransformerBlock.forward`
+(pinned by `test_activation_checkpoint_ffn_matches_no_checkpoint_forward`). 4
+tests added.
+
+**Measured (RTX 5090, bf16, torch.compile default, flex, 100M d768/L14):**
+
+| shape | mode | peak | fwd+bwd | mem saved | throughput cost |
+|-------|------|------|---------|-----------|-----------------|
+| seq8192 b4 | none | 15.4 GB | 182 ms | — | — |
+| seq8192 b4 | full | 3.3 GB | 390 ms | −79% | **+114%** |
+| seq8192 b4 | selective | 5.5 GB | 317 ms | −64% | +74% |
+| seq8192 b4 | **ffn** | **9.8 GB** | **212 ms** | **−36%** | **+16%** |
+| seq32768 b1 | ffn | 9.9 GB | 215 ms | fits | ~+15% vs not-runnable |
+
+**Reading.** FFN-only is a ~7× better throughput/memory tradeoff than full: 36%
+of the memory saving for 14% of the throughput cost (full: 79% saving / 114%
+cost). At seq=32K it fits in ~10 GB with ~16% overhead — making 600M@32K on the
+5090 not just possible but reasonably fast. The "harsh pill" is resolved: use
+`"ffn"` for long context, `false` for short context that fits, `true` only when
+`"ffn"` doesn't fit.
+
+## 11. FP8 / FP4 (NVFP4) low-precision training — blocked on sm_120 software support, not the env
+
+**Source:** §13 precision routing. FP8 FFN/attn (and FP4/NVFP4 FFN) matmuls are
+the biggest remaining throughput lever on Blackwell (~2× BF16 on the FFN, which
+is ~60% of compute). Investigated thoroughly; the blocker is deeper than the
+environment.
+
+**Stock torch 2.13 (no TE):**
+- `_scaled_mm` has **no backward kernel** at all (`derivative for
+  aten::_scaled_mm is not implemented`) — kills FP8 *training* (the FP8 head
+  stays eval-only, as implemented in §3).
+- The NVFP4 *API* exists: `torch.float4_e2m1fn_x2` (packed) + the v2
+  `F.scaled_mm` with `ScalingType.BlockWise1x16` + fp8 block scales. But on the
+  RTX 5090 (sm_120), cuBLASLt returns **`CUBLAS_STATUS_NOT_SUPPORTED`** (0
+  algorithms) for FP4 matmuls — the FP4 cuBLASLt kernels are absent in this
+  cu130 build. FP8 forward works; FP4 forward does not. So NVFP4 is doubly dead
+  from stock torch on sm_120 (no kernel + no backward).
+
+**Transformer Engine:**
+- **No source build needed** — the prior OOM was the `transformer-engine`
+  meta-package; the dedicated `transformer-engine-torch==2.17.0` +
+  `transformer-engine-cu13==2.17.0` are **prebuilt wheels for cu130/cp313**.
+  (The runaway build was also avoidable: a capped `MAX_JOBS=4` build fits the
+  31GB WSL RAM budget — ninja had launched 24 parallel jobs into 31GB. Moot now
+  since the wheel exists.)
+- **But NVFP4 *training* is broken on sm_120 in TE 2.17** regardless: issue
+  [NVIDIA/TransformerEngine#3062](https://github.com/NVIDIA/TransformerEngine/issues/3062)
+  — the default `NVFP4BlockScaling()` recipe (Random Hadamard Transform +
+  stochastic rounding, which backward-gradient quant uses, i.e. *training*)
+  crashes on consumer Blackwell ("fused kernel exceeds 101376-byte shared-memory
+  opt-in cap"). Plain round-to-nearest NVFP4 GEMM works; the training-grade path
+  does not. Related open sm_120 defects:
+  [#3281](https://github.com/NVIDIA/TransformerEngine/pull/3281),
+  [#3219](https://github.com/NVIDIA/TransformerEngine/issues/3219).
+
+**Bottom line: low-precision training is blocked by sm_120 software support,
+not this box.** Consumer Blackwell (5090) trails datacenter Blackwell (B200) on
+the FP4/FP8 training kernels. This is a wait-for-upstream situation. FP8-via-TE
+(forward+backward, the §13 FFN/attn tier) *may* work on the prebuilt wheel
+(NVFP4 is the clearly-broken part; plain FP8 is less clear) — worth a quick
+re-test if pursued, gated on TE+`torch.compile`+Muon coexisting. The §13 config
+scaffolding (`ffn_precision`/`attn_precision`) is in place; only the TE-backed
+casting is missing.
 
 ## 12. Liger FusedRMSNorm + FusedSwiGLU: 2× SLOWER under compile — do not adopt
 

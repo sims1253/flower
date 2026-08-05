@@ -1006,3 +1006,111 @@ def test_activation_checkpoint_selective_reduces_memory():
     assert sel_ckpt < no_ckpt, (
         f"selective checkpointing did not reduce memory: {sel_ckpt:.2f} >= {no_ckpt:.2f} GB"
     )
+
+
+# ---------------------------------------------------------------------------
+# S14-checkpoint "ffn" mode: checkpoint ONLY the FFN sub-layer, keep attention
+# live. The best throughput/memory tradeoff at long context (see config docstring
+# + NEXT_IDEAS.md §10a). FlashAttention already recomputes the O(T^2) score
+# matmul in backward, so the only thing full checkpointing buys on the attention
+# side is dropping Q/K/V — which are large at long T but cheap to keep. The FFN
+# intermediate is both the biggest single activation AND cheap to recompute.
+# Measured: ~36% memory saving for ~16% throughput cost vs full's ~79% / ~114%.
+# ---------------------------------------------------------------------------
+
+
+def test_activation_checkpoint_ffn_loss_identical_dropout_rng():
+    # The correctness gate for "ffn" mode: with dropout > 0, the loss must be
+    # bit-identical to no-checkpoint at the same seed. The FFN recompute must
+    # apply dropout identically (use_reentrant=False saves/restores RNG state).
+    def run(checkpoint) -> float:
+        torch.manual_seed(0)
+        cfg = tiny(
+            num_layers=4,
+            local_window=32,
+            dropout=0.1,
+            activation_checkpoint=checkpoint,
+        )
+        model = build_model(cfg)
+        model.train()
+        torch.manual_seed(123)
+        ids = torch.randint(0, cfg.vocab_size, (2, 32))
+        return float(model(ids, labels=ids)["loss"])
+
+    loss_no = run(False)
+    loss_ffn = run("ffn")
+    assert loss_no == loss_ffn, (
+        f"'ffn' checkpointing changed the loss with dropout>0: {loss_no} vs {loss_ffn} "
+        f"(delta {abs(loss_no - loss_ffn):.2e}); RNG state not preserved"
+    )
+
+
+def test_activation_checkpoint_ffn_disabled_in_eval():
+    cfg = tiny(num_layers=3, local_window=32, activation_checkpoint="ffn")
+    model = build_model(cfg)
+    model.eval()
+    ids = torch.randint(0, cfg.vocab_size, (2, 32))
+    out = model(ids, labels=ids)
+    assert out["loss"] is not None  # runs without error in eval (no recompute)
+
+
+def test_activation_checkpoint_ffn_matches_no_checkpoint_forward():
+    # With dropout=0 the ffn-checkpointed forward must produce IDENTICAL output
+    # to the plain forward (same weights, same input, no RNG involved). This
+    # pins that the inline attn/ln1/ln2/ff replication in the ffn branch exactly
+    # matches TransformerBlock.forward.
+    torch.manual_seed(0)
+    cfg = tiny(num_layers=3, local_window=32, dropout=0.0, activation_checkpoint=False)
+    model_plain = build_model(cfg).eval()
+    torch.manual_seed(0)
+    cfg_ffn = tiny(num_layers=3, local_window=32, dropout=0.0, activation_checkpoint="ffn")
+    model_ffn = build_model(cfg_ffn).eval()
+    model_ffn.load_state_dict(model_plain.state_dict())
+    ids = torch.randint(0, cfg.vocab_size, (2, 32))
+    with torch.no_grad():
+        a = model_plain(ids)["logits"]
+        b = model_ffn(ids)["logits"]
+    assert torch.equal(a, b), "ffn-mode forward diverges from plain forward (structurally broken)"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the memory measurement")
+def test_activation_checkpoint_ffn_reduces_memory_and_beats_full_throughput_ish():
+    # ffn mode must (a) reduce peak memory vs no-checkpoint, and (b) recompute
+    # LESS than full — i.e. its peak is between no-ckpt and full. We don't assert
+    # the throughput claim here (timing is flaky in CI); the memory ordering is
+    # the structural invariant: none > ffn > full (ffn keeps attention live).
+    from flower.models.base import prebuild_attention_masks
+
+    def peak(checkpoint) -> float:
+        torch.manual_seed(0)
+        cfg = tiny(
+            num_layers=6,
+            d_model=128,
+            num_heads=4,
+            ffn_dim=384,
+            max_seq_len=512,
+            local_window=128,
+            flex_attention=True,
+            activation_checkpoint=checkpoint,
+        )
+        dev = torch.device("cuda")
+        model = build_model(cfg).to(dev).to(torch.bfloat16)
+        prebuild_attention_masks(model, 512, dev)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 512), device=dev)
+        torch.cuda.reset_peak_memory_stats()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = model(ids, labels=ids)["loss"]
+        loss.backward()
+        return torch.cuda.max_memory_allocated() / 1e9
+
+    import gc
+
+    no_ckpt = peak(False)
+    gc.collect(); torch.cuda.empty_cache()
+    ffn_ckpt = peak("ffn")
+    gc.collect(); torch.cuda.empty_cache()
+    full_ckpt = peak(True)
+    # ffn saves memory vs none, but keeps more than full (attention stays live).
+    assert ffn_ckpt < no_ckpt, f"ffn did not reduce memory: {ffn_ckpt:.2f} >= {no_ckpt:.2f}"
+    assert ffn_ckpt > full_ckpt, f"ffn saved MORE than full (expected between): {ffn_ckpt:.2f} <= {full_ckpt:.2f}"

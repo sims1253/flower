@@ -56,7 +56,11 @@ model:
   init_scheme: scaled
   init_std: 0.02
   flex_attention: true
-  activation_checkpoint: true   # the seq=32K enabler (see header)
+  activation_checkpoint: "ffn"   # FFN-only checkpointing: the best throughput/
+                                 # memory tradeoff (see NEXT_IDEAS.md §10a). At
+                                 # seq=32K: ~10GB peak, ~16% throughput cost vs
+                                 # full's ~100% cost. true (full) fits in less
+                                 # memory (~3GB) but halves throughput.
 
 data:
   dataset: fineweb_edu
