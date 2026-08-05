@@ -17,6 +17,7 @@ from flower.models.attn_res import DepthRouter, routing_sites
 # Imported lazily so the module still loads on builds without the symbol and so
 # CPU tests that never enable the flag pay no import cost.
 _flex_attention: Any = None
+_flex_attention_compiled: Any = None
 _create_block_mask: Any = None
 
 
@@ -32,6 +33,27 @@ def _load_flex_attention() -> tuple[Any, Any]:
         _flex_attention = _fa
         _create_block_mask = _cbm
     return _flex_attention, _create_block_mask
+
+
+def _load_flex_attention_compiled() -> Any:
+    """Return a torch.compiled flex_attention callable (S14-checkpoint).
+
+    The fused CUDA flex kernel is obtained automatically when the *outer* model
+    is torch.compiled, but activation checkpointing recomputes the block forward
+    in a context the outer graph does not cover — so during recompute flex falls
+    back to its eager ``math_attention`` path, which materializes the full
+    (B, H, T, T) scores tensor and OOMs at long context (e.g. seq=8192 already
+    needs ~3 GB just for scores). Compiling ``flex_attention`` as a standalone
+    callable makes the fused kernel available in the recompute too, which is
+    what makes activation checkpointing + FlexAttention coexist (pytorch#147879
+    documents the incompatibility; pre-compiling flex is the working workaround).
+    Built lazily so CPU/no-flex tests pay nothing.
+    """
+    global _flex_attention_compiled
+    if _flex_attention_compiled is None:
+        flex_attention, _ = _load_flex_attention()
+        _flex_attention_compiled = torch.compile(flex_attention)
+    return _flex_attention_compiled
 
 
 # S14-5b: Liger FusedLinearCrossEntropy fuses the tied lm_head matmul + CE so
@@ -60,6 +82,53 @@ def _load_liger_fce() -> Any:
         except Exception:
             _liger_fce_cls = False
     return _liger_fce_cls if _liger_fce_cls is not False else None
+
+
+# S14-selective: byte-threshold policy for selective activation checkpointing.
+# Activations whose storage meets this threshold are recomputed during backward
+# (dropped from the saved-for-backward set); smaller ones stay materialized.
+# The dominant activation in a SwiGLU/GELU block is the FFN intermediate
+# (B, T, ffn_dim) — at 100M/seq8192/b4/bf16 that is ~134 MiB/layer, far above
+# the threshold — so the default policy targets it while keeping the residual
+# stream (B, T, d_model, ~6 MiB) and the norm outputs materialized. The
+# threshold is deliberately a few MiB so it lands between those two scales.
+_SELECTIVE_CKPT_BYTE_THRESHOLD = 8 * 1024 * 1024  # 8 MiB
+
+
+def _selective_checkpoint_context_fn(*, threshold_bytes: int = _SELECTIVE_CKPT_BYTE_THRESHOLD) -> Any:
+    """Build a ``context_fn`` for selective activation checkpointing.
+
+    Returns a callable suitable as ``context_fn=`` to
+    ``torch.utils.checkpoint.checkpoint``: a ``functools.partial`` over
+    ``create_selective_checkpoint_contexts`` whose policy recomputes any op
+    output whose storage is >= ``threshold_bytes`` and saves everything else.
+
+    The policy inspects ``ctx.op_output`` (a tensor) and returns
+    ``CheckpointPolicy.MUST_RECOMPUTE`` for large tensors (drop them so they
+    are recomputed in backward) and ``CheckpointPolicy.MUST_SAVE`` for small
+    ones (keep them materialized — no recompute). Non-tensor outputs are saved.
+    Equivalent in spirit to the default byte-threshold policy described in the
+    PyTorch selective-checkpointing docs, expressed as an explicit policy_fn so
+    it works on any torch version that ships ``create_selective_checkpoint_contexts``.
+    """
+    import functools
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    def policy_fn(ctx, op, *args, **kwargs):
+        out = ctx.op_output
+        if isinstance(out, torch.Tensor):
+            try:
+                nbytes = out.numel() * out.element_size()
+            except Exception:
+                nbytes = 0
+            if nbytes >= threshold_bytes:
+                return CheckpointPolicy.MUST_RECOMPUTE
+        return CheckpointPolicy.MUST_SAVE
+
+    return functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
 def make_causal_local_block_mask(
@@ -404,6 +473,14 @@ class CausalSelfAttention(nn.Module):
         # S1 (FlexAttention). Opt-in; the SDPA path stays the default so the
         # existing (non-flex) tests and published runs reproduce bit-for-bit.
         self.use_flex = bool(getattr(config, "flex_attention", False))
+        # S14-checkpoint: when activation checkpointing wraps the block forward,
+        # flex must use its standalone-compiled fused kernel so the recompute
+        # (which the outer torch.compile graph does not cover) still runs fused
+        # instead of falling back to the OOM-prone dense math path. See
+        # _load_flex_attention_compiled.
+        self._flex_needs_compile = self.use_flex and bool(
+            getattr(config, "activation_checkpoint", False)
+        )
         # Block-mask cache: create_block_mask is expensive (it compiles). The
         # mask only changes when seq_len or local_window changes, so cache it.
         self._cached_block_mask: Any = None
@@ -479,7 +556,13 @@ class CausalSelfAttention(nn.Module):
         # (B, H, T, T) tensor is ever materialized. The fused CUDA kernel is
         # obtained automatically when the outer model is torch.compiled; in eager
         # mode flex_attention still runs (unfused) — correct, just not fast.
-        flex_attention, _ = _load_flex_attention()
+        # S14-checkpoint: when activation checkpointing is on, use the
+        # standalone-compiled flex so the recompute forward also gets the fused
+        # kernel (otherwise it OOMs materializing the dense scores).
+        if self._flex_needs_compile:
+            flex_attention = _load_flex_attention_compiled()
+        else:
+            flex_attention, _ = _load_flex_attention()
         block_mask = self._get_block_mask(seq_len, q.device)
         if self.kernel_bias == "rbf":
             # Per-head RBF scale; close over the current parameter value so the
@@ -548,6 +631,10 @@ class CausalLM(nn.Module):
         # device is not CUDA. See `_fused_cross_entropy`.
         self.fused_linear_ce = bool(getattr(config, "fused_linear_ce", False))
         self._liger_fce: Any = None
+        # S14-checkpoint: activation checkpointing on the transformer blocks.
+        # Stored verbatim (False | True | "selective") so forward can branch on
+        # the mode. bool() would collapse "selective" to True and lose the mode.
+        self.activation_checkpoint = getattr(config, "activation_checkpoint", False)
         # S8: auxiliary Multi-Token-Prediction heads for t+2, t+3, ... These are
         # untied heads on the already-normed hidden state; the main tied head
         # still predicts t+1. None when mtp_extra_heads <= 0 (legacy default).
@@ -796,9 +883,58 @@ class CausalLM(nn.Module):
         # loop_count=1 reproduces the standard single-pass behaviour.
         loops = max(1, getattr(self.config, "loop_count", 1))
         if self.depth_router is None:
-            for _ in range(loops):
-                for block in self.blocks:
-                    x, memory = block(x, memory)
+            # S14-checkpoint: activation checkpointing on each block during
+            # training. Activations are not retained for backward (recomputed
+            # from the block inputs instead), cutting activation memory from
+            # O(num_layers) to O(1) at the cost of one extra forward per
+            # backward. use_reentrant=False preserves the differentiable memory
+            # tensor carried between blocks and saves/restores RNG state so
+            # dropout is identical across the two passes (verified by a
+            # same-seed loss-identity test). Skipped in eval (no backward, so
+            # checkpointing only wastes the recompute) and when the flag is off.
+            # Loop count > 1 is left uncheckpointed: the shared memory state
+            # across loops makes per-loop checkpointing interact subtly with
+            # the carried memory, and loop_count>1 is not used in the
+            # long-context configs this targets.
+            #
+            # activation_checkpoint values:
+            #   False  -> off (legacy)
+            #   True   -> full checkpointing (recompute every activation)
+            #   "selective" -> recompute only large activations (FFN
+            #     intermediate); keep cheap ones (residual stream) materialized.
+            #     Uses create_selective_checkpoint_contexts (torch 2.13) with a
+            #     byte-threshold policy via context_fn. The flex-compile
+            #     workaround still applies (selective also recomputes flex).
+            do_ckpt = (
+                self.training
+                and self.activation_checkpoint
+                and loops == 1
+            )
+            if do_ckpt:
+                from torch.utils.checkpoint import checkpoint
+
+                if self.activation_checkpoint == "selective":
+                    # Selective: build the byte-threshold context_fn once
+                    # (it is stateless per call) and reuse across layers.
+                    context_fn = _selective_checkpoint_context_fn()
+                    for block in self.blocks:
+                        x, memory = checkpoint(
+                            block, x, memory,
+                            use_reentrant=False,
+                            context_fn=context_fn,
+                        )
+                else:
+                    for block in self.blocks:
+                        # memory=None on the first block; checkpoint requires at
+                        # least one input that requires grad, which `x` (coming
+                        # from the embedding) does under training. Passing
+                        # use_reentrant=False avoids the reentrant variant's RNG
+                        # and grad-input quirks and handles memory=None correctly.
+                        x, memory = checkpoint(block, x, memory, use_reentrant=False)
+            else:
+                for _ in range(loops):
+                    for block in self.blocks:
+                        x, memory = block(x, memory)
         else:
             # Delta Block AttnRes: sources are the embedding plus one delta per
             # completed block. At each site the router additively mixes the

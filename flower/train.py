@@ -244,6 +244,17 @@ def update_attention_windows(model: torch.nn.Module, step: int, cfg) -> None:
     cfg.model.attn_warmup_start to cfg.model.local_window over
     cfg.model.attn_warmup_steps steps, then holds at local_window.
     No-op when attn_warmup_steps == 0 (the default: use local_window always).
+
+    When ``attn_warmup_quantize > 0`` the ramp is quantised: the target window
+    only changes every ``quantize`` steps, so a warmup of N steps produces at
+    most ``ceil(N / quantize)`` distinct windows instead of N. Each distinct
+    window forces a FlexAttention ``create_block_mask`` recompile (its
+    ``mask_mod`` closure captures the window), so without quantising the ramp
+    exhausts torch.compile's recompile limit and flex falls back to the eager
+    dense path. Quantising keeps the recompile count under the limit (default
+    8) while preserving the ramp's training-dynamics benefit. The final window
+    is always ``local_window``; ``quantize`` is a step-stride (number of steps
+    between window changes), not a window-value grid.
     """
     if getattr(cfg.model, "attn_warmup_steps", 0) == 0:
         return
@@ -251,7 +262,15 @@ def update_attention_windows(model: torch.nn.Module, step: int, cfg) -> None:
     if step >= cfg.model.attn_warmup_steps:
         target = cfg.model.local_window
     else:
-        frac = step / max(1, cfg.model.attn_warmup_steps)
+        # `quantize` is a step-stride: only advance the ramp every `quantize`
+        # steps, holding the window constant in between. This bounds the number
+        # of distinct windows (= create_block_mask recompiles) to
+        # ceil(warmup_steps / quantize). Without it the per-step ramp exhausts
+        # torch.compile's recompile limit. Snap the *effective step* down to
+        # the nearest quantize boundary so each plateau is constant.
+        quantize = int(getattr(cfg.model, "attn_warmup_quantize", 0) or 0)
+        eff_step = step if quantize <= 1 else (step // quantize) * quantize
+        frac = eff_step / max(1, cfg.model.attn_warmup_steps)
         target = int(round(cfg.model.attn_warmup_start + frac * (cfg.model.local_window - cfg.model.attn_warmup_start)))
     for module in model.modules():
         lw = getattr(module, "local_window", None)
@@ -339,6 +358,26 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     # reference makes state_dict keys stable across compiled/uncompiled runs.
     optim_or_list = build_optimizer(model, cfg.training)
     eager_model = model
+    # CUDAGraph (reduce-overhead) + gradient accumulation is a known
+    # torch.compile limitation: the captured graph pins the `.grad` tensor
+    # addresses, but accumulation reuses them across micro-steps and the graph
+    # replay then reads a buffer that a later replay has already overwritten
+    # ("accessing gradient tensor output of CUDAGraphs that has been
+    # overwritten... when a .grad tensor is allocated during CUDAGraph capture").
+    # The error's own suggested fix is to allocate stable `.grad` buffers
+    # *outside* CUDAGraph capture before the compiled backward runs, so the
+    # graph captures their (now-stable) addresses. We do that by directly
+    # assigning `p.grad = torch.zeros_like(p)` before the training loop (see
+    # below) and keeping those buffers allocated across the run
+    # (zero_grad(set_to_none=False) below). With accum == 1 this is unnecessary,
+    # so we skip it. See pytorch/pytorch#169545 — standard workarounds
+    # (mark_step_begin, cloning) do not fix it; only pre-allocated buffers do.
+    use_persistent_grads = (
+        cfg.training.compile_model
+        and cfg.training.compile_mode == "reduce-overhead"
+        and int(cfg.training.gradient_accumulation_steps) > 1
+        and device.type == "cuda"
+    )
     if cfg.training.compile_model:
         # The diagnostics walk uses dir()/getattr over every submodule, which
         # Dynamo cannot trace; leaving it on would graph-break every forward.
@@ -437,6 +476,26 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
 
     model.train()
     shm_watchdog = start_shm_watchdog()
+    # CUDAGraph + grad-accum warmup (see `use_persistent_grads` above):
+    # pre-allocate a zeroed `.grad` tensor for every trainable parameter *before*
+    # CUDAGraph capture, so the graph pins those (now-stable) addresses instead
+    # of allocating fresh `.grad` tensors during capture (which then get
+    # overwritten on the next replay — the "accessing gradient tensor output of
+    # CUDAGraphs that has been overwritten" error). This is the fix the error
+    # message itself suggests ("preallocating zeroed .grad tensors") and the only
+    # one that works in torch 2.13 (mark_step_begin / cloning do not — see
+    # pytorch/pytorch#169545). We allocate directly rather than via an eager
+    # backward so flex-attention stays on its fused compiled kernel (the eager
+    # backward would materialise the T x T scores matrix and can OOM at long
+    # context). The buffers are kept across the run via zero_grad(set_to_none=
+    # False) below. Skipped unless the combination is active, so default-mode
+    # and accum==1 runs are unaffected. Cost: +1x params worth of `.grad`
+    # memory, which is already the steady-state cost of any backward.
+    if use_persistent_grads:
+        for p in eager_model.parameters():
+            if p.requires_grad:
+                p.grad = torch.zeros_like(p)
+        print("[compile] persistent .grad buffers allocated for reduce-overhead + grad accumulation")
     try:
         for step in range(resume_step + 1, cfg.training.steps + 1):
             update_attention_windows(eager_model, step, cfg)
@@ -444,7 +503,10 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 eager_model.set_step(step)
             accum_steps = max(1, int(cfg.training.gradient_accumulation_steps))
             for opt in optims:
-                opt.zero_grad(set_to_none=True)
+                # Keep pre-allocated `.grad` buffers (stable addresses for
+                # CUDAGraph replay) when reduce-overhead + accumulation is on;
+                # otherwise free them (the standard, lower-memory path).
+                opt.zero_grad(set_to_none=not use_persistent_grads)
             # Accumulate the loss on-device: the previous float(...cpu()) here
             # forced a host sync once per micro-step (8x per optimizer step at
             # accum=8), serialising the pipeline for a number only read at

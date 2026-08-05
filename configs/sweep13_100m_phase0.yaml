@@ -121,4 +121,8 @@ training:
   # --- next-gen pipeline ---
   precision: bf16           # TF32 matmuls + bf16 autocast; fp32 master weights
   compile_model: true
-  compile_mode: default     # `reduce-overhead` adds CUDA graphs; try after this works
+  # `default` measured faster than `reduce-overhead` here: seq1024/b16/accum4 is
+  # a high-launch-rate shape where CUDA-graph capture overhead outweighs the
+  # launch savings (measured -7%: 90k -> 84k tok/s). reduce-overhead wins on the
+  # long-context compute-bound shapes (see sweep13_100m_longctx_phase0.yaml).
+  compile_mode: default

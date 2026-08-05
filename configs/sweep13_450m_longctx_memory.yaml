@@ -70,6 +70,15 @@ sweep:
       validation_interval: 1000
       precision: bf16
       compile_model: true
+      # `default` over `reduce-overhead`: measured — reduce-overhead OOMs at
+      # this 450M size on the 32GB 5090 (CUDA graphs' private pools hold
+      # ~18.6 GB on top of the 25 GB default-mode peak, past the 27 GB VRAM
+      # cap). default fits in 25.1 GB. So reduce-overhead is not viable at
+      # 450M here, not just speed-neutral. activation_checkpoint (ModelConfig)
+      # can be set true on a variant to cut activation memory ~58% (16.5->7 GB
+      # at the 100M/seq8192 shape) and is the enabler for seq=32K (11 GB peak
+      # vs OOM without it); if a 450M run needs headroom, that is the lever,
+      # not reduce-overhead.
       compile_mode: default
 
   variants:

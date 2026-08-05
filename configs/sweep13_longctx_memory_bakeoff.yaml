@@ -101,6 +101,10 @@ sweep:
       validation_interval: 500
       precision: bf16
       compile_model: true
+      # `default` over `reduce-overhead`: measured -2% on the bloom arm at this
+      # shape (seq8192/b8/accum2, d512/L8). reduce-overhead is not a universal
+      # win — keep default here. The +7.7% win is specific to the 100M longctx
+      # compute-bound shape (see sweep13_100m_longctx_phase0.yaml).
       compile_mode: default
 
   variants:

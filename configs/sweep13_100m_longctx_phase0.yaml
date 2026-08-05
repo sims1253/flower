@@ -107,4 +107,13 @@ training:
   # --- next-gen pipeline ---
   precision: bf16
   compile_model: true
-  compile_mode: default
+  # reduce-overhead = CUDA graphs. Measured +7.7% tokens/sec over `default` at
+  # this config (seq8192/b4/accum2, flex+local, RTX 5090): 77.2k -> 83.2k tok/s.
+  # This is the long-step compute-bound shape where launch-overhead elimination
+  # pays off. train.py pre-allocates persistent .grad buffers for reduce-overhead
+  # + grad accumulation (the only combination that works — see the note in
+  # flower/train.py and pytorch/pytorch#169545). Losses match `default` within
+  # noise at the same seed. NOTE: reduce-overhead is shape-dependent — it was
+  # -7% at seq1024/b16 and -2% on the small bloom variant, so it is NOT a
+  # universal flip; measure each config before adopting.
+  compile_mode: reduce-overhead

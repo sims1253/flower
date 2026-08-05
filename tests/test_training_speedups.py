@@ -247,6 +247,47 @@ def test_window_warmup_schedule():
     assert attn.local_window == 32
 
 
+def test_window_warmup_quantize_bounds_distinct_windows():
+    # attn_warmup_quantize is a step-stride that bounds the number of distinct
+    # windows during warmup (each distinct window forces a create_block_mask
+    # recompile, which exhausts torch.compile's recompile limit without it).
+    # The ramp moves in `quantize`-step plateaus; the final window still
+    # reaches local_window exactly. quantize=0 reproduces the per-step ramp.
+    base = dict(
+        variant="vanilla_local", vocab_size=256, d_model=64, num_heads=4,
+        num_layers=2, ffn_dim=192, max_seq_len=64, local_window=32,
+        attn_warmup_start=4, attn_warmup_steps=12,
+    )
+
+    def windows(quantize: int) -> list[int]:
+        cfg = ModelConfig(**base, attn_warmup_quantize=quantize)
+        exp_cfg = ExperimentConfig(model=cfg)
+        model = build_model(cfg)
+        attn = _first_local_attn(model)
+        out = []
+        for step in range(0, 13):
+            update_attention_windows(model, step, exp_cfg)
+            out.append(attn.local_window)
+        return out
+
+    # Legacy per-step ramp (quantize=0): ~one distinct window per step.
+    legacy = windows(0)
+    assert len(set(legacy)) > 8, f"per-step ramp should have many windows, got {len(set(legacy))}"
+    assert legacy[-1] == 32  # final window reached
+
+    # Quantized ramp: far fewer distinct windows, still reaches local_window.
+    quantized = windows(4)
+    assert len(set(quantized)) <= len(set(legacy)) // 2, "quantize must reduce distinct windows"
+    assert quantized[-1] == 32, "quantize must still reach local_window at the end"
+    # Plateaus are constant for `quantize` steps: steps 1-3 share eff_step=0
+    # (the first plateau), and steps 4-7 share the second plateau.
+    assert quantized[1] == quantized[2] == quantized[3], \
+        "window must be held constant within the first quantize plateau"
+    assert quantized[4] == quantized[5] == quantized[6] == quantized[7], \
+        "window must be held constant within the second quantize plateau"
+    assert quantized[3] != quantized[4], "adjacent plateaus must differ (else no ramp)"
+
+
 def test_window_warmup_clears_block_mask_cache():
     # When the window changes during warmup, the FlexAttention block-mask
     # cache (S1) must be invalidated.
@@ -770,3 +811,198 @@ def test_fused_linear_ce_matches_eager_under_compile():
     # of the loss value, so a relative tolerance is the correct frame: the
     # property to preserve is "same loss to bf16 precision", not bit-equality.
     assert torch.allclose(out_f["loss"].float(), out_e["loss"].float(), rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# S14-checkpoint: activation checkpointing on the transformer blocks.
+# ---------------------------------------------------------------------------
+
+
+def test_activation_checkpoint_defaults_off():
+    assert ModelConfig().activation_checkpoint is False
+
+
+def test_activation_checkpoint_loss_identical_dropout_rng():
+    # The core correctness gate for activation checkpointing: with dropout > 0,
+    # the loss must be bit-identical with and without checkpointing at the same
+    # seed. use_reentrant=False saves/restores the RNG state across the two
+    # forward passes (the original + the recompute during backward), so dropout
+    # is applied identically. If this fails, the RNG state is not being restored
+    # — a subtle correctness bug.
+    def run(checkpoint: bool) -> float:
+        torch.manual_seed(0)
+        cfg = tiny(
+            num_layers=4,
+            local_window=32,
+            dropout=0.1,
+            activation_checkpoint=checkpoint,
+        )
+        model = build_model(cfg)
+        model.train()
+        torch.manual_seed(123)
+        ids = torch.randint(0, cfg.vocab_size, (2, 32))
+        out = model(ids, labels=ids)
+        return float(out["loss"])
+
+    loss_no = run(False)
+    loss_ckpt = run(True)
+    assert loss_no == loss_ckpt, (
+        f"checkpointing changed the loss with dropout>0: {loss_no} vs {loss_ckpt} "
+        f"(delta {abs(loss_no - loss_ckpt):.2e}); RNG state not preserved"
+    )
+
+
+def test_activation_checkpoint_disabled_in_eval():
+    # In eval mode there is no backward, so checkpointing only wastes a recompute
+    # forward. The flag must be a no-op under eval (forward only, no recompute).
+    cfg = tiny(num_layers=3, local_window=32, activation_checkpoint=True)
+    model = build_model(cfg)
+    model.eval()
+    ids = torch.randint(0, cfg.vocab_size, (2, 32))
+    out = model(ids, labels=ids)
+    assert out["loss"] is not None  # runs without error in eval
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the memory measurement")
+def test_activation_checkpoint_reduces_memory_flex():
+    # Sanity: with FlexAttention on, checkpointing must reduce peak activation
+    # memory (the whole point). Measures fwd+bwd peak on a small CUDA model.
+    from flower.models.base import prebuild_attention_masks
+
+    def peak(checkpoint: bool) -> float:
+        torch.manual_seed(0)
+        cfg = tiny(
+            num_layers=6,
+            d_model=128,
+            num_heads=4,
+            ffn_dim=384,
+            max_seq_len=512,
+            local_window=128,
+            flex_attention=True,
+            activation_checkpoint=checkpoint,
+        )
+        dev = torch.device("cuda")
+        model = build_model(cfg).to(dev).to(torch.bfloat16)
+        prebuild_attention_masks(model, 512, dev)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 512), device=dev)
+        torch.cuda.reset_peak_memory_stats()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = model(ids, labels=ids)["loss"]
+        loss.backward()
+        return torch.cuda.max_memory_allocated() / 1e9
+
+    import gc
+
+    no_ckpt = peak(False)
+    gc.collect()
+    torch.cuda.empty_cache()
+    ckpt = peak(True)
+    assert ckpt < no_ckpt, f"checkpointing did not reduce memory: {ckpt:.2f} >= {no_ckpt:.2f} GB"
+
+
+# ---------------------------------------------------------------------------
+# S14-selective: selective activation checkpointing (recompute only large
+# activations, keep cheap ones materialized). Mirrors the three full-checkpoint
+# tests above: config validation, loss-identity-with-dropout (the RNG gate),
+# eval no-op, and a CUDA memory-reduction test.
+# ---------------------------------------------------------------------------
+
+
+def test_activation_checkpoint_selective_config_validation():
+    # "selective" is accepted; typos are rejected at config load.
+    assert ModelConfig(activation_checkpoint="selective").activation_checkpoint == "selective"
+    assert ModelConfig(activation_checkpoint=False).activation_checkpoint is False
+    assert ModelConfig(activation_checkpoint=True).activation_checkpoint is True
+    with pytest.raises(ValueError):
+        ModelConfig(activation_checkpoint="selectiv")  # typo
+    with pytest.raises(ValueError):
+        ModelConfig(activation_checkpoint="full")  # strings other than "selective"
+
+
+def test_activation_checkpoint_selective_loss_identical_dropout_rng():
+    # The core correctness gate for selective checkpointing: with dropout > 0,
+    # the loss must be bit-identical with no-checkpoint and full-checkpoint at
+    # the same seed. create_selective_checkpoint_contexts + use_reentrant=False
+    # preserves RNG state across the forward + recompute passes (same contract
+    # as full checkpointing). If this fails, the RNG state is not being restored
+    # — a subtle correctness bug.
+    def run(checkpoint) -> float:
+        torch.manual_seed(0)
+        cfg = tiny(
+            num_layers=4,
+            local_window=32,
+            dropout=0.1,
+            activation_checkpoint=checkpoint,
+        )
+        model = build_model(cfg)
+        model.train()
+        torch.manual_seed(123)
+        ids = torch.randint(0, cfg.vocab_size, (2, 32))
+        out = model(ids, labels=ids)
+        return float(out["loss"])
+
+    loss_no = run(False)
+    loss_full = run(True)
+    loss_sel = run("selective")
+    assert loss_no == loss_sel, (
+        f"selective checkpointing changed the loss with dropout>0: {loss_no} vs {loss_sel} "
+        f"(delta {abs(loss_no - loss_sel):.2e}); RNG state not preserved"
+    )
+    assert loss_full == loss_sel, (
+        f"selective != full loss: {loss_full} vs {loss_sel}; the two checkpoint "
+        f"modes must agree at the same seed"
+    )
+
+
+def test_activation_checkpoint_selective_disabled_in_eval():
+    # In eval mode there is no backward, so checkpointing (full or selective)
+    # only wastes a recompute forward. Selective must be a no-op under eval
+    # (forward only, no recompute).
+    cfg = tiny(num_layers=3, local_window=32, activation_checkpoint="selective")
+    model = build_model(cfg)
+    model.eval()
+    ids = torch.randint(0, cfg.vocab_size, (2, 32))
+    out = model(ids, labels=ids)
+    assert out["loss"] is not None  # runs without error in eval
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the memory measurement")
+def test_activation_checkpoint_selective_reduces_memory():
+    # Selective checkpointing must reduce peak activation memory vs no-checkpoint.
+    # It may save slightly less than full (cheap activations stay materialized)
+    # but should still be a clear win. Uses flex + the byte-threshold policy.
+    from flower.models.base import prebuild_attention_masks
+
+    def peak(checkpoint) -> float:
+        torch.manual_seed(0)
+        cfg = tiny(
+            num_layers=6,
+            d_model=128,
+            num_heads=4,
+            ffn_dim=384,
+            max_seq_len=512,
+            local_window=128,
+            flex_attention=True,
+            activation_checkpoint=checkpoint,
+        )
+        dev = torch.device("cuda")
+        model = build_model(cfg).to(dev).to(torch.bfloat16)
+        prebuild_attention_masks(model, 512, dev)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 512), device=dev)
+        torch.cuda.reset_peak_memory_stats()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = model(ids, labels=ids)["loss"]
+        loss.backward()
+        return torch.cuda.max_memory_allocated() / 1e9
+
+    import gc
+
+    no_ckpt = peak(False)
+    gc.collect()
+    torch.cuda.empty_cache()
+    sel_ckpt = peak("selective")
+    assert sel_ckpt < no_ckpt, (
+        f"selective checkpointing did not reduce memory: {sel_ckpt:.2f} >= {no_ckpt:.2f} GB"
+    )

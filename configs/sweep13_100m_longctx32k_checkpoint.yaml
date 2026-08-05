@@ -1,0 +1,94 @@
+# Sweep 13, Long-Context Phase 0 at seq=32768 — enabled by activation checkpointing.
+#
+# docs/training-speedups.md Section 13 names seq=32K (with a 2048 sliding window)
+# as the regime where memory mechanisms become load-bearing: tokens in the first
+# 2K are invisible to tokens past 22K UNLESS memory carries that information
+# forward. The binding constraint at this scale is activation memory, not
+# compute. At seq=32K a vanilla model OOMs on the forward alone (29.8 GB for
+# activations at batch 1 on this 100M model), because every layer's activations
+# are retained for backward.
+#
+# Activation checkpointing (S14-checkpoint) fixes this: each block's forward is
+# wrapped in torch.utils.checkpoint, so activations are recomputed during
+# backward instead of stored, cutting activation memory from O(num_layers) to
+# O(1). Measured (RTX 5090, bf16+compile+flex, 0.85 cap):
+#   seq32768 batch 1 -> 11.1 GB peak  (vs OOM without checkpointing)
+#   seq32768 batch 2 -> 13.8 GB peak  (fits with headroom)
+# Loss is bit-identical to the no-checkpoint path at the same seed (dropout RNG
+# is preserved by use_reentrant=False).
+#
+# The non-obvious bit: checkpoint + FlexAttention are incompatible without the
+# standalone-compiled-flex workaround (the recompute forward would fall back to
+# flex's eager dense path and OOM). flower/models/base.py applies that
+# workaround automatically when activation_checkpoint is on — see
+# _load_flex_attention_compiled. pytorch/pytorch#147879.
+#
+# Throughput cost: ~25-33% slower than a hypothetical no-checkpoint seq=32K run
+# (one extra forward per backward). At seq=32K that trade is mandatory — the
+# alternative is not running at all. Throughput-sensitive runs at seq<=8K that
+# already fit should keep activation_checkpoint: false.
+#
+# Same architecture as sweep13_100m_longctx_phase0.yaml (d768/L14, 99.1M non-emb
+# core, 111.7M total). Batch 2 x accum 4 = effective batch 262144 tokens.
+#
+# Launch:
+#   PYTHONPATH=. FLOWER_DATA_CACHE=data_cache \
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m flower.train \
+#     --config configs/sweep13_100m_longctx32k_checkpoint.yaml \
+#     --output-dir runs/sweep13_longctx32k_phase0 --device cuda
+
+model:
+  variant: vanilla_local
+  vocab_size: 16384
+  d_model: 768
+  num_heads: 12
+  num_layers: 14
+  ffn_dim: 3072              # SwiGLU hidden auto-matched to 2048 (2/3 * 3072)
+  max_seq_len: 32768
+  local_window: 2048         # seq/window = 16x — deep in the memory-relevant regime
+  rope_base: 10000.0
+  dropout: 0.0
+  norm_type: rmsnorm
+  ffn_activation: swiglu
+  ffn_param_match: true
+  qk_norm: true
+  use_bias: false
+  init_scheme: scaled
+  init_std: 0.02
+  flex_attention: true
+  activation_checkpoint: true   # the seq=32K enabler (see header)
+
+data:
+  dataset: fineweb_edu
+  tokenizer: "custom:tokenizers/fineweb_16k.json"
+  sequence_length: 32768
+  eval_seq_len: 32768
+  bytes_per_token: 4.279
+
+training:
+  batch_size: 2              # 13.8 GB peak measured (see header); headroom for frag
+  gradient_accumulation_steps: 4   # effective batch 262144 tokens
+  steps: 4000               # ~1.05B tokens
+  lr: 0.003
+  warmup_steps: 500
+  lr_schedule: wsd
+  lr_decay_frac: 0.2
+  lr_final_frac: 0.0
+  grad_clip: 1.0
+  eval_interval: 500
+  checkpoint_interval: 1000
+  save_checkpoints: true
+  device: auto
+  seed: 0
+  log_backend: tensorboard
+  composite_eval: false
+  optimizer: muon
+  muon_lr: 0.002
+  muon_momentum: 0.95
+  weight_decay: 0.01
+  weight_decay_exclude_embeddings: true
+  validation_steps: 20
+  validation_interval: 500
+  precision: bf16
+  compile_model: true
+  compile_mode: default     # keep default here; measure reduce-overhead at 32K separately

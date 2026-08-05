@@ -223,6 +223,20 @@ class ModelConfig:
     # attn_warmup_steps training steps. 0 disables (use local_window always).
     attn_warmup_start: int = 256
     attn_warmup_steps: int = 0
+    # S2/S14-bugfix: quantise the warmup window to coarse steps. Each distinct
+    # window value forces FlexAttention's create_block_mask to recompile (the
+    # mask_mod closure captures the window), so a per-step ramp over N warmup
+    # steps causes N recompiles and exhausts torch.compile's recompile limit
+    # (default 8), after which flex falls back to the eager dense path and
+    # throughput collapses. ``attn_warmup_quantize`` is the number of *steps*
+    # between window changes: the ramp is divided into
+    # ceil(warmup_steps / quantize) segments, each held at a constant window.
+    # e.g. quantize=32 over a 256-step warmup = 8 segments = 8 recompiles
+    # (under the limit). 0 = the legacy per-step ramp (a distinct window every
+    # step). The final window is always local_window regardless of quantize.
+    # The ramp's training-dynamics benefit (start narrow, widen) is preserved
+    # — it jumps in `quantize`-step plateaus instead of 1-position steps.
+    attn_warmup_quantize: int = 0
     # S3: FP8 matmul for the lm_head projection (Blackwell/Hopper, bf16 only).
     fp8_lm_head: bool = False
     # S4: compute cross-entropy in BF16 instead of FP32.
@@ -244,6 +258,35 @@ class ModelConfig:
     # the SwiGLU multiply numerically equivalent but with a narrower dynamic
     # range, stabilising FP8/FP4 training. No-op for GELU FFNs.
     smooth_swiglu: bool = False
+    # S14-checkpoint: activation checkpointing on the transformer blocks.
+    # Wraps each block's forward in torch.utils.checkpoint during training so
+    # activations are not retained for backward (recomputed from the block
+    # inputs instead), cutting activation memory from O(num_layers) saved
+    # tensors to O(1). Trades ~one extra forward per backward (~25-33% more
+    # compute) for a large activation-memory reduction — the enabler for
+    # seq=32K on the 32GB 5090 (Section 13). use_reentrant=False (the modern
+    # recommended path) preserves the differentiable memory tensor that flows
+    # between blocks and saves/restores RNG state so dropout is identical
+    # between the two passes. No-op in eval mode and when False (old runs
+    # reproduce exactly). AttnRes (depth_router) is incompatible: it reads
+    # inter-block deltas, so checkpointing is skipped when depth_router is set.
+    #
+    # Values:
+    #   False        -> off (default; old runs reproduce).
+    #   True         -> full checkpointing: recompute EVERY activation in the
+    #                   block during backward. Maximum memory saving, maximum
+    #                   recompute cost (~25-33% throughput loss).
+    #   "selective"  -> selective checkpointing: recompute only the large
+    #                   activations (default byte-threshold policy targets the
+    #                   FFN intermediate, the dominant tensor), keeping cheap
+    #                   ones (residual stream, norms) materialized so they are
+    #                   not recomputed. Recovers much of the throughput cost
+    #                   while retaining most of the memory saving. Uses
+    #                   torch.utils.checkpoint.create_selective_checkpoint_contexts
+    #                   (torch 2.13) with a context_fn + use_reentrant=False;
+    #                   the same RNG-state-save/restore and flex-compile
+    #                   workarounds as full checkpointing apply.
+    activation_checkpoint: bool | str = False
     # S12.2: orthogonal weight initialisation for 2D matrices (pairs with Muon).
     orthogonal_init: bool = False
     # S13: per-component precision routing (scaffolding). The actual FP4/FP8
@@ -273,6 +316,14 @@ class ModelConfig:
             )
         if self.head_precision not in {"bf16", "fp8"}:
             raise ValueError(f"head_precision must be bf16|fp8, got {self.head_precision!r}")
+        # S14-checkpoint: activation_checkpoint accepts False / True / "selective".
+        # bool|str validated here so a typo (e.g. "selectiv") fails loudly at
+        # config load rather than silently behaving like "off" in forward.
+        if self.activation_checkpoint not in {False, True, "selective"}:
+            raise ValueError(
+                f"activation_checkpoint must be False, True, or 'selective', "
+                f"got {self.activation_checkpoint!r}"
+            )
 
 
 @dataclass
