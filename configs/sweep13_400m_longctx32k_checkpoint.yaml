@@ -69,6 +69,7 @@ training:
   log_backend: tensorboard
   composite_eval: false
   optimizer: muon
+  ema_decay: 0.997          # eval-only EMA weight averaging (S12.4); zero training cost
   muon_lr: 0.0018
   muon_momentum: 0.95
   weight_decay: 0.01

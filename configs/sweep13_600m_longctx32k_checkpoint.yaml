@@ -82,7 +82,8 @@ training:
   seed: 0
   log_backend: tensorboard
   composite_eval: false
-  optimizer: muon            # Muon's 1x momentum (vs AdamW's 8x) is part of why this fits
+  optimizer: muon
+  ema_decay: 0.997          # eval-only EMA weight averaging (S12.4); zero training cost            # Muon's 1x momentum (vs AdamW's 8x) is part of why this fits
   muon_lr: 0.0015
   muon_momentum: 0.95
   weight_decay: 0.01
