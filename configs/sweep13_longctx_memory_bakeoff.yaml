@@ -59,6 +59,7 @@ sweep:
       use_bias: false
       init_scheme: scaled
       init_std: 0.02
+      bf16_cross_entropy: true     # CE in bf16 (doc S4)
       flex_attention: true       # the long-context enabler
       # Shared memory settings (used by the memory arms; ignored by vanilla).
       memory_slots: 8

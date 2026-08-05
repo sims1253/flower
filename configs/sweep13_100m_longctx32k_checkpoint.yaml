@@ -55,6 +55,7 @@ model:
   use_bias: false
   init_scheme: scaled
   init_std: 0.02
+  bf16_cross_entropy: true     # CE in bf16 (doc S4)
   flex_attention: true
   activation_checkpoint: "ffn"   # FFN-only checkpointing: the best throughput/
                                  # memory tradeoff (see NEXT_IDEAS.md §10a). At

@@ -74,6 +74,7 @@ model:
   use_bias: false
   init_scheme: scaled
   init_std: 0.02
+  bf16_cross_entropy: true     # CE in bf16 (doc S4)
 
 data:
   dataset: fineweb_edu

@@ -102,6 +102,7 @@ sweep:
         use_bias: false
         init_scheme: scaled
         init_std: 0.02
+        bf16_cross_entropy: true     # CE in bf16 (doc S4)
         flex_attention: true
 
     # bloom_memory: d1024/L20 = 481M total (+17% over vanilla from the memory bank).
@@ -125,6 +126,7 @@ sweep:
         use_bias: false
         init_scheme: scaled
         init_std: 0.02
+        bf16_cross_entropy: true     # CE in bf16 (doc S4)
         flex_attention: true
         memory_slots: 8
         bloom_num_hashes: 4

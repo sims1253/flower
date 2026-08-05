@@ -40,6 +40,7 @@ model:
   use_bias: false
   init_scheme: scaled
   init_std: 0.02
+  bf16_cross_entropy: true     # CE in bf16 (doc S4)
   flex_attention: true
   activation_checkpoint: "ffn"   # the enabler — keeps attn live, checkpoints FFN only
 
@@ -75,5 +76,5 @@ training:
   validation_steps: 20
   validation_interval: 500
   precision: bf16
-  compile_model: true        # REQUIRED — eager flex would materialize ~30GB of scores
+  compile_model: true
   compile_mode: default

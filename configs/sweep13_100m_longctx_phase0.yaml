@@ -68,6 +68,7 @@ model:
   use_bias: false
   init_scheme: scaled
   init_std: 0.02
+  bf16_cross_entropy: true     # CE in bf16 (doc S4)
   # --- long-context enabler (docs/training-speedups.md Section 1) ---
   flex_attention: true
 

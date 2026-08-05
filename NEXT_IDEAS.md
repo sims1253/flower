@@ -765,3 +765,28 @@ No kernel work is the lever; the lever is upstream FP8 support for consumer
 Blackwell, or renting datacenter Blackwell where TE's FP8 path works.
 
 
+
+## 14. fused_linear_ce + torch.compile + grad-accum: liger 0.8.1 bug (not adopted)
+
+**Source:** §6 / §5b. fused_linear_ce (fuses lm_head+CE, never materializes the
+logits tensor) was measured as a clean win in isolation: −1.3GB (−14%) at the
+bloom d512/L8/seq8192 shape with loss delta 9e-7, and it works eager AND under
+compile in a single forward+backward. So it was applied to all production
+configs — but it **crashes under the real training path** (torch.compile +
+gradient_accumulation_steps>1).
+
+**The bug.** `torch._inductor.exc.InductorError: LoweringException: TypeError:
+tuned_addmm() takes 3 positional arguments but 4 were given`, raised from
+liger_kernel's `fused_linear_cross_entropy_forward` during the inductor lowering
+of the resumed-in graph (the `torch_dynamo_resume_in_fused_linear_cross_
+entropy_forward_at_84` frame — i.e. the retrace that grad accumulation
+triggers). Reproducible: works in isolation (d768/L4/b4, compile, fwd+bwd) but
+fails in `flower.train` with `gradient_accumulation_steps: 4`. A clean inductor
+cache did not fix it. This is a liger-kernel 0.8.1 ↔ inductor (torch 2.13)
+incompatibility, not a flower bug.
+
+**Action taken:** reverted fused_linear_ce from all configs. bf16_cross_entropy
+(the other plainly-safe flag, a pure CE-reduction dtype change) is kept — it
+trains cleanly under compile+accum and is applied everywhere. fused_linear_ce
+should be re-enabled once liger-kernel is upgraded past 0.8.1 (or the inductor
+`tuned_addmm` signature mismatch is fixed upstream).
