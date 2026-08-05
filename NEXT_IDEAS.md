@@ -630,10 +630,28 @@ tests added.
 
 **Reading.** FFN-only is a ~7× better throughput/memory tradeoff than full: 36%
 of the memory saving for 14% of the throughput cost (full: 79% saving / 114%
-cost). At seq=32K it fits in ~10 GB with ~16% overhead — making 600M@32K on the
-5090 not just possible but reasonably fast. The "harsh pill" is resolved: use
-`"ffn"` for long context, `false` for short context that fits, `true` only when
-`"ffn"` doesn't fit.
+cost). At seq=32K it fits in ~10 GB with ~16% overhead.
+
+**The corrected seq=32K viability map (RTX 5090, bf16, compile+flex+Muon+ffn).**
+An earlier note (§10) said 600M@32K "needs rented 8xGPU" — that was based on an
+eager measurement where FlexAttention materialized the dense (B,H,T,T) scores
+(~30-38 GB). With `torch.compile` (the production path) flex runs fused and
+never materializes scores, so the real peaks are far lower:
+
+| model | params | peak @ seq=32K b1 | verdict |
+|-------|--------|-------------------|---------|
+| 100M (d768/L14) | 112M | ~10 GB | comfortable |
+| 400M (d1024/L24) | 320M | 19.5 GB | comfortable (12 GB headroom) |
+| 600M (d1280/L28) | 569M | 27.5 GB | fits but tight (~4.5 GB headroom) |
+
+**400M is the recommended local scale-up** — comfortable headroom for the
+memory-mechanism arms (bloom/summary add ~17% params + activations) and
+fragmentation, and 320M non-embedding is solidly in the §13 regime. 600M is
+runnable but risky; 100M-800M-class needs the rented node only beyond ~600M.
+The "harsh pill" is resolved: use `"ffn"` for long context, `false` for short
+context that fits, `true` only when `"ffn"` doesn't fit. Ready configs:
+`sweep13_400m_longctx32k_checkpoint.yaml` (recommended),
+`sweep13_600m_longctx32k_checkpoint.yaml` (tight).
 
 ## 11. FP8 / FP4 (NVFP4) low-precision training — blocked on sm_120 software support, not the env
 
