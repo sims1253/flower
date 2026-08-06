@@ -350,7 +350,7 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     cfg = load_config(args.config, overrides)
     set_global_seed(int(cfg.training.seed))
     device = resolve_device(cfg.training.device)
-    configure_vram_limit(device)
+    configure_vram_limit(device, fraction=getattr(cfg.training, "vram_fraction", 0.85))
     amp_dtype = configure_precision(cfg.training.precision, device)
     model = build_model(cfg.model).to(device)
     # Optimizers are always built on the eager module: torch.compile returns a

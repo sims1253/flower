@@ -315,6 +315,18 @@ class ModelConfig:
     memory_precision: str = "bf16"  # bf16 only
     head_precision: str = "bf16"  # bf16 | fp8
     bf16_guard_blocks: int = 0
+    # S14 Opportunity 3: analytical Titans surprise gradient (research
+    # contribution — see NEXT_IDEAS.md §7). Replaces the per-step
+    # torch.autograd.grad inner loop in TitansMACBlock._surprise_update with a
+    # closed-form gradient of the associative-retrieval MSE w.r.t. memory slots.
+    # Eliminates building/destroying an inner autograd graph every forward step
+    # while keeping the outer CE gradient intact (every op is a standard
+    # differentiable PyTorch op). The closed form is exact — it matches
+    # torch.autograd.grad at fp32 ~1e-9 (gate: 1e-4), so the Titans write rule
+    # is numerically unchanged and the alpha_logit/write_scale semantics are
+    # preserved. False reproduces the legacy autograd path bit-for-bit (old
+    # runs and checkpoints reproduce).
+    titans_analytical_surprise: bool = False
 
     def __post_init__(self) -> None:
         # S13: validate the precision-routing fields. Keep the actual FP4/FP8
@@ -501,6 +513,11 @@ class TrainingConfig:
     # S12.4 (EMA weight averaging for evaluation): maintain an EMA copy of
     # the weights (decay) and use it for validation/final eval. 0.0 disables.
     ema_decay: float = 0.0
+    # VRAM allocator cap fraction (train.py configure_vram_limit). 0.85 default
+    # leaves headroom against WSL2 silent shared-memory spill. Raise for large
+    # models whose validation-pass memory spikes above the training steady-state
+    # (e.g. 0.95 for the 450M long-context runs). 0.0 = no cap.
+    vram_fraction: float = 0.85
 
 
 @dataclass

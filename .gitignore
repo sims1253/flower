@@ -20,6 +20,13 @@ data_cache/
 .codex
 .zcode/
 
+# Profiler output (regenerable via scripts/profile_step.py + analyze_profile.py).
+# The Chrome traces are 150-500MB each; the raw log + summary.json are machine-
+# specific. Keep the docs/profiling/*.md writeups tracked, ignore everything
+# under traces/ and the throwaway run log.
+docs/profiling/traces/
+docs/profiling/run.log
+
 # Model weights / large checkpoints
 *.pt
 *.pth

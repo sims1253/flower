@@ -69,6 +69,11 @@ sweep:
       weight_decay_exclude_embeddings: true
       validation_steps: 30
       validation_interval: 1000
+      # The 450M validation pass spikes above the ~29 GB training steady-state.
+      # The default 0.85 cap (27 GB) forces an OOM there; 0.95 (30 GB) gives
+      # headroom for the spike while still catching a genuine runaway before the
+      # 32 GB physical limit + shared-memory bleed.
+      vram_fraction: 0.95
       precision: bf16
       compile_model: true
       # `default` over `reduce-overhead`: measured — reduce-overhead OOMs at
