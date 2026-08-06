@@ -44,14 +44,13 @@ sweep:
       bytes_per_token: 4.279
 
     training:
-      # batch 1 x accum 32 = effective batch 262144 tokens. The validation
-      # forward at batch 2 needs ~37 GB (logits + activations spike past the 32
-      # GB card), so batch 2 OOMs on the eval pass even though training fits.
-      # batch 1 fits both training and validation with headroom (~15-19 GB peak).
-      # Throughput halves vs batch 2 (~25k vs 45k tok/s) — the price of the
-      # memory ceiling. Same effective batch, so the comparison is unchanged.
-      batch_size: 1
-      gradient_accumulation_steps: 32
+      # Train at batch 2 x accum 16 = effective batch 262144 tokens (~45k tok/s,
+      # ~29 GB peak). The validation forward OOMs at batch 2 (logits tensor spikes
+      # past 32 GB), so eval runs at batch 1 via eval_batch_size (12 GB peak).
+      # Best of both: full training throughput + safe eval.
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
       steps: 10000
       lr: 0.0025              # slightly lower than the small bake-off (0.003); bigger model
       warmup_steps: 500

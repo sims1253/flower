@@ -405,8 +405,9 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             p.requires_grad_(False)
     initialize_lr_schedule(optims)
     batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
+    eval_bs = cfg.training.eval_batch_size or cfg.training.batch_size
     val_batches = (
-        validation_token_batches(cfg.data, cfg.training.batch_size, device)
+        validation_token_batches(cfg.data, eval_bs, device)
         if cfg.training.validation_steps > 0
         else None
     )

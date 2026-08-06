@@ -513,6 +513,11 @@ class TrainingConfig:
     # S12.4 (EMA weight averaging for evaluation): maintain an EMA copy of
     # the weights (decay) and use it for validation/final eval. 0.0 disables.
     ema_decay: float = 0.0
+    # Batch size for validation/eval forwards. None (default) uses the training
+    # batch_size. Set lower than batch_size when the eval forward spikes memory
+    # higher than training (e.g. the 450M long-context run trains at batch 2 but
+    # the no-grad eval logits tensor OOMs at batch 2, so eval at batch 1).
+    eval_batch_size: int | None = None
     # VRAM allocator cap fraction (train.py configure_vram_limit). 0.85 default
     # leaves headroom against WSL2 silent shared-memory spill. Raise for large
     # models whose validation-pass memory spikes above the training steady-state
