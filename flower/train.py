@@ -403,6 +403,28 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         ema_model.eval()
         for p in ema_model.parameters():
             p.requires_grad_(False)
+        # The EMA copy runs validation forwards eagerly (it is NOT wrapped in
+        # torch.compile, unlike `model` below). A flex-attention forward that
+        # misses the fused compiled kernel falls back to the unfused math path,
+        # which materialises the full (B, H, T, T) score matrix per layer. At
+        # the 450M config (seq 8192, 16 heads) that is ~8 GB per allocation and
+        # OOMs on top of the compiled training model's ~24 GB of live inductor
+        # workspaces. On WSL2/WDDM the overshoot does not raise a clean
+        # OutOfMemoryError — it spills to host shared memory and the next CUDA
+        # kernel fails with `cudaErrorUnknown` (the bloom_memory 450M sweep-13
+        # step-1000 crash, surfaced at currentStreamCaptureStatusMayInitCtx).
+        # `_load_flex_attention_compiled` is the codebase's existing primitive
+        # for exactly this (used when activation_checkpointing triggers an
+        # eager recompute): a standalone-compiled fused flex kernel that never
+        # materialises the dense scores. Forcing `_flex_needs_compile=True` on
+        # the EMA copy's flex attention drops the eval peak from OOM (>32 GB)
+        # to ~11.5 GB, matching the compiled model. No-op when flex is off
+        # (use_flex is False) — there is no dense-score fallback to avoid.
+        from flower.models.base import CausalSelfAttention
+
+        for module in ema_model.modules():
+            if isinstance(module, CausalSelfAttention) and getattr(module, "use_flex", False):
+                module._flex_needs_compile = True
     initialize_lr_schedule(optims)
     batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
     eval_bs = cfg.training.eval_batch_size or cfg.training.batch_size
