@@ -25,6 +25,7 @@ data_cache/
 # specific. Keep the docs/profiling/*.md writeups tracked, ignore everything
 # under traces/ and the throwaway run log.
 docs/profiling/traces/
+docs/profiling/traces_fp8/
 docs/profiling/run.log
 
 # Model weights / large checkpoints
@@ -33,10 +34,12 @@ docs/profiling/run.log
 *.ckpt
 *.safetensors
 
-# Tokenizers are regenerable via scripts/train_custom_tokenizer.py and
-# scripts/compare_tokenizer_algorithms.py (see tokenizers/README.md).
+# Tokenizers are regenerable via scripts/train_custom_tokenizer.py,
+# scripts/compare_tokenizer_algorithms.py and scripts/compare_vocab_sizes.py
+# (see tokenizers/README.md).
 tokenizers/*.json
 tokenizers/algo/
+tokenizers/vocab_sweep/
 
 # ZCode / agent scratch
 .t3/

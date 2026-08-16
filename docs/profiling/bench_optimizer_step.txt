@@ -1,0 +1,28 @@
+warning: Malware checks are experimental and may change without warning. Pass `--preview-features malware-check` to disable this warning.
+
+=== perf_control ===
+  107.45 ms/step   state 1.73 GB   Muon+AdamW
+
+=== opt_per_head ===
+  109.12 ms/step   state 1.73 GB   Muon+AdamW
+
+=== opt_cm_isotropic ===
+  244.41 ms/step   state 1.73 GB   Muon+AdamW
+
+=== opt_cm_full ===
+  762.95 ms/step   state 1.73 GB   Muon+AdamW
+
+=== opt_aurora ===
+  499.39 ms/step   state 1.73 GB   Aurora+AdamW
+
+arm                      ms/step   spread  vs control  state GB % of step
+perf_control              107.45    10.8%      1.000x      1.73     8.91%
+opt_per_head              109.12    21.6%      1.016x      1.73     9.05%
+opt_cm_isotropic          244.41    26.1%      2.275x      1.73    20.27%
+opt_cm_full               762.95    10.8%      7.101x      1.73    63.26%
+opt_aurora                499.39    25.3%      4.648x      1.73    41.41%
+
+control = perf_control
+Percentages are against --step-ms 1206. The decision number is the
+DELTA in '% of step' between an arm and the control, not the ratio in 'vs control':
+a 2x optimizer that is 3% of the step costs 3% of throughput, not 100%.

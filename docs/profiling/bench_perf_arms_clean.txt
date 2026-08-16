@@ -1,0 +1,37 @@
+
+=== perf_control ===
+  56,549 tok/s (min 56,488 / max 56,722)   peak 19.18 GB   params 412,601,600
+
+=== fp8_fast_accum ===
+  53,894 tok/s (min 53,820 / max 54,776)   peak 19.18 GB   params 412,601,600
+
+=== mtp_1_head ===
+  54,107 tok/s (min 53,497 / max 55,001)   peak 19.64 GB   params 433,573,120
+
+=== mtp_2_heads ===
+  51,875 tok/s (min 51,519 / max 52,605)   peak 20.10 GB   params 454,544,640
+
+=== fp8_lm_head ===
+  57,155 tok/s (min 56,319 / max 57,523)   peak 19.18 GB   params 412,601,600
+
+=== window_512 ===
+  69,996 tok/s (min 69,803 / max 70,292)   peak 19.18 GB   params 412,601,600
+
+=== window_1024 ===
+  64,744 tok/s (min 64,492 / max 65,024)   peak 19.18 GB   params 412,601,600
+
+=== window_4096 ===
+  49,599 tok/s (min 47,144 / max 51,220)   peak 19.18 GB   params 412,601,600
+
+arm                         tok/s   spread  vs control   peak GB
+perf_control               56,549     0.4%      1.000x     19.18
+fp8_fast_accum             53,894     1.8%      0.953x     19.18
+mtp_1_head                 54,107     2.8%      0.957x     19.64
+mtp_2_heads                51,875     2.1%      0.917x     20.10
+fp8_lm_head                57,155     2.1%      1.011x     19.18
+window_512                 69,996     0.7%      1.238x     19.18
+window_1024                64,744     0.8%      1.145x     19.18
+window_4096                49,599     8.2%      0.877x     19.18
+
+control = perf_control; batch 2 x accum 4 x seq 8192
+A gap smaller than the spread column is not evidence. Re-run with more --repeats.

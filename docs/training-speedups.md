@@ -8,6 +8,27 @@ Each section is self-contained: the file(s) to modify, the current code, the tar
 
 **Source for all improvements**: KellerJordan/modded-nanogpt speedrun (records #1-#55) and Track 3 optimization benchmark (records #1-#46). https://github.com/KellerJordan/modded-nanogpt
 
+> **Measured results live in [`profiling/speedup_results.md`](profiling/speedup_results.md).**
+> This file is the *spec*; that file records what was actually measured on the
+> RTX 5090 at the 450M config, including several items here that turned out to be
+> dead ends. Read it before implementing anything below. In particular it
+> supersedes:
+>
+> - **Section 13's FP4 plan** — nvfp4 measures 1.02x bf16 with 13.9% error and
+>   mxfp4 measures 0.49x on sm_120; there is no fast FP4 GEMM for consumer
+>   Blackwell, and torchao 0.18 has no MX/NVFP4 training path at all. FP8
+>   tensorwise (1.30x at model scale) is the whole of the low-precision win.
+>   Section 13's Transformer Engine suggestion is also moot — TE is not installed
+>   and torchao covers the working path.
+> - **Section 14 Opportunity 1 / S14-5a (Newton-Schulz)** — still not worth doing,
+>   but *not* because the optimizer is free. `baseline_profile.md`'s "~0 ms,
+>   <1% of step" was a subtraction artifact; measured directly it is 134 ms/step.
+>   It is skippable because the batching is already optimal (4 shape groups, zero
+>   singletons) and it is ~2.8% at production accum.
+> - **Section 14 Opportunity 5 / S14-5b (fused linear CE)** — was *broken* under
+>   `torch.compile` on torch 2.13 and is now fixed; it is a ~1.1 GB memory win,
+>   not a speed win.
+
 ---
 
 ## Section 1: FlexAttention Migration (HIGH PRIORITY)

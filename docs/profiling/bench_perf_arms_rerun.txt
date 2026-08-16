@@ -1,0 +1,17 @@
+
+=== perf_control ===
+  59,915 tok/s (min 59,887 / max 60,052)   peak 19.18 GB   params 412,601,600
+
+=== mtp_2_heads_unfused ===
+  56,118 tok/s (min 52,057 / max 56,508)   peak 21.97 GB   params 454,544,640
+
+=== window_4096 ===
+  53,431 tok/s (min 51,151 / max 54,258)   peak 19.18 GB   params 412,601,600
+
+arm                         tok/s   spread  vs control   peak GB
+perf_control               59,915     0.3%      1.000x     19.18
+mtp_2_heads_unfused        56,118     7.9%      0.937x     21.97
+window_4096                53,431     5.8%      0.892x     19.18
+
+control = perf_control; batch 2 x accum 4 x seq 8192
+A gap smaller than the spread column is not evidence. Re-run with more --repeats.

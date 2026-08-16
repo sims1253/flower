@@ -1,0 +1,38 @@
+warning: Malware checks are experimental and may change without warning. Pass `--preview-features malware-check` to disable this warning.
+
+=== perf_control ===
+  59,854 tok/s (min 58,993 / max 60,412)   peak 19.18 GB   params 412,601,600
+
+=== mtp_1_head ===
+  56,882 tok/s (min 56,573 / max 57,077)   peak 19.64 GB   params 433,573,120
+
+=== mtp_2_heads ===
+  54,291 tok/s (min 54,239 / max 54,790)   peak 20.10 GB   params 454,544,640
+
+=== mtp_2_heads_unfused ===
+  33,630 tok/s (min 14,616 / max 55,004)   peak 21.97 GB   params 454,544,640
+
+=== fp8_lm_head ===
+  60,109 tok/s (min 53,056 / max 61,209)   peak 19.18 GB   params 412,601,600
+
+=== window_512 ===
+  75,904 tok/s (min 75,235 / max 75,996)   peak 19.18 GB   params 412,601,600
+
+=== window_1024 ===
+  69,472 tok/s (min 66,003 / max 69,529)   peak 19.18 GB   params 412,601,600
+
+=== window_4096 ===
+  39,057 tok/s (min 3,654 / max 52,567)   peak 19.18 GB   params 412,601,600
+
+arm                         tok/s   spread  vs control   peak GB
+perf_control               59,854     2.4%      1.000x     19.18
+mtp_1_head                 56,882     0.9%      0.950x     19.64
+mtp_2_heads                54,291     1.0%      0.907x     20.10
+mtp_2_heads_unfused        33,630   120.1%      0.562x     21.97
+fp8_lm_head                60,109    13.6%      1.004x     19.18
+window_512                 75,904     1.0%      1.268x     19.18
+window_1024                69,472     5.1%      1.161x     19.18
+window_4096                39,057   125.2%      0.653x     19.18
+
+control = perf_control; batch 2 x accum 4 x seq 8192
+A gap smaller than the spread column is not evidence. Re-run with more --repeats.
