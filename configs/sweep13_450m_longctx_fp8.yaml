@@ -1,0 +1,121 @@
+# Sweep 13, 450M long-context — FP8 CONFIRMATION RUN.
+#
+# PURPOSE
+#   The single full-length run that decides whether the FP8 speedup stack ships.
+#   Everything here is byte-identical to `vanilla_matched` in
+#   configs/sweep13_450m_longctx_memory.yaml EXCEPT the four speedup settings
+#   marked below, so the result is directly comparable to the finished seeds in
+#   runs/sweep13_450m_longctx/:
+#
+#     seed 0 -> val_bpb 0.90234
+#     seed 1 -> val_bpb 0.90270
+#     converged 10k-step seed band = 0.0004
+#
+#   THIS is where the 0.0004 band is the correct threshold — same length, same
+#   converged regime. (It was the wrong threshold for the 600-step screen, where
+#   the measured band is 0.01282; see docs/profiling/speedup_results.md.)
+#
+# WHAT THE SCREEN ALREADY ESTABLISHED (runs/speedup_screen_450m*)
+#   - 1.275x whole-run throughput: 44,836 -> 57,146 tok/s
+#   - FP8 offset at 600 steps is +0.00107 val_bpb, i.e. 12x BELOW the 600-step
+#     reseed noise floor of 0.01282 — no divergence
+#   - smooth_swiglu does not reduce the offset and costs ~3%: left OFF
+#   - keep_bf16_blocks: 1 beats 0 on BOTH quality and speed: kept at 1
+#
+#   What the screen could NOT establish is converged quality. That is this run.
+#
+# EXPECTED COST
+#   10000 steps x 262,144 tokens = 2.62B tokens at ~57k tok/s ~= 13h
+#   (the bf16 seeds took ~17h each at ~43k tok/s).
+#
+# SUCCESS CRITERION
+#   val_bpb within 0.0004 of 0.90234/0.90270. Outside that band is a real
+#   converged-quality regression and FP8 should not ship for research runs,
+#   regardless of the throughput win.
+#
+# LAUNCH
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/sweep13_450m_longctx_fp8.yaml \
+#     --output-dir runs/sweep13_450m_longctx_fp8
+
+sweep:
+  name: sweep13_450m_longctx_fp8
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 10000
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      eval_interval: 1000
+      checkpoint_interval: 100000   # no checkpoints on 10k benchmark runs: staging spikes ~3-4GB host RAM and distorts whole-run tok/s
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 1000
+      vram_fraction: 0.95
+      precision: bf16
+
+      # ---- THE ONLY DIFFERENCES FROM THE BASELINE CONFIG --------------------
+      compile_model: true
+      # baseline uses `default`. max-autotune (without CUDA graphs — the graph
+      # pools do not fit at 450M even with FP8's saving) measured +3.2%.
+      compile_mode: max-autotune-no-cudagraphs
+      fp8_linear: true
+      fp8_recipe: tensorwise      # rowwise measures 1.01x on sm_120; pointless
+      fp8_keep_bf16_blocks: 1     # measured better than 0 on quality AND speed
+      # ----------------------------------------------------------------------
+
+  variants:
+    - name: vanilla_matched_fp8
+      model:
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        # The other speedup: fuses the tied lm_head matmul + CE so the
+        # (B*T, vocab) logits tensor is never materialised. -1.1 GB. Requires
+        # the @torch._dynamo.disable wrapper in flower/models/base.py — without
+        # it this flag crashes under compile on torch 2.13.
+        fused_linear_ce: true
+        # smooth_swiglu deliberately absent: measured to cost ~3% throughput
+        # while NOT reducing the FP8 offset (+0.00117 with vs +0.00107 without).

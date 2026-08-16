@@ -1,0 +1,128 @@
+# 450M CONFIRMATION RUN — per-head Muon on top of the FP8 stack.
+#
+# WHY THIS RUN
+#   The 1500-step Muon screen measured per-head Muon at -0.02714 val_bpb against
+#   an otherwise identical baseline — the largest quality effect found anywhere
+#   in this work, at no throughput cost, and comparable in size to the entire
+#   memory-mechanism signal the project is researching (~0.03 bpb).
+#
+#   It is n=1 at 1500 steps, and the FP8 confirmation just demonstrated how badly
+#   a short screen can mislead: FP8 read 12x BELOW the noise floor at 600 steps
+#   and finished 4.8x ABOVE it at 10k. So the screen result is a hypothesis, not
+#   a finding, until it survives full length.
+#
+# THE CONTROL IS runs/sweep13_450m_longctx_fp8 (val_bpb 0.90428, 58,102 tok/s)
+#   This config is byte-identical to configs/sweep13_450m_longctx_fp8.yaml except
+#   for `muon_per_head: true`, so the delta isolates per-head Muon.
+#
+#   That control ran BEFORE several optimizer edits, so reusing it needs
+#   justification rather than assumption. Every change since is default-off or
+#   verified inert for this configuration:
+#     * norm_update  — the NorMuon fix only executes when norm_update=True (off)
+#     * contra_muon  — defaults 0.0, branch skipped
+#     * muon_per_head— defaults False (the variable under test here)
+#     * muon_nesterov— newly exposed, defaults True = the previous hardcoded value
+#     * TST          — tst_enabled defaults False
+#     * EMA _foreach_— verified BIT-EXACT against the previous loop
+#     * log_interval — defaults 0 = the previous eval_interval-derived cadence
+#     * grad-norm logging — additive scalars only
+#   Re-running the control would cost another ~11h. If per-head lands NEAR the
+#   0.0004 seed band rather than clearly beyond it, re-run the control before
+#   concluding anything.
+#
+# WHY per-head ALONE, not stacked with the other screen winners
+#   `muon_no_nesterov` measured -0.00602 and `muon_cautious_wd` -0.00047, but
+#   confirmation runs cost ~11h each and a combined arm cannot attribute a
+#   regression to a cause. Per-head is 4.5x the next effect, so it gets the run.
+#   Contra-Muon is deliberately excluded: alone it measured +0.00013 (neutral)
+#   and added only -0.00094 on top of per-head — noise, despite being ranked #1
+#   in both optimizer research docs.
+#
+# SUCCESS CRITERION
+#   val_bpb at least 0.0004 (the converged 10k seed band) BELOW the FP8 control's
+#   0.90428. A result inside that band means per-head does not survive to
+#   convergence, exactly as FP8's advantage did not.
+#
+# EXPECTED COST: ~11h at ~58k tok/s.
+
+sweep:
+  name: sweep13_450m_longctx_fp8_perhead
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 10000
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      eval_interval: 1000
+      # Dense scalar logging so the stability signals (grad_norm, grad_norm_max,
+      # grad_clip_frac) are usable. The control logged at the 1000-step default;
+      # this affects logging only, not training.
+      log_interval: 50
+      checkpoint_interval: 100000   # no checkpoints on 10k benchmark runs: staging spikes ~3-4GB host RAM and distorts whole-run tok/s
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 1000
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+      # ---- THE ONLY DIFFERENCE FROM THE FP8 CONTROL ----------------------
+      # Orthogonalise each attention head's block separately (qkv splits rows
+      # into 3*heads, the output projection splits columns into heads) so every
+      # head gets its own unit-spectral-norm update instead of sharing one
+      # across the fused matrix. arXiv:2605.08933; Kimi K3 §2.5 uses it at 2.8T.
+      muon_per_head: true
+      # --------------------------------------------------------------------
+
+  variants:
+    - name: vanilla_matched_fp8_perhead
+      model:
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true

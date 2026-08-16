@@ -1,0 +1,120 @@
+# Tokenizer screen — production 16K BPE vs regex-free ("superword") BPE.
+#
+# PURPOSE
+#   docs/profiling/tokenizer_candidates_results.md measured that dropping the
+#   pre-tokenizer regex constraint (merges may cross whitespace) compresses
+#   FineWeb-Edu from 4.274 to 4.844 bytes/token (+13.3%) at the SAME vocab
+#   (16384) — zero parameter cost, so if val_bpb holds, wall-clock-per-byte
+#   improves by the full +13%. This screen asks the quality half of that
+#   question: does BPB at matched steps actually hold?
+#
+# MEASUREMENT DISCIPLINE
+#   Two arms, identical except data.tokenizer + data.bytes_per_token (each
+#   arm's own measured value, so val_bpb is comparable across tokenizers —
+#   perplexity is NOT). Same seed, same data order discipline, same step
+#   count, full FP8 stack in both. Throughput note: tok/s should be ~equal
+#   across arms; bytes/s = tok/s * bytes_per_token, so noregex wins that
+#   product by construction if BPB holds.
+#
+#   The noregex tokenizer is the existing tokenizers/algo/bpe_noregex_16384.json
+#   artifact (regenerate: scripts/compare_tokenizer_algorithms.py --vocab 16384
+#   --algos bpe_noregex). It was fitted on 40k docs; the corpus-size curve in
+#   the results doc shows merge-fit size is irrelevant (+0.1% from 20k->500k).
+#
+# CAVEAT THIS SCREEN DOES NOT COVER
+#   SuperBPE (arXiv:2503.13423) says t=0 (this tokenizer) is the crude lower
+#   bound of the idea; a two-stage schedule is the refined variant and the
+#   follow-up if this screen passes.
+#
+# LAUNCH
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/tokenizer_screen_450m.yaml \
+#     --output-dir runs/tokenizer_screen_450m
+
+sweep:
+  name: tokenizer_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      sequence_length: 8192
+      eval_seq_len: 8192
+
+    training:
+      # Same shape as the muon screens (1500 steps ~2h/arm): a tokenizer change
+      # is a data-representation change and should show early, but 600 (the
+      # fp8 screen length) felt thin for a potential baseline switch.
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      eval_interval: 25      # scalar-logging cadence only
+      checkpoint_interval: 100000   # no checkpoints: they distort whole-run tok/s
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 200
+      vram_fraction: 0.95
+      precision: bf16
+      # The production FP8 stack (speedup_results.md "How to enable the stack").
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # The control: the production tokenizer, full stack. Every claim in this
+    # sweep is relative to this arm. bytes_per_token 4.279 is the canonical
+    # config value (same held-out protocol as the noregex arm's 4.844).
+    - name: tok_bpe_control
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+      data:
+        tokenizer: "custom:tokenizers/fineweb_16k.json"
+        bytes_per_token: 4.279
+
+    # The candidate: same recipe, regex constraint lifted (superword merges).
+    # Same vocab_size, same param count, same everything except the tokenizer
+    # path and its measured bytes_per_token.
+    - name: tok_noregex
+      model: *vanilla_450m
+      data:
+        tokenizer: "custom:tokenizers/algo/bpe_noregex_16384.json"
+        bytes_per_token: 4.844

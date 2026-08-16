@@ -1,0 +1,118 @@
+# NorMuon re-screen against the FIXED implementation.
+#
+# WHY THIS EXISTS
+#   The first Muon screen measured `norm_update: true` at +0.517 val_bpb against
+#   baseline (train loss 4.64 vs 3.16) — not a regression, a broken feature.
+#   Cause: the implementation was a single GLOBAL Frobenius normalisation
+#
+#       ortho = ortho / ortho.norm()
+#
+#   whereas NorMuon (arXiv:2510.05491) is PER-ROW RMS normalisation. An
+#   orthogonalised (m, n) matrix has ||ortho||_F ~= sqrt(min(m, n)) ~= 36 at
+#   d_model=1280, so that line silently cut the Muon learning rate ~36x.
+#
+#   Fixed to per-row RMS while preserving ||update||_F, so the operation is a
+#   pure redistribution of scale across rows rather than a hidden LR change —
+#   otherwise this screen would measure an LR change, not the method.
+#   Guarded by test_normuon_equalises_row_scales_without_changing_step_size.
+#
+# WHY A FRESH BASELINE ARM
+#   `muon_baseline` already ran in runs/muon_screen_450m and the fix cannot
+#   affect it (norm_update=False skips the branch entirely), so reusing it would
+#   be defensible. It is re-run anyway so the comparison is self-contained under
+#   one code version — the first screen has now been shown to contain a broken
+#   arm, which is exactly the situation where cross-invocation reuse is worth
+#   the extra 35 minutes to avoid.
+#
+# COST: 4 arms x 1500 steps ~= 2.3h.
+#
+# LAUNCH: queued by scripts/queue_normuon_fixed.sh behind the TST screen.
+
+sweep:
+  name: muon_normuon_fixed_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    - name: fixnorm_baseline
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    - name: fixnorm_normuon
+      model: *vanilla_450m
+      training:
+        norm_update: true
+
+    - name: fixnorm_normuon_cautious
+      model: *vanilla_450m
+      training:
+        norm_update: true
+        cautious_wd: 0.01
+
+    # The Track-3 PR #301 pairing (Contra-Muon + NorMuon), now that NorMuon works.
+    - name: fixnorm_contra_normuon
+      model: *vanilla_450m
+      training:
+        norm_update: true
+        contra_muon: 0.2

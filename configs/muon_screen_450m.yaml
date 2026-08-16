@@ -1,0 +1,206 @@
+# Muon variant screen — stability and sample efficiency at 450M.
+#
+# WHY THIS IS A DIFFERENT KIND OF SCREEN FROM speedup_screen_450m.yaml
+#   The speedup screen asked "is it faster at equal quality". This one asks the
+#   opposite: "does it reach a given loss in fewer steps, and is it more stable".
+#   Muon is only ~2.8% of step time at production accum, so NO optimizer variant
+#   can move throughput meaningfully. The prize is sample efficiency.
+#
+# THE METRIC IS STEPS-TO-TARGET-LOSS, NOT FINAL val_bpb
+#   Measured seed bands at 600 steps: bf16 0.01282, fp8_stack 0.01339 val_bpb.
+#   A 5-10% sample-efficiency gain is FAR below that noise floor, so comparing
+#   final val_bpb over a short run cannot detect it — the screen would report
+#   "no difference" for a real improvement. Compare the loss-vs-step curves
+#   instead: if an arm reaches the control's step-N loss at step 0.94N, that is a
+#   6% gain and it is visible well before the bands separate.
+#   `training.log_interval: 25` exists for exactly this; the production configs'
+#   1000-step cadence gives 11 points and cannot support the comparison.
+#
+# STABILITY IS NOW OBSERVABLE
+#   train/grad_norm, train/grad_norm_max and train/grad_clip_frac are logged
+#   (previously `clip_grad_norm_`'s return value was computed and discarded).
+#   A variant that is more stable shows a lower clip fraction and fewer grad-norm
+#   excursions, which is a signal independent of the loss curve.
+#
+# WHAT IS *NOT* HERE, AND WHY
+#   - MuonClip / QK-Clip: structurally inapplicable. `HeadRMSNorm` is
+#     parameter-free, so attention logits are invariant to W_Q/W_K spectral norm
+#     — verified across 8 orders of magnitude (max|logit| = 4.7598 identically
+#     from scale 1e0 to 1e6, hard bound sqrt(head_dim) = 8). MuonClip exists to
+#     stop exactly the MaxLogit explosion that cannot happen here.
+#   - Muonp (fractional spectral powers): its own paper reports p=0 (i.e.
+#     standard Muon) is optimal for PRETRAINING; Muonp wins only for finetuning.
+#     Wrong regime.
+#   - SAM-Muon: needs a second forward/backward per step (~2x compute).
+#   - Newton-Muon / MiMuon / Compositional Muon / KL-SOAP: all need substantial
+#     new machinery (ZZ^T EWMA + cached Cholesky inverse; per-step SVD; etc).
+#     Worth doing only if the cheap arms below show the optimizer is a live axis
+#     at this scale. Newton-Muon's own evidence weakens exactly here: 6% fewer
+#     iterations on nanoGPT's short track but "marginal improvement only" on the
+#     medium track.
+#
+# THE ARMS ARE ALL ZERO-IMPLEMENTATION-COST
+#   NorMuon, Cautious WD and cubic5 are already implemented in flower/optim.py
+#   and simply never switched on; nesterov was hardcoded and is now exposed.
+#
+# LAUNCH (after the FP8 confirmation run finishes — it owns the GPU)
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/muon_screen_450m.yaml \
+#     --output-dir runs/muon_screen_450m
+
+sweep:
+  name: muon_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      # 1500 rather than the speedup screen's 600: sample-efficiency differences
+      # accumulate with steps, and 1000 of these are past the LR warmup.
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25          # dense enough to compare loss-vs-step curves
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      # FP8 stack held FIXED across every arm, so the only difference is the
+      # optimizer. It is also 1.275x faster, which is what makes a 1500-step
+      # screen affordable (~35 min/arm instead of ~45).
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # The control: exactly what the finished 450M seeds used.
+    - name: muon_baseline
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # NorMuon (arXiv:2510.05491) — normalise the orthogonalised update to unit
+    # Frobenius norm before LR/aspect-ratio scaling. Implemented since S5 and
+    # never enabled. Targets update-norm drift across the run, so its effect
+    # should grow with step count rather than appear immediately.
+    - name: muon_normuon
+      model: *vanilla_450m
+      training:
+        norm_update: true
+
+    # Cautious Weight Decay (Track 3 records #43/#46) — decay only coordinates
+    # the update is already shrinking. Implemented since S6, never enabled.
+    # Matches the AdamW group's weight_decay so the two are comparable.
+    - name: muon_cautious_wd
+      model: *vanilla_450m
+      training:
+        cautious_wd: 0.01
+
+    # Both, since they act on different parts of the update (direction norm vs
+    # decay) and could compose.
+    - name: muon_normuon_cautious
+      model: *vanilla_450m
+      training:
+        norm_update: true
+        cautious_wd: 0.01
+
+    # Nesterov off. NVIDIA's arXiv:2607.20548 (to 100M-token batches) reports
+    # Nesterov did not help for Muon or SOAP and skipped it for both. It was
+    # hardcoded True here and untestable until now. If it is neutral, turning it
+    # off is free and removes one add per parameter per step.
+    - name: muon_no_nesterov
+      model: *vanilla_450m
+      training:
+        muon_nesterov: false
+
+    # Contra-Muon (github.com/nilin/contra-muon). Ranked #1 in BOTH
+    # docs/OPTIMIZER_RESEARCH_2026.md and
+    # docs/research/frontier-speedups-2026-08.md. Subtracts a normalised copy of
+    # the pre-orthogonalisation update, damping large-sigma directions more than
+    # small ones so singular-value diversity rises. Multiple nanoGPT Track-3
+    # records. Verified in tests/test_newton_schulz.py: damping correlates with
+    # gradient sigma at -1.000.
+    - name: muon_contra
+      model: *vanilla_450m
+      training:
+        contra_muon: 0.2
+
+    # Contra-Muon + NorMuon: the pairing behind Track-3 PR #301.
+    - name: muon_contra_normuon
+      model: *vanilla_450m
+      training:
+        contra_muon: 0.2
+        norm_update: true
+
+    # Per-head Muon (arXiv:2605.08933; Kimi K3 §2.5). Ranked #2 in both
+    # optimizer docs. Orthogonalises each attention head's block separately, so
+    # heads no longer share one update scale. Verified in
+    # tests/test_newton_schulz.py: per-head block singular values ~1 vs ~0.5
+    # under whole-matrix NS.
+    - name: muon_per_head
+      model: *vanilla_450m
+      training:
+        muon_per_head: true
+
+    # The two top-ranked ideas together.
+    - name: muon_contra_per_head
+      model: *vanilla_450m
+      training:
+        contra_muon: 0.2
+        muon_per_head: true
+
+    # cubic5 Newton-Schulz (arXiv:2606.00371): 10 dominant matmuls per 5 steps
+    # instead of quintic's 15. The paper finds training quality is NOT
+    # monotonically governed by polar-decomposition accuracy — cubic5, quintic5
+    # and even exact FP32 SVD land within ~1e-3 val loss. Implemented, unused.
+    - name: muon_cubic5
+      model: *vanilla_450m
+      training:
+        muon_ns_schedule: cubic5

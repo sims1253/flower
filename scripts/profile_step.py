@@ -57,6 +57,7 @@ from flower.config import load_config
 from flower.models import build_model
 from flower.models.base import count_parameters, prebuild_attention_masks
 from flower.optim import build_optimizer
+from flower.precision import maybe_convert_fp8
 from flower.sweep import load_sweep, select_variants
 from flower.train import configure_precision, configure_vram_limit, resolve_device
 
@@ -212,9 +213,17 @@ def load_variant_config(sweep_path: str, variant_name: str, *, accum_override: i
 def build_everything(cfg):
     """Mirror flower/train.py train() model+optim+compile wiring exactly."""
     device = resolve_device(cfg.training.device)
-    configure_vram_limit(device)
+    # Honour the config's vram_fraction exactly as train.py does. Hardcoding the
+    # 0.85 default here made the harness cap VRAM lower than the run it claims to
+    # mirror (the 450M configs set 0.95 for the validation spike), so arms that
+    # fit in a real run would OOM under measurement.
+    configure_vram_limit(device, fraction=getattr(cfg.training, "vram_fraction", 0.85))
     amp_dtype = configure_precision(cfg.training.precision, device)
     eager_model = build_model(cfg.model).to(device)
+    # Same FP8 gate the trainer uses, in the same position (before the optimizer
+    # is built, since conversion rebinds weight Parameters). Shared entry point
+    # so a profile can never measure a different precision layout than a run.
+    eager_model, _fp8_info = maybe_convert_fp8(eager_model, cfg.training, device)
     optim_or_list = build_optimizer(eager_model, cfg.training)
     optims = optim_or_list if isinstance(optim_or_list, list) else [optim_or_list]
     # Match train.py compile-time wiring.

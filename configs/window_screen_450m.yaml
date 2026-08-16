@@ -1,0 +1,153 @@
+# Attention window: what does 1.268x throughput actually cost in quality?
+#
+# WHY THIS SCREEN
+#   scripts/bench_arms.py measured (docs/profiling/bench_perf_arms.txt):
+#       window  512   75,904 tok/s   1.268x
+#       window 1024   69,472 tok/s   1.161x
+#       window 2048   59,854 tok/s   1.000x   (production)
+#   Cross-validated independently by scripts/bench_attn_warmup.py, which saw
+#   1.256x at window 512 on the same box. Both spreads were ~1%, so the
+#   throughput side is settled. The quality side is not measured at all.
+#
+#   This is the largest single throughput lever found in the August 2026 sweep
+#   of unused features — larger than MTP (-5%/head), larger than anything left
+#   in the kernel stack after FP8. It applies to every future run.
+#
+# THIS IS A TRADEOFF, NOT A FREE WIN
+#   Unlike FP8 (same computation, fewer bits) a shorter window changes WHAT THE
+#   MODEL CAN ATTEND TO. At seq 8192 a window of 512 sees 1/4 the context of
+#   2048. val_bpb is expected to get WORSE at matched steps. The question is
+#   whether it gets worse by less than 1.268x more steps buys back.
+#
+#   Also note this is an ARCHITECTURE change, and docs/training-speedups.md is
+#   explicit that architecture changes confound the memory-mechanism comparison.
+#   These arms are vanilla_local only. Do NOT transfer the result to a memory
+#   variant without re-running it there — the whole memory thesis is that the
+#   variants use context differently, so they cannot be assumed to pay the same
+#   price for losing it.
+#
+# THE DECISION COMPARISON IS EQUAL WALL-CLOCK, NOT EQUAL STEPS
+#   This is the point of the screen and the reason for the `_isotime` arm.
+#   Comparing val_bpb at 1500 steps across windows answers "is a short window
+#   worse per step", which is not the question anyone has — of course it is.
+#   The question is "given a fixed hour of GPU, which window gets further".
+#   A 1.268x arm completes 1902 steps in the wall-clock the control needs for
+#   1500, so `w512_isotime` runs exactly that many. If its val_bpb beats
+#   `w2048_control`, the shorter window is strictly better for a compute-bound
+#   run and the production default should change.
+#
+#   Both comparisons are kept because they answer different things:
+#     matched steps (w512 vs w2048_control)      -> the pure quality cost
+#     matched wall-clock (w512_isotime vs same)  -> the deployment decision
+#
+# SEED BAND
+#   The 600-step reseed band was 0.01282 val_bpb; at 1500 steps it is narrower
+#   but has not been measured. The muon screen resolved -0.027 at 1500 steps and
+#   treated that as real. Read anything under ~0.01 here as inconclusive rather
+#   than as a null result, and reseed before believing a small gap.
+#
+# LAUNCH (queued as stage 5 of scripts/queue_investigations.sh)
+#   PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/window_screen_450m.yaml \
+#     --output-dir runs/window_screen_450m
+
+sweep:
+  name: window_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      # FP8 stack fixed across every arm, matching muon_screen_450m and
+      # comp_muon_screen_450m so all three screens are mutually comparable.
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # Production default. Should reproduce muon_screen_450m's muon_baseline
+    # (1.12785 val_bpb) — same config, same seed. If it does not, the box
+    # drifted and every cross-screen comparison in this file is void.
+    - name: w2048_control
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # Matched steps: the pure per-step quality cost of halving the window.
+    - name: w1024
+      model:
+        <<: *vanilla_450m
+        local_window: 1024
+
+    - name: w512
+      model:
+        <<: *vanilla_450m
+        local_window: 512
+
+    # THE DECISION ARM. 1500 x 1.268 = 1902 steps, i.e. the same wall-clock as
+    # w2048_control, using the measured 75,904/59,854 ratio. Beating the control
+    # here means the shorter window is strictly better under a compute budget.
+    #
+    # If throughput on the day differs from the benched 1.268x, this arm is
+    # mis-sized — check the tok/s in its metrics.json against 75,904 before
+    # trusting the comparison, and rescale rather than reinterpreting.
+    - name: w512_isotime
+      model:
+        <<: *vanilla_450m
+        local_window: 512
+      training:
+        steps: 1902

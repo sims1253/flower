@@ -1,0 +1,144 @@
+# Token Superposition Training screen — does the 3x phase-1 speedup cost quality?
+#
+# WHAT TST DOES (S9, arXiv:2605.06546)
+#   Phase 1 averages the embeddings of `tst_bag_size` consecutive tokens into one
+#   superposed position and scores against the NEXT bag's token SET via multi-hot
+#   cross-entropy. The transformer runs T/s positions instead of T — that is the
+#   entire source of the speedup. Phase 2 reverts to standard next-token
+#   prediction, so the FINAL model is architecturally identical to a normal run.
+#
+# MEASURED STEP-TIME (450M proportions, batch 1, seq 8192, compiled)
+#   bag 1 (NTP)  1315.88 ms   1.00x   8192 positions
+#   bag 2         439.39 ms   2.99x   4096
+#   bag 4         429.60 ms   3.06x   2048
+#   bag 8         357.86 ms   3.68x   1024
+#
+#   Note the shape: bag 2 already captures 2.99x and bag 4 adds almost nothing
+#   (3.06x). Attention falls off faster than linearly in the compressed length
+#   while the FFN stays linear, and by bag 4 the step is launch-bound. So bag 2
+#   buys nearly all the speed while discarding far less token structure — which
+#   is why the arms below centre on bag 2, not on the largest bag that fits.
+#
+# WHAT THIS SCREEN IS FOR
+#   The speedup is measured; the QUALITY cost is not. Phase 1 optimises a
+#   different objective, so the questions are (a) does the phase-1 -> phase-2
+#   transition recover, and (b) does the run end up at the same loss-vs-token
+#   position as pure NTP. End-of-run val_bpb alone cannot answer this at 1500
+#   steps (the measured 600-step seed band is 0.013 bpb, far larger than any
+#   plausible effect) — compare the loss-vs-step curves, which is why
+#   `log_interval: 25` is set.
+#
+#   Expect a visible loss spike at the phase boundary; the paper reports rapid
+#   recovery below the phase-1 trajectory. A spike that does NOT recover is the
+#   failure mode.
+#
+# END-TO-END ARITHMETIC (why the headline is not 3x)
+#   3x on a fraction `r` of steps gives 1/(r/3 + (1-r)) overall:
+#     r=0.3 -> 1.28x    r=0.5 -> 1.50x    r=0.7 -> 2.14x
+#   So the phase ratio, not the bag size, is what decides the end-to-end win —
+#   and how high it can go is exactly what this screen measures.
+#
+# LAUNCH (queued behind the confirmation run by scripts/queue_after_confirmation.sh)
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/tst_screen_450m.yaml --output-dir runs/tst_screen_450m
+
+sweep:
+  name: tst_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25          # dense enough to see the phase transition
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      # FP8 stack held fixed across arms so the only variable is TST.
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # Control: no TST. Same config as the Muon screen's baseline.
+    - name: tst_off
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # The conservative setting: bag 2 captures 2.99x of the available 3.06x.
+    - name: tst_bag2_r30
+      model: *vanilla_450m
+      training:
+        tst_enabled: true
+        tst_bag_size: 2
+        tst_phase_ratio: 0.3
+
+    # Same bag, longer phase 1. If quality holds this is 1.50x end-to-end vs
+    # 1.28x above — the phase ratio is the real lever.
+    - name: tst_bag2_r50
+      model: *vanilla_450m
+      training:
+        tst_enabled: true
+        tst_bag_size: 2
+        tst_phase_ratio: 0.5
+
+    # Bag 4 prices the extra compression: only +2% step-time over bag 2, but
+    # twice the token structure discarded. Expected to be the first arm to show
+    # a quality cost; included to establish where the cliff is.
+    - name: tst_bag4_r30
+      model: *vanilla_450m
+      training:
+        tst_enabled: true
+        tst_bag_size: 4
+        tst_phase_ratio: 0.3
