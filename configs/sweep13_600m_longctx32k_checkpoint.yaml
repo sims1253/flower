@@ -1,0 +1,95 @@
+# Sweep 13, 600M @ seq=32768 — the Section 13 scale-up, enabled by FFN-only
+# activation checkpointing on the 5090.
+#
+# docs/training-speedups.md Section 13 names 600M @ seq=32K (2048 window) as the
+# regime where memory mechanisms become load-bearing, and projected it would
+# "need rented 8xGPU." That projection predates FFN-only activation checkpointing
+# (NEXT_IDEAS.md §10b). Analytic memory budget for this config (bf16, compiled
+# flex, Muon, ffn-checkpoint):
+#     weights (576M bf16)        ~1.2 GB
+#     grads                      ~1.2 GB
+#     Muon momentum (1x, bf16)   ~1.2 GB   (Muon has no fp32 m+v for 2D params)
+#     AdamW states (1D/norm)     ~0.1 GB
+#     master fp32 weights        ~2.3 GB
+#     attn activations retained  ~9.4 GB   (Q,K,V,O per block — ffn-ckpt keeps attn live)
+#     flex logsumexp (fp32)      ~0.1 GB
+#                              ----------
+#     total                     ~15.5 GB   (well under the 32 GB card)
+#
+# The earlier "600M OOMs at 32K" finding was measured WITHOUT torch.compile,
+# which made FlexAttention materialize the dense (B,H,T,T) scores (~38 GB for
+# 20 heads) — that was the eager-flex artifact, not the model. With compile the
+# fused kernel never materializes scores, and the real budget is ~15-19 GB.
+#
+# Architecture: d1280, L28, H20, SwiGLU (matched ~3456 hidden), vocab 16384.
+# ~576M params total (560M non-embedding core). batch 1 x accum 8 = effective
+# batch 262144 tokens.
+#
+# IMPORTANT: this is the *first* run at this scale on local hardware — verify it
+# fits with a short --steps 20 run before committing to the full schedule. If it
+# OOMs (fragmentation, compile overhead), drop to d1280/L24 (~500M) or switch
+# activation_checkpoint to true (full, slower but lowest peak ~3 GB).
+#
+# Launch:
+#   PYTHONPATH=. FLOWER_DATA_CACHE=data_cache \
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python -m flower.train \
+#     --config configs/sweep13_600m_longctx32k_checkpoint.yaml \
+#     --output-dir runs/sweep13_600m_longctx32k --device cuda
+
+model:
+  variant: vanilla_local
+  vocab_size: 16384
+  d_model: 1280
+  num_heads: 20
+  num_layers: 28
+  ffn_dim: 5120              # SwiGLU hidden auto-matched to ~3456 (2/3 * 5120)
+  max_seq_len: 32768
+  local_window: 2048         # seq/window = 16x — deep in the memory-relevant regime
+  rope_base: 10000.0
+  dropout: 0.0
+  norm_type: rmsnorm
+  ffn_activation: swiglu
+  ffn_param_match: true
+  qk_norm: true
+  use_bias: false
+  init_scheme: scaled
+  init_std: 0.02
+  bf16_cross_entropy: true     # CE in bf16 (doc S4)
+  flex_attention: true
+  activation_checkpoint: "ffn"   # the enabler — keeps attn live, checkpoints FFN only
+
+data:
+  dataset: fineweb_edu
+  tokenizer: "custom:tokenizers/fineweb_16k.json"
+  sequence_length: 32768
+  eval_seq_len: 32768
+  bytes_per_token: 4.279
+
+training:
+  batch_size: 1              # 600M @ 32K is tight; batch 1 x accum reaches effective batch
+  gradient_accumulation_steps: 8   # effective batch 262144 tokens
+  steps: 3000               # ~786M tokens
+  lr: 0.002                  # lower than 100M (bigger model)
+  warmup_steps: 500
+  lr_schedule: wsd
+  lr_decay_frac: 0.2
+  lr_final_frac: 0.0
+  grad_clip: 1.0
+  eval_interval: 500
+  checkpoint_interval: 500
+  save_checkpoints: true
+  device: auto
+  seed: 0
+  log_backend: tensorboard
+  composite_eval: false
+  optimizer: muon
+  ema_decay: 0.997          # eval-only EMA weight averaging (S12.4); zero training cost            # Muon's 1x momentum (vs AdamW's 8x) is part of why this fits
+  muon_lr: 0.0015
+  muon_momentum: 0.95
+  weight_decay: 0.01
+  weight_decay_exclude_embeddings: true
+  validation_steps: 20
+  validation_interval: 500
+  precision: bf16
+  compile_model: true
+  compile_mode: default

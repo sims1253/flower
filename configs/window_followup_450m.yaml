@@ -1,0 +1,127 @@
+# Window follow-up: where does the curve turn, and does the win survive?
+#
+# WHY
+#   configs/window_screen_450m.yaml measured (docs/profiling/window_screen_results.md):
+#       w512_isotime   1.06594   -0.06194 vs control, at equal wall-clock
+#       w512           1.10995   -0.01792 at matched steps
+#       w1024          1.11602   -0.01185
+#       w2048_control  1.12787   —
+#   Shorter windows are better on quality AND faster. -0.062 at equal wall-clock
+#   is 2.2x the best optimizer result ever measured on this model (per-head Muon
+#   at -0.027). Two things stop that from being a deployment decision.
+#
+# QUESTION 1: THE OPTIMUM IS UNBRACKETED
+#   2048 -> 1024 -> 512 improves monotonically with no turnover, so the best
+#   window is at or below 512 — outside the measured range. `w256` brackets it.
+#   If 256 also improves, the curve still has not turned and that is itself the
+#   finding (and cheap to extend to 128 later).
+#
+# QUESTION 2: IS IT A WARMUP ARTIFACT? (this is the one that decides deployment)
+#   The screen was 1500 steps; production runs are 10k. Early in training a model
+#   cannot yet exploit long range, so a short window may simply be a better prior
+#   that stops mattering — or inverts — once the model can use context.
+#   `w2048_4k` vs `w512_4k_isotime` re-runs the headline comparison at ~3x the
+#   horizon. If -0.062 holds, it is real. If it decays toward zero, the
+#   production default should NOT change and the screen measured a transient.
+#
+#   4000 steps rather than the full 10k because this is the derivative that
+#   matters — the direction and rough magnitude of the trend with horizon — and
+#   10k would cost ~26h for the pair against ~10h here.
+#
+# ISO-TIME SIZING USES THE IN-RUN RATIO, NOT THE BENCH
+#   The bench said 1.268x; measured in-run w512 was 76,826 / 64,221 = 1.196x.
+#   4000 x 1.196 = 4784 steps. Each arm gets a complete WSD schedule for its own
+#   step count, so neither is caught mid-decay — that is what makes the pair a
+#   fair equal-wall-clock comparison rather than a schedule artifact.
+#
+# LAUNCH
+#   nohup bash scripts/queue_window_followup.sh > runs_queue_window_followup.log 2>&1 &
+
+sweep:
+  name: window_followup_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      # FP8 stack fixed across every arm, matching muon_screen_450m and
+      # comp_muon_screen_450m so all three screens are mutually comparable.
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # Bracket the optimum: 2048 -> 1024 -> 512 never turned over.
+    - name: w256
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 256
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # --- the decision pair: does the iso-time win survive 3x the horizon? ---
+    - name: w2048_4k
+      model:
+        <<: *vanilla_450m
+        local_window: 2048
+      training:
+        steps: 4000
+
+    - name: w512_4k_isotime
+      model:
+        <<: *vanilla_450m
+        local_window: 512
+      training:
+        steps: 4784

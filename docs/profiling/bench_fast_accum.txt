@@ -1,0 +1,13 @@
+
+=== perf_control ===
+  55,215 tok/s (min 55,135 / max 55,444)   peak 19.18 GB   params 412,601,600
+
+=== fp8_fast_accum ===
+  55,658 tok/s (min 55,566 / max 55,880)   peak 19.18 GB   params 412,601,600
+
+arm                         tok/s   spread  vs control   peak GB
+perf_control               55,215     0.6%      1.000x     19.18
+fp8_fast_accum             55,658     0.6%      1.008x     19.18
+
+control = perf_control; batch 2 x accum 4 x seq 8192
+A gap smaller than the spread column is not evidence. Re-run with more --repeats.

@@ -11,6 +11,7 @@ wheels/
 
 # Run outputs and artifacts
 runs/
+runs_*.log
 reports/
 data_cache/
 .pytest_cache/
@@ -19,16 +20,26 @@ data_cache/
 .codex
 .zcode/
 
+# Profiler output (regenerable via scripts/profile_step.py + analyze_profile.py).
+# The Chrome traces are 150-500MB each; the raw log + summary.json are machine-
+# specific. Keep the docs/profiling/*.md writeups tracked, ignore everything
+# under traces/ and the throwaway run log.
+docs/profiling/traces/
+docs/profiling/traces_fp8/
+docs/profiling/run.log
+
 # Model weights / large checkpoints
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 
-# Tokenizers are regenerable via scripts/train_custom_tokenizer.py and
-# scripts/compare_tokenizer_algorithms.py (see tokenizers/README.md).
+# Tokenizers are regenerable via scripts/train_custom_tokenizer.py,
+# scripts/compare_tokenizer_algorithms.py and scripts/compare_vocab_sizes.py
+# (see tokenizers/README.md).
 tokenizers/*.json
 tokenizers/algo/
+tokenizers/vocab_sweep/
 
 # ZCode / agent scratch
 .t3/

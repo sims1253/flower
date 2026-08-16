@@ -45,6 +45,15 @@
 #   scp -i ~/.ssh/id_ed25519 runs/sweep13_100m_phase0/vanilla_local_step15000.pt \
 #       root@<host>:/workspace/flower/runs/sweep13_100m_phase0/
 # build_still_model now FAILS loudly if still_pretrained_base is missing.
+#
+# NOTE: this config stays at seq=1024 because the Still compactor bake-off
+# (phase1) inherits the base's architecture and state_dict layout — changing
+# sequence length here would invalidate every phase1 arm. For the NEW long-
+# context memory-mechanism direction enabled by the speedups work, use
+# configs/sweep13_100m_longctx_phase0.yaml (seq=8192, flex_attention=true).
+# At seq=1024 FlexAttention is ~18% slower than SDPA and saves no memory, so it
+# is intentionally NOT enabled here. See docs/sweeps/SWEEP13_PIPELINE.md
+# "Long-context: what FlexAttention unlocks".
 
 model:
   variant: vanilla_local
@@ -65,6 +74,7 @@ model:
   use_bias: false
   init_scheme: scaled
   init_std: 0.02
+  bf16_cross_entropy: true     # CE in bf16 (doc S4)
 
 data:
   dataset: fineweb_edu
@@ -103,6 +113,7 @@ training:
   log_backend: tensorboard
   composite_eval: false
   optimizer: muon
+  ema_decay: 0.997          # eval-only EMA weight averaging (S12.4); zero training cost
   muon_lr: 0.002            # larger model -> lower muon LR (matches sweep_still_scale)
   muon_momentum: 0.95
   weight_decay: 0.01
@@ -112,4 +123,8 @@ training:
   # --- next-gen pipeline ---
   precision: bf16           # TF32 matmuls + bf16 autocast; fp32 master weights
   compile_model: true
-  compile_mode: default     # `reduce-overhead` adds CUDA graphs; try after this works
+  # `default` measured faster than `reduce-overhead` here: seq1024/b16/accum4 is
+  # a high-launch-rate shape where CUDA-graph capture overhead outweighs the
+  # launch savings (measured -7%: 90k -> 84k tok/s). reduce-overhead wins on the
+  # long-context compute-bound shapes (see sweep13_100m_longctx_phase0.yaml).
+  compile_mode: default

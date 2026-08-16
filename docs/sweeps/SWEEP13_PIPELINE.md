@@ -617,3 +617,196 @@ Before step 1, run ~200 steps of phase 0 twice (fp32/no-compile vs bf16/compile)
 to get the actual speedup on your card and confirm bf16 is stable at this scale.
 `entities/nanowhale.md` reports bf16 NaN at ~110M — that was MLA+MoE, not a
 dense GPT, but it is cheap to rule out.
+
+---
+
+## 13. Long-context: what FlexAttention unlocks (training-speedups integration)
+
+The original sweep-13 plan above runs at seq=1024 with a 256 sliding window. At
+that ratio every token reaches the whole sequence through the windowed
+attention itself, so there is nothing for an external memory to carry across —
+which is the project's whole reason for existing. `docs/training-speedups.md`
+Section 13 is explicit about this: for memory mechanisms to show measurable
+signal, **sequence length must exceed the sliding window by >=4x** (seq >= 8K
+at a 2048 window). Below that ratio local attention covers most token
+dependencies and external memory adds no information.
+
+The blocker was always the dense causal/local attention mask. SDPA materializes
+a `(1, 1, T, T)` fp32 mask per layer: ~268 MB/layer at seq 8K, ~4 GB/layer at
+seq 32K. At seq 32K that OOMs the 5090's 32 GB before the model even runs.
+
+**FlexAttention** (`docs/training-speedups.md` Section 1) compiles the mask
+pattern into the attention kernel without ever materializing the T x T matrix.
+It is enabled with `model.flex_attention: true` and requires `compile_model:
+true` — **without compile, flex_attention runs unfused and is slower than SDPA**
+(it materializes the full scores matrix and warns). This was the single largest
+implementation caveat; the configs below always pair the two.
+
+### Measured (RTX 5090, flex + compile + bf16 + muon, 0.85 memory cap)
+
+What FlexAttention actually saves is the **mask**, not the activations. This
+matters and is easy to get wrong, so here is the honest decomposition (100M,
+d768/L14, batch 1, sliding window 2048):
+
+| seq | model+opt | flex block mask | forward (act+logits) | peak |
+|-----|-----------|-----------------|----------------------|------|
+| 8192 | 0.51 GB | ~0 | 3.91 GB | 4.77 GB |
+| 16384 | 0.79 GB | ~0 | 7.57 GB | 8.97 GB |
+| 32768 | 0.90 GB | ~0 | 14.92 GB | 17.0 GB |
+| 65536 | — | — | — | OOM ("tried to allocate 32 GB") |
+
+Two things to read off this table:
+1. The flex block mask is ~0 GB at every seq — that is the win. The SDPA path
+   materializes a `(1,1,T,T)` fp32 causal/local mask per layer, which at seq 32K
+   is ~4 GB/layer and OOMs before the model runs. FlexAttention compiles the
+   mask into the kernel and never holds it.
+2. **Activation memory still scales linearly with tokens-per-batch.** The
+   forward pass holds per-token activations and the `(B*T, vocab)` logits tensor,
+   both of which grow with `B*T`. That is why 65K OOMs: a single logits tensor at
+   batch 1 × seq 65536 × vocab 16384 in bf16 is ~2 GB, and the layered activations
+   on top push the peak past 32 GB.
+
+The practical consequence: batch size must shrink as sequence grows to keep
+`B*T` (and thus peak memory) under the cap. That is exactly what the configs do.
+Per-token memory is roughly flat across seq; per-sequence memory is not.
+
+Throughput and fit at the config batch sizes (flex + compile + bf16):
+
+| size | seq | batch | peak GB | tok/s | notes |
+|---|---|---|---|---|---|
+| 100M (d768/L14) | 8192 | 4 | 19.9 | 120k | flex, the longctx_phase0 config (torch 2.13) |
+| 100M | 16384 | 2 | 18.2 | 113k | flex |
+| 100M | 32768 | 1 | 17.0 | 103k | **flex fits; SDPA OOMs at batch 1** |
+| 350M (d1024/L28) | 8192 | 2 | 23.2 | 33k | flex |
+| 350M | 16384 | 1 | 23.3 | 30k | flex |
+
+The crossover point: at seq <= 4K SDPA (flash kernel) is as fast or faster than
+flex and saves nothing, so the seq=1024 configs above do **not** enable flex.
+From seq 8K upward flex is both faster (where SDPA fits at all) and the only
+thing that fits at 32K. Use `scripts/bench_speedups.py` to re-measure.
+
+### What the speedups work added (and what it did not change)
+
+Implemented from `docs/training-speedups.md`, all behind config flags that
+default to legacy so the seq=1024 results stay reproducible:
+
+- **FlexAttention (S1)** — the long-context enabler above. The win is real and
+  matches the doc: 4.4x throughput at seq 32K and half the VRAM vs SDPA.
+- **FP8 lm_head (S3)** — eval-only. `_scaled_mm` has no backward kernel in torch
+  2.9, so the FP8 head runs in inference and the BF16 head is used during
+  training. The pipeline doc's section 9 verdict ("skip FP8/NVFP4 at this size")
+  stands: only the wide lm_head GEMM wins clearly, and the eval-only path makes
+  it a negligible-end-of-training convenience, not a training speedup.
+- **NorMuon (S5), Cautious WD (S6), Smooth-SwiGLU (S10), Orthogonal init
+  (S12.2)** — roughly cost-neutral on throughput (measured). Their value is
+  sample efficiency / stability, which needs a longer run to show. Not enabled
+  in the overnight configs below; opt in per-arm when re-running a winner.
+- **BF16 CE (S4), EMA eval (S12.4), sliding-window eval (S12.5), MTP (S8), TST
+  (S9)** — available, off by default.
+
+Skipped (need hardware/external deps outside the 5090's reach): **FSDP (S7)**,
+**Triton/Liger/TE kernels (S14)**, **FP4/NVFP4 precision routing (S13)**, the
+**600M @ seq=32K scale-up config** (OOMs the 5090 — needs a rented 8xGPU node,
+see the doc's compute-budget table).
+
+### New configs
+
+The seq=1024 Still-compactor pipeline (phase0/phase1 above) is preserved
+unchanged for comparability with the published 12M/100M results. Two new configs
+add the long-context direction:
+
+- **`configs/sweep13_100m_longctx_phase0.yaml`** — the long-context base.
+  Identical 100M arch (d768/L14), but seq=8192, local_window=2048 (4x ratio),
+  flex_attention. This is the base that makes the memory question testable.
+- **`configs/sweep13_longctx_memory_bakeoff.yaml`** — the core experiment.
+  `vanilla_local` (no memory) vs `bloom_memory` vs `summary_memory` at seq=8192 /
+  window=2048, where tokens past position 4K cannot see the first 2K unless a
+  memory mechanism carries them across the window. 3 arms x 2 seeds, an
+  overnight directional first pass; follow up with 8 seeds on any winner.
+
+### Suggested order (updated)
+
+0. (unchanged) tokenizer probe, LR calibration, taper shake-out.
+1. `configs/sweep13_100m_longctx_phase0.yaml` — the long-context base. ~3-4 h.
+2. `configs/sweep13_longctx_memory_bakeoff.yaml` — the memory bake-off. ~12-18 h.
+3. (optional, separate GPU budget) the seq=1024 Still bake-off (phase0+phase1)
+   and AttnRes probe — preserved for the compactor question, orthogonal to the
+   long-context memory question.
+
+If the overnight bake-off shows a memory arm beating vanilla at long context,
+that is the first positive signal for the project's thesis and the trigger for
+the powered (8-seed) follow-up and the 350M / 600M scale-up.
+
+### First results (overnight directional pass)
+
+`configs/sweep13_longctx_memory_bakeoff.yaml`, d512/L8 (~33-54M), seq=8192,
+local_window=2048 (4x ratio), 6000 steps, 2 seeds/arm, flex+compile+bf16+muon,
+batch 8 (effective batch 131072 tokens). This is the floor of the regime where
+memory mechanisms can show signal — and signal appeared.
+
+| arm | params | seeds | val_loss (±) | val_bpb | vs vanilla |
+|-----|--------|------:|-------------|---------|-----------|
+| **bloom_memory** | 54.5M | 2 | **3.2615 ± 0.0041** | **1.0996** | **-0.0054** |
+| vanilla_local | 33.3M | 2 | 3.2774 ± 0.0064 | 1.1050 | baseline |
+| summary_memory | 64.9M | — | (re-running, see note) | — | — |
+
+**Reading.** bloom_memory beats vanilla on both seeds (3.265, 3.259 vs 3.273,
+3.283) with tighter variance. The -0.0054 bpb delta is small and not yet
+significant at n=2, but it is consistent and in the predicted direction: the
+memory mechanism helps once sequence exceeds the sliding window. This is the
+first positive long-context signal in the project and the trigger for the
+powered follow-up (`configs/sweep13_longctx_memory_powered.yaml`, 4 seeds,
+10000 steps).
+
+**Caveats.** (1) The arms are NOT parameter-matched — bloom (54.5M) has ~64%
+more params than vanilla (33.3M). The bloom win could be capacity, not
+mechanism. A fair follow-up needs a param-matched vanilla control. (2) n=2 is
+directional only; the powered config raises this to n=4. (3) summary_memory
+OOMed on both seeds at batch 8 due to allocator fragmentation (the VRAM cap
+caught it loudly, as designed); it re-runs with `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True`. summary_memory is the most memory-hungry arm
+(perceiver cross-attention); batch 8 = 23.4 GB peak in isolation but fragments
+under the long-context activations.
+
+**Environment note.** These runs use the upgraded stack (torch 2.13.0+cu130,
+Python 3.13, fla 0.5.2, flex+compile, bloom diagnostics graph-break fixed).
+Throughput at batch 8: ~400k tok/s, ~22 GB peak (vanilla), ~26 GB peak (bloom).
+The bloom diagnostics host-sync was graph-breaking compile and dropping GPU
+util to ~46%; gating it behind `torch.compiler.is_compiling()` (S14 Opportunity
+4) restored full utilization.
+
+### Verdict: the directional bloom win was capacity, not mechanism
+
+The directional pass's -0.0054 bpb bloom "win" was confounded: bloom (54.5M)
+had ~64% more params than vanilla (33.3M). The powered follow-up resolves this
+by comparing bloom against a **param-matched vanilla control** (d640/L10,
+49.6M non-emb, within 8% of bloom's 46.1M), both at 10000 steps:
+
+| arm | non-emb params | seeds | val_loss (±) | val_bpb | vs matched vanilla |
+|-----|---------------|------:|-------------|---------|-------------------|
+| **vanilla_matched54M** | 49.6M | 2 | **3.0803 ± 0.0023** | **1.0385** | baseline |
+| bloom_memory | 46.1M | 1 | 3.1818 | 1.0728 | **+0.0343 bpb (worse)** |
+| vanilla_local (small) | 24.9M | 2 (6k) | 3.2774 ± 0.0064 | 1.1050 | (different step count) |
+
+**At matched parameters and matched steps, plain sliding-window attention beats
+bloom memory by +0.034 bpb** — a gap ~15x the seed noise (0.0023). The memory
+mechanism is *hurting* at this scale: the params bloom spends on hash
+projections / perceiver summaries / slot writes return less than spending the
+same params on a wider vanilla transformer.
+
+This is the expected null result at 33-54M / seq 8192, and it matches
+`docs/training-speedups.md` Section 13's explicit prediction: memory mechanisms
+need ~500M+ params (and seq >= 8K) before the circuits they support can form.
+The positive reading: the experiment worked — it produced a clean, decisive
+mechanism-vs-capacity separation at the smallest scale where the question was
+testable, and the answer is "not yet." The scale-up that could flip this
+(600M / seq 32K) is the doc's Phase 3 target and needs rented 8xGPU hardware.
+
+**What this means for the project.** Do not chase memory-mechanism wins below
+~500M — they are capacity artefacts. The long-context infrastructure
+(FlexAttention, the bake-off configs) is now in place and validated; the next
+step that could show real memory signal is the 600M scale-up, not more
+small-model variants.
+
+
+

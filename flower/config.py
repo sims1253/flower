@@ -209,6 +209,158 @@ class ModelConfig:
     attn_res_blocks: int = 8
     attn_res_key: str = "full"  # full | sliced
     attn_res_rank: int = 64
+    # ------------------------------------------------------------------
+    # docs/training-speedups.md. Each knob defaults to the legacy
+    # behaviour so published runs reproduce; opt in per config.
+    # ------------------------------------------------------------------
+    # S1: FlexAttention. Compiles the causal/local mask into the attention
+    # kernel without materializing the T x T mask — required for seq=32K.
+    # On CPU / when off, the SDPA path is used (flex needs CUDA to be fast
+    # but does run, unfused, for tests).
+    flex_attention: bool = False
+    # S2: attention-window warmup. Linearly ramps every attention module's
+    # local_window from attn_warmup_start to local_window over
+    # attn_warmup_steps training steps. 0 disables (use local_window always).
+    attn_warmup_start: int = 256
+    attn_warmup_steps: int = 0
+    # S2/S14-bugfix: quantise the warmup window to coarse steps. Each distinct
+    # window value forces FlexAttention's create_block_mask to recompile (the
+    # mask_mod closure captures the window), so a per-step ramp over N warmup
+    # steps causes N recompiles and exhausts torch.compile's recompile limit
+    # (default 8), after which flex falls back to the eager dense path and
+    # throughput collapses. ``attn_warmup_quantize`` is the number of *steps*
+    # between window changes: the ramp is divided into
+    # ceil(warmup_steps / quantize) segments, each held at a constant window.
+    # e.g. quantize=32 over a 256-step warmup = 8 segments = 8 recompiles
+    # (under the limit). 0 = the legacy per-step ramp (a distinct window every
+    # step). The final window is always local_window regardless of quantize.
+    # The ramp's training-dynamics benefit (start narrow, widen) is preserved
+    # — it jumps in `quantize`-step plateaus instead of 1-position steps.
+    attn_warmup_quantize: int = 0
+    # S3: FP8 matmul for the lm_head projection (Blackwell/Hopper, bf16 only).
+    fp8_lm_head: bool = False
+    # S4: compute cross-entropy in BF16 instead of FP32.
+    bf16_cross_entropy: bool = False
+    # S14-5b: Liger FusedLinearCrossEntropy. Fuses the tied lm_head matmul + CE
+    # so the (B*T, vocab) logits tensor is never materialized during training —
+    # the binding memory constraint at seq=8192/vocab=16K and the blocker for
+    # seq=32K on the 32GB 5090. Training-time only; eval keeps the eager logits
+    # path so FP8-head / logprob consumers are untouched. CUDA-only (Triton
+    # kernel); the forward falls back to the eager path automatically when the
+    # flag is on but CUDA is unavailable. False reproduces old runs exactly.
+    fused_linear_ce: bool = False
+    # S8: Multi-Token Prediction (final-runs only; changes the loss surface).
+    # Predicts N extra future tokens with untied heads; aux losses weighted by
+    # mtp_weight. 0 disables (standard next-token loss).
+    mtp_extra_heads: int = 0
+    mtp_weight: float = 0.5
+    # FP8-attention quality probe (NOT a speedup — it is slightly slower than
+    # bf16). Rounds Q/K/V to e4m3 in the attention forward with a
+    # straight-through gradient, so the quality cost of FP8-precision attention
+    # can be measured in an ordinary training run without first writing an FP8
+    # attention backward. Simulates Q/K/V only, not the softmax probabilities,
+    # so it is a LOWER BOUND on a real FP8 kernel's error. See
+    # flower/models/base.py::_fake_quant_e4m3 and
+    # flower/kernels/fp8_swa_attention.py.
+    fp8_attention_sim: bool = False
+    # S10: Smooth-SwiGLU. Per-channel scale on the `up` projection that makes
+    # the SwiGLU multiply numerically equivalent but with a narrower dynamic
+    # range, stabilising FP8/FP4 training. No-op for GELU FFNs.
+    smooth_swiglu: bool = False
+    # S14-checkpoint: activation checkpointing on the transformer blocks.
+    # Wraps each block's forward in torch.utils.checkpoint during training so
+    # activations are not retained for backward (recomputed from the block
+    # inputs instead), cutting activation memory from O(num_layers) saved
+    # tensors to O(1). Trades ~one extra forward per backward (~25-33% more
+    # compute) for a large activation-memory reduction — the enabler for
+    # seq=32K on the 32GB 5090 (Section 13). use_reentrant=False (the modern
+    # recommended path) preserves the differentiable memory tensor that flows
+    # between blocks and saves/restores RNG state so dropout is identical
+    # between the two passes. No-op in eval mode and when False (old runs
+    # reproduce exactly). AttnRes (depth_router) is incompatible: it reads
+    # inter-block deltas, so checkpointing is skipped when depth_router is set.
+    #
+    # Values:
+    #   False        -> off (default; old runs reproduce).
+    #   True         -> full checkpointing: recompute EVERY activation in the
+    #                   block during backward. Maximum memory saving, maximum
+    #                   recompute cost (~25-33% throughput loss).
+    #   "selective"  -> selective checkpointing: recompute only the large
+    #                   activations (default byte-threshold policy targets the
+    #                   FFN intermediate, the dominant tensor), keeping cheap
+    #                   ones (residual stream, norms) materialized so they are
+    #                   not recomputed. Recovers much of the throughput cost
+    #                   while retaining most of the memory saving. Uses
+    #                   torch.utils.checkpoint.create_selective_checkpoint_contexts
+    #                   (torch 2.13) with a context_fn + use_reentrant=False;
+    #                   the same RNG-state-save/restore and flex-compile
+    #                   workarounds as full checkpointing apply.
+    #   "ffn"        -> checkpoint ONLY the feed-forward sub-layer, keeping
+    #                   attention (Q/K/V/O) materialized. The best throughput/
+    #                   memory tradeoff at long context: FlashAttention/Flex
+    #                   already recomputes the O(T^2) score matmul in backward
+    #                   from saved Q,K,V, so the only extra cost full
+    #                   checkpointing adds on the attention side is the cheap
+    #                   qkv/out projections — but it also forces dropping Q,K,V
+    #                   which are large at long T. Checkpointing only the FFN
+    #                   (whose intermediate is the biggest single activation AND
+    #                   whose matmuls are cheap to recompute) saves ~37% peak
+    #                   memory for only ~10% throughput cost, vs full's ~50%
+    #                   saving for ~100% cost. Measured at d768/L14/seq8192/b4:
+    #                   none 15.3GB/185ms, full 3.3GB/373ms, ffn 9.7GB/203ms.
+    #                   vanilla_local blocks only (memory-variant forwards are
+    #                   left to full/selective; "ffn" falls back to "full" for
+    #                   them with a warning).
+    activation_checkpoint: bool | str = False
+    # S12.2: orthogonal weight initialisation for 2D matrices (pairs with Muon).
+    orthogonal_init: bool = False
+    # S13: per-component precision routing (scaffolding). The actual FP4/FP8
+    # matmul casting requires NVIDIA's transformer_engine and is NOT
+    # implemented here — these fields are forward-looking config only and must
+    # stay bf16 (memory_precision is bf16-locked by design: Flower's memory
+    # write/read path needs high dynamic range).
+    ffn_precision: str = "bf16"  # bf16 | fp8 | fp4
+    attn_precision: str = "bf16"  # bf16 | fp8
+    memory_precision: str = "bf16"  # bf16 only
+    head_precision: str = "bf16"  # bf16 | fp8
+    bf16_guard_blocks: int = 0
+    # S14 Opportunity 3: analytical Titans surprise gradient (research
+    # contribution — see NEXT_IDEAS.md §7). Replaces the per-step
+    # torch.autograd.grad inner loop in TitansMACBlock._surprise_update with a
+    # closed-form gradient of the associative-retrieval MSE w.r.t. memory slots.
+    # Eliminates building/destroying an inner autograd graph every forward step
+    # while keeping the outer CE gradient intact (every op is a standard
+    # differentiable PyTorch op). The closed form is exact — it matches
+    # torch.autograd.grad at fp32 ~1e-9 (gate: 1e-4), so the Titans write rule
+    # is numerically unchanged and the alpha_logit/write_scale semantics are
+    # preserved. False reproduces the legacy autograd path bit-for-bit (old
+    # runs and checkpoints reproduce).
+    titans_analytical_surprise: bool = False
+
+    def __post_init__(self) -> None:
+        # S13: validate the precision-routing fields. Keep the actual FP4/FP8
+        # matmul casting (which requires NVIDIA's transformer_engine) out of
+        # scope; these fields are forward-looking config scaffolding only.
+        if self.ffn_precision not in {"bf16", "fp8", "fp4"}:
+            raise ValueError(f"ffn_precision must be bf16|fp8|fp4, got {self.ffn_precision!r}")
+        if self.attn_precision not in {"bf16", "fp8"}:
+            raise ValueError(f"attn_precision must be bf16|fp8, got {self.attn_precision!r}")
+        if self.memory_precision != "bf16":
+            raise ValueError(
+                f"memory_precision must stay 'bf16' (Flower's memory write/read path "
+                f"needs high dynamic range; low precision collapses routing decisions), "
+                f"got {self.memory_precision!r}"
+            )
+        if self.head_precision not in {"bf16", "fp8"}:
+            raise ValueError(f"head_precision must be bf16|fp8, got {self.head_precision!r}")
+        # S14-checkpoint: activation_checkpoint accepts False / True / "selective".
+        # bool|str validated here so a typo (e.g. "selectiv") fails loudly at
+        # config load rather than silently behaving like "off" in forward.
+        if self.activation_checkpoint not in {False, True, "selective", "ffn"}:
+            raise ValueError(
+                f"activation_checkpoint must be False, True, 'selective', or 'ffn', "
+                f"got {self.activation_checkpoint!r}"
+            )
 
 
 @dataclass
@@ -239,6 +391,21 @@ class DataConfig:
     # computes true per-document BPB for final numbers; this is the cheap
     # in-loop approximation.)
     bytes_per_token: float | None = None
+    # DataLoader worker count for the *training* stream. The baseline profile
+    # (docs/profiling/baseline_profile.md) reaches 52.2k tok/s on synthetic
+    # tokens while the real 450M runs logged 41.9-44.8k — a ~17% gap that is
+    # entirely tokenization throughput.
+    #
+    # NOT order-preserving: each worker holds its own streaming iterator and
+    # shards documents by `islice(worker_id, None, num_workers)`, so the worker
+    # count determines which documents land in which batch. Changing it
+    # perturbs the training data order the same way a different data seed
+    # would — the token *set* is unchanged, the interleaving is not. Runs at
+    # different worker counts are therefore seed-comparable, not bit-comparable;
+    # the 450M seed band (0.0004 BPB) is the yardstick for that. 2 is the
+    # legacy default and reproduces the published runs.
+    num_workers: int = 2
+    prefetch_factor: int = 4
 
 
 @dataclass
@@ -285,7 +452,39 @@ class TrainingConfig:
     #   bf16 -> TF32 matmuls + bf16 autocast for the forward/backward
     # bf16 needs no GradScaler (unlike fp16); master weights stay fp32.
     # ------------------------------------------------------------------
+    # Scalar-logging cadence, in steps. 0 = legacy behaviour (derive it from
+    # `eval_interval`), which in the production configs means logging every 1000
+    # steps — only 11 points in a 10k-step run, far too coarse to see a loss
+    # spike or a gradient-norm excursion. Set this to 25-50 for any run whose
+    # stability you intend to reason about.
+    log_interval: int = 0
     precision: str = "fp32"  # fp32 | tf32 | bf16
+    # ------------------------------------------------------------------
+    # FP8 linear-layer training (torchao). Targets the cutlass GEMM bucket that
+    # the baseline profile measures at 62.1% of kernel time. Requires
+    # precision: bf16 (FP8 layers consume bf16 activations) and CUDA sm_89+.
+    #
+    # Measured at the 450M block shape on sm_120: tensorwise 1.39x, rowwise
+    # 1.01x. Rowwise is safer numerically but buys nothing on this GPU, so
+    # tensorwise is the default and the guardrails carry the risk — see
+    # flower/precision.py. Pair with model.smooth_swiglu (S10).
+    #
+    # Off by default: FP8 changes numerics, so every published run reproduces.
+    # ------------------------------------------------------------------
+    fp8_linear: bool = False
+    fp8_recipe: str = "tensorwise"  # tensorwise | rowwise
+    # Number of transformer blocks at each end kept in bf16. The first block
+    # sees raw embeddings and the last feeds the LM head; both carry the widest
+    # activation ranges. Nemotron-H uses 4 at 28 layers; 1 at 20 layers is the
+    # proportionate floor. 0 converts every block.
+    fp8_keep_bf16_blocks: int = 1
+    # cuBLASLt fast accumulation for the two *backward* FP8 GEMMs (dgrad,
+    # wgrad). torchao's tensorwise recipe already fast-accums the forward GEMM;
+    # the backward GEMMs default to fp32 accumulation, together ~2/3 of the
+    # _scaled_mm bucket (28.1% of CUDA time in the fp8_stack profile). May be
+    # a no-op on sm_120 — bench_arms decides. Changes numerics (lower-precision
+    # K accumulation), so quality-screen before adopting.
+    fp8_use_fast_accum: bool = False
     compile_model: bool = False
     compile_mode: str = "default"  # default | reduce-overhead | max-autotune
     # Sweep 2: optimizer choice. "adamw" = legacy default. "muon" = Muon for 2D weights + AdamW for 1D/embeddings/heads.
@@ -309,6 +508,61 @@ class TrainingConfig:
     #   cubic5   = 5x cubic (1.5,-0.5,0), 10 matmuls (-33% orth compute, ~1e-3 val loss per arXiv:2606.00371)
     #   hybrid_v4 = 8x quintic + 2x stabilize (2,-1.5,0.5) pinning singular values to 1 (DeepSeek-V4)
     muon_ns_schedule: str = "quintic5"
+    # Nesterov momentum on the Muon group. True reproduces every existing run
+    # (it was hardcoded True and not configurable, so it could not be tested).
+    # NVIDIA's large-scale optimizer study (arXiv:2607.20548, up to 100M-token
+    # batches) reports Nesterov did not help for either Muon or SOAP and was
+    # skipped for both — so this is worth an A/B here rather than an assumption.
+    # Turning it off also removes one add per parameter per step.
+    muon_nesterov: bool = True
+    # Contra-Muon (github.com/nilin/contra-muon). Subtracts `contra_muon` times
+    # the Frobenius-normalised pre-orthogonalisation update from the Newton-Schulz
+    # output, which damps large singular directions more than small ones and so
+    # increases singular-value diversity. Multiple nanoGPT Track-3 records.
+    # 0.0 = off (reproduces every existing run). The reference uses
+    # CONTRA_MUON=0.4 meaning an effective 0.2 coefficient; start there.
+    contra_muon: float = 0.0
+    # Per-head / Group Muon (arXiv:2605.08933; Kimi K3 §2.5). Orthogonalise each
+    # attention head's block separately instead of the fused QKV / output matrix,
+    # so every head gets its own unit-spectral-norm update rather than sharing
+    # one across all heads. Kimi K3 runs this at 2.8T params for stability;
+    # nanoGPT PR #253 measured ~10 fewer steps. False reproduces existing runs.
+    muon_per_head: bool = False
+    # Compositional Muon (github.com/tilde-research/comp-muon-release). Muon
+    # controls the operator norm of each matrix in isolation, but the loss sees
+    # the composed circuits W_Q W_K^T and W_O W_V. CM whitens each factor's
+    # gradient by its partner's inverse Gram root before and after the spectral
+    # sign, so the *product's* update is what gets norm-controlled.
+    #
+    # This is the principled generalisation of `muon_per_head`, which was the
+    # best arm in the 1500-step Muon screen (-0.027 val_bpb): CM's QK rule is
+    # head-local by construction and adds the partner whitening plain per-head
+    # splitting lacks. CM takes precedence over `muon_per_head` on the attention
+    # matrices — they are the same parameters, and stacking them is undefined.
+    comp_muon: bool = False
+    # Whitening regime. True = isotropic (replace each head's inverse Gram root
+    # with one scalar), which degenerates to a partner-rescaled per-head Muon at
+    # near-zero cost over `muon_per_head` and is the honest ablation against it.
+    # False = the full coupled-Newton-Schulz matrix inverse root: 25 extra bmms
+    # on (head_dim, head_dim) blocks per circuit, the method as published.
+    comp_muon_isotropic: bool = False
+    # Gram damping `lam` in C = (W^T W + lam I)^{1/2}. The released default.
+    comp_muon_damping: float = 1e-2
+    # CM learning-rate multiplier on top of `muon_lr`. CM applies no spectral
+    # shape-scale, so its effective step differs from Muon's at the same LR; this
+    # is the knob for matching them without moving `muon_lr` (which would also
+    # move every non-attention matrix).
+    comp_muon_mp: float = 1.0
+    # S14 Opportunity 1/5a (NEXT_IDEAS.md section 5): batch the Newton-Schulz
+    # iteration over same-shape params — one `bmm` per NS line per shape group
+    # instead of one `mm` per param. The optimizer step is launch-bound (GPU idle
+    # ~40% of step wall-clock waiting on per-param Python dispatch), so fusing
+    # launches is the win, not fusing the per-matrix matmuls. Batched NS is
+    # mathematically identical to the per-matrix path (a `bmm` over a stack
+    # reduces slice-for-slice to looping the legacy `mm`), so it only differs by
+    # bf16 kernel-selection noise. False reproduces the exact legacy dispatch and
+    # is the fallback for reproducing runs made before this flag existed.
+    muon_ns_batched: bool = True
     # Aurora (optimizer: "aurora"). `aurora_pp_iterations` is the number of
     # row-oblique rebalancing passes around the polar step; 2 is the released
     # default. Square matrices reduce exactly to Muon, so this only changes
@@ -337,6 +591,39 @@ class TrainingConfig:
         "cond",
         "flow",
     )
+    # ------------------------------------------------------------------
+    # docs/training-speedups.md — optimizer / training-schedule knobs.
+    # All default to the legacy behaviour.
+    # ------------------------------------------------------------------
+    # S5 (NorMuon, arXiv:2510.05491): normalise the Muon update to unit
+    # Frobenius norm before the LR/aspect-ratio scaling step.
+    norm_update: bool = False
+    # S6 (Cautious Weight Decay): only decay a weight where the optimizer
+    # update is already shrinking it (update * weight > 0). Replaces standard
+    # weight_decay for the Muon group when > 0; for the AdamW group, replaces
+    # decoupled weight decay. 0.0 = disabled.
+    cautious_wd: float = 0.0
+    # S9 (Token Superposition Training, arXiv:2605.06546). Phase 1 compresses
+    # `tst_bag_size` consecutive tokens into bags and trains with multi-hot
+    # cross-entropy; phase 2 reverts to standard next-token prediction. The
+    # final model is architecturally identical to a baseline. Disabled by
+    # default.
+    tst_enabled: bool = False
+    tst_bag_size: int = 4
+    tst_phase_ratio: float = 0.3
+    # S12.4 (EMA weight averaging for evaluation): maintain an EMA copy of
+    # the weights (decay) and use it for validation/final eval. 0.0 disables.
+    ema_decay: float = 0.0
+    # Batch size for validation/eval forwards. None (default) uses the training
+    # batch_size. Set lower than batch_size when the eval forward spikes memory
+    # higher than training (e.g. the 450M long-context run trains at batch 2 but
+    # the no-grad eval logits tensor OOMs at batch 2, so eval at batch 1).
+    eval_batch_size: int | None = None
+    # VRAM allocator cap fraction (train.py configure_vram_limit). 0.85 default
+    # leaves headroom against WSL2 silent shared-memory spill. Raise for large
+    # models whose validation-pass memory spikes above the training steady-state
+    # (e.g. 0.95 for the 450M long-context runs). 0.0 = no cap.
+    vram_fraction: float = 0.85
 
 
 @dataclass

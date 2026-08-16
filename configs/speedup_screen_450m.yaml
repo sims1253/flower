@@ -1,0 +1,307 @@
+# Speedup screening sweep — 450M vanilla_matched, short runs.
+#
+# PURPOSE
+#   Screen candidate training speedups against the finished baseline in
+#   runs/sweep13_450m_longctx (vanilla_matched, 412.6M params, 10k steps):
+#     seed 0 -> val_bpb 0.90234, 44,810 tok/s
+#     seed 1 -> val_bpb 0.90270, 41,918 tok/s
+#   The seed band is 0.0004 BPB — the yardstick any numerics-changing arm must
+#   land inside.
+#
+# MEASUREMENT DISCIPLINE
+#   Compare arms ONLY against the `bf16_baseline` arm in this same file, never
+#   against the 52,207 tok/s figure in docs/profiling/baseline_profile.md. That
+#   number is steady-state on synthetic tokens over 30 steps; the run-level
+#   tok/s in metrics.json is a whole-run average that includes compile warmup,
+#   validation passes and checkpoint writes, and a 17-hour run also sits at a
+#   lower sustained clock than a 2-minute profile. The two are not comparable,
+#   and the ~17% between them is NOT recoverable overhead — measured: the data
+#   loader sustains 1.08M tok/s at the default 2 workers against a 52k tok/s
+#   consumption rate, so input is not the constraint (scripts/bench_data_workers.py).
+#
+#   All arms here share seed 0, the same data order, and the same step count, so
+#   their tok/s and loss traces are directly comparable to each other.
+#
+# WHAT IS BEING SCREENED
+#   fp8_tensorwise  — the headline candidate. Targets the cutlass GEMM bucket
+#     that the baseline profile puts at 62.1% of kernel time. Measured 1.39x on
+#     an isolated 450M block fwd+bwd; this asks what survives at model scale.
+#   fp8_smooth      — same, plus smooth_swiglu (S10), which narrows the SwiGLU
+#     activation range that is the usual FP8 divergence source.
+#   fp8_no_margin   — converts every block (keep_bf16_blocks: 0) to price what
+#     the first/last-block guardrail actually costs in throughput.
+#
+#   fp8_rowwise is deliberately absent: measured 1.01x on this GPU (the per-row
+#   scale computation costs back the GEMM win), so it buys nothing.
+#
+# LAUNCH
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/speedup_screen_450m.yaml \
+#     --output-dir runs/speedup_screen_450m
+
+sweep:
+  name: speedup_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      # Identical to configs/sweep13_450m_longctx_memory.yaml except `steps`.
+      # 600 steps is past compile warmup and the LR warmup ramp (500) so the
+      # loss trace is informative, while costing ~1h per arm instead of ~17h.
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 600
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      # eval_interval ONLY sets the scalar-logging cadence (train.py:521 derives
+      # log_interval from it; nothing else reads it). 25 gives ~24 loss points
+      # over the run, which is the resolution needed to see an FP8 arm peel away
+      # from the bf16 trace. The production configs' 1000 would give 0 usable
+      # points here.
+      eval_interval: 25
+      checkpoint_interval: 100000   # no checkpoints: they distort whole-run tok/s
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 200
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: default
+
+  variants:
+    # The control. Every claim in this sweep is relative to this arm.
+    - name: bf16_baseline
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+
+    # FP8 tensorwise, first/last block kept in bf16 (the default guardrail).
+    - name: fp8_tensorwise
+      model: *vanilla_450m
+      training:
+        fp8_linear: true
+        fp8_recipe: tensorwise
+        fp8_keep_bf16_blocks: 1
+
+    # FP8 + Smooth-SwiGLU. S10 exists precisely to stabilise FP8 FFNs; this arm
+    # asks whether it is needed at this scale or merely costs throughput.
+    - name: fp8_smooth
+      model:
+        <<: *vanilla_450m
+        smooth_swiglu: true
+      training:
+        fp8_linear: true
+        fp8_recipe: tensorwise
+        fp8_keep_bf16_blocks: 1
+
+    # No bf16 margin — prices the guardrail. If this is much faster AND tracks
+    # the baseline loss, the margin can be dropped; if it diverges, the margin
+    # is doing real work.
+    - name: fp8_no_margin
+      model: *vanilla_450m
+      training:
+        fp8_linear: true
+        fp8_recipe: tensorwise
+        fp8_keep_bf16_blocks: 0
+
+    # ---- stacked on top of FP8 -------------------------------------------
+    # Everything below holds FP8 fixed and adds one more change, so each arm
+    # prices its own contribution against `fp8_tensorwise`, not against bf16.
+
+    # Inductor autotuning for the GEMM and FlexAttention templates.
+    # `-no-cudagraphs` deliberately: plain max-autotune bundles CUDA graphs, and
+    # reduce-overhead was already measured to OOM at 450M on this card (the
+    # graph pools hold ~18.6 GB on top of the ~25 GB default-mode peak). FP8
+    # frees 4.2 GB but not enough to make graph pools fit.
+    - name: fp8_autotune
+      model: *vanilla_450m
+      training:
+        fp8_linear: true
+        compile_mode: max-autotune-no-cudagraphs
+
+    # Liger fused linear+CE. The baseline profile puts softmax/CE at 0.2-0.3% of
+    # kernel time, so this is NOT a compute win — it stops the (B*T, vocab)
+    # logits tensor being materialised. Benched for the peak-VRAM column, which
+    # is what buys a larger batch below.
+    - name: fp8_fusedce
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+
+    # Isolates whether the fused-CE failure is an FP8 interaction or a plain
+    # Liger + torch.compile incompatibility on this torch build.
+    - name: bf16_fusedce
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+
+    # Larger microbatch. The baseline profile found vanilla is launch/dispatch
+    # bound ("GPU starved between kernels", 7,000 launches/step) rather than
+    # compute bound, so wider batches should raise utilisation. FP8's 4.2 GB
+    # saving plus fused CE is what makes batch 4 plausible at all.
+    - name: fp8_batch4
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+        batch_size: 4
+        gradient_accumulation_steps: 8
+
+    # batch 4 OOMs (measured: needs >30.25 GB). 3 is the next step up that keeps
+    # the effective batch a clean multiple: 3 x 10 accum = 245,760 tokens vs the
+    # baseline's 2 x 16 = 262,144, close enough for a throughput read.
+    #
+    # RESULT: 0.976x — SLOWER than batch 2, at 25.98 GB vs 19.18. The baseline
+    # profile's "launch-bound, GPU starved between kernels" reading was taken in
+    # bf16; once FP8 shortens the GEMMs the step is no longer launch-bound, so
+    # widening the batch buys nothing and costs 6.8 GB. Kept as a documented
+    # negative result so it is not re-tried.
+    - name: fp8_batch3
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+        batch_size: 3
+        gradient_accumulation_steps: 10
+
+    # The full recommended stack: FP8 + fused CE + inductor autotuning.
+    # This is the arm that should be carried into the confirmation run.
+    - name: fp8_stack
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+        compile_mode: max-autotune-no-cudagraphs
+
+    # The stack with the bf16 margin dropped. Measured: the margin costs ~4%
+    # throughput (fp8_tensorwise 55,397 vs fp8_no_margin 57,845 tok/s), so this
+    # is the fastest configuration available — IF the quality screen shows
+    # converting block 0 and block 19 does not move the loss trace. That is
+    # exactly what the screen exists to decide.
+    - name: fp8_stack_no_margin
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+        fp8_keep_bf16_blocks: 0
+        compile_mode: max-autotune-no-cudagraphs
+
+    # fp8_stack + fast accumulation on the two backward FP8 GEMMs (dgrad/wgrad;
+    # the forward GEMM already fast-accums in torchao's recipes — verified by
+    # tests/test_precision.py).
+    #
+    # RESULT (2026-08-15, docs/profiling/bench_fast_accum.txt): 1.008x vs
+    # perf_control with 0.6% per-arm spread — a no-op on sm_120; consumer
+    # Blackwell's default FP8 accumulation path is already full-rate. This arm
+    # is therefore MOOT at current torch. Re-check only after a torchao/torch
+    # upgrade changes the FP8 GEMM backend (tests/test_precision.py pins the
+    # torchao recipe defaults and fails loudly if that happens).
+    - name: fp8_fast_accum
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+        compile_mode: max-autotune-no-cudagraphs
+        fp8_use_fast_accum: true
+
+    # FP8-ATTENTION QUALITY PROBE — not a speedup arm.
+    #
+    # Attention is the largest remaining bucket after FP8 (~27% of CUDA time),
+    # and a tuned FP8 sliding-window forward kernel measures 1.36x flex's
+    # forward (flower/kernels/fp8_swa_attention.py), so the speed is real. The
+    # blocker is numerics: e4m3 attention measures 18.4x bf16's output error,
+    # and per-head scaling does not help, which identifies it as mantissa-limited
+    # (head_dim 64 is too short a reduction for the noise to average down).
+    #
+    # Whether ~5% attention-output error actually costs trained quality can only
+    # be answered by training. This arm answers it WITHOUT first writing an FP8
+    # attention backward: Q/K/V are genuinely e4m3-rounded in the forward with a
+    # straight-through gradient, flex still computes the attention.
+    #
+    # It does NOT simulate quantizing the softmax probabilities (an independent
+    # 9.4x contributor, unreachable inside flex), so this is a LOWER BOUND. If
+    # this arm degrades quality, the real kernel is strictly worse and the whole
+    # FP8-attention direction is closed without writing the backward.
+    #
+    # Compare against `fp8_stack`, not against bf16 — the FP8 linears are common
+    # to both, so the delta isolates the attention precision change.
+    - name: fp8_attn_sim
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+        fp8_attention_sim: true
+      training:
+        fp8_linear: true
+        compile_mode: max-autotune-no-cudagraphs
+
+    # CUDA graphs, retried under FP8. reduce-overhead was ruled out at 450M in
+    # bf16 because the graph pools held ~18.6 GB on top of a ~25 GB peak. FP8
+    # cuts the peak to 19.18 GB and shrinks the activations the pools capture,
+    # so the arithmetic that ruled it out no longer obviously holds. Cheap to
+    # retest; expected to be small either way, since batch3 showed the step is
+    # no longer launch-bound once FP8 shortens the GEMMs.
+    - name: fp8_cudagraph
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+      training:
+        fp8_linear: true
+        compile_mode: reduce-overhead
+
+    # The stack plus Smooth-SwiGLU, in case the quality screen shows the plain
+    # stack drifting. Benched separately because S10 adds elementwise work.
+    - name: fp8_stack_smooth
+      model:
+        <<: *vanilla_450m
+        fused_linear_ce: true
+        smooth_swiglu: true
+      training:
+        fp8_linear: true
+        compile_mode: max-autotune-no-cudagraphs

@@ -12,7 +12,7 @@ evaluation, and optimizer stack, so results are directly comparable.
 
 ## Quick start
 
-Requires Python ≥ 3.12. Install with [uv](https://docs.astral.sh/uv/):
+Requires Python ≥ 3.13. Install with [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv sync                 # or: uv sync --extra dev  (adds pytest, ruff, ty, torchao)

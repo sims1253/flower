@@ -33,9 +33,38 @@ def _checkpoint_config(path: Path) -> dict[str, Any] | None:
     return config if isinstance(config, dict) else None
 
 
+def _model_has_sdp_bias(model: torch.nn.Module) -> bool | None:
+    """Whether the model's SDPCrossAttention modules have bias, for the MHA
+    state-dict remap. Returns None if the model has no such module (non-summary /
+    non-bloom), which the remap treats as "keep bias" (the MHA default)."""
+    from flower.models.memory import SDPCrossAttention
+
+    for module in model.modules():
+        if isinstance(module, SDPCrossAttention):
+            return module.q_proj.bias is not None
+    return None
+
+
 def _load_checkpoint_model(model: torch.nn.Module, checkpoint: Path, device: torch.device) -> int | None:
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     state = payload.get("model", payload)
+    # S14 Opportunity 2 Part A: bloom_memory's K-hash ModuleList became a single
+    # `hash_weights` Parameter. Remap legacy `hashes.{i}.weight` checkpoints so
+    # old artifacts (sweep5/7/13 bloom runs) still load. No-op for new-format /
+    # non-bloom state_dicts.
+    from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+    from flower.models.memory import remap_legacy_mha_state_dict
+
+    state = remap_legacy_bloom_state_dict(state)
+    # S14 Opportunity: summary_memory / bloom_memory replaced their
+    # nn.MultiheadAttention perceiver with a compile-clean SDPCrossAttention.
+    # Remap legacy in_proj_*/out_proj.* MHA keys to the new q/k/v/out_proj
+    # projection layout. `bias` is taken from the target model's SDPCrossAttention
+    # modules (nn.MultiheadAttention always had bias, but SDPCrossAttention
+    # respects config.use_bias, so a use_bias=False checkpoint must drop them).
+    # No-op for new-format / non-summary / non-bloom state_dicts.
+    bias = _model_has_sdp_bias(model)
+    state = remap_legacy_mha_state_dict(state, bias=bias)
     model.load_state_dict(state)
     step = payload.get("step")
     return int(step) if step is not None else None
@@ -193,6 +222,105 @@ def evaluate_documents(
 
 
 @torch.no_grad()
+def sliding_window_loss(
+    model: torch.nn.Module,
+    token_ids: torch.Tensor,
+    window_size: int,
+    stride: int,
+    device: torch.device,
+) -> float:
+    """Mean per-token loss with overlapping (sliding) windows.
+
+    Each window of `window_size` tokens is run through the model; the loss
+    for tokens in the window is accumulated. Overlapping windows let every
+    token be scored with near-full backward context, giving a more accurate
+    bits-per-byte measurement than non-overlapping chunks. Use for final
+    evaluations, not during-training monitoring (more forward passes).
+    """
+    del device  # token_ids already lives on device; kept for API symmetry.
+    T = token_ids.numel()
+    total_loss = 0.0
+    total_tokens = 0
+    # If the sequence is shorter than a full window, score it as a single
+    # window of size T (CE then predicts T-1 tokens).
+    effective_window = min(window_size, T)
+    for start in range(0, max(1, T - window_size + 1), stride):
+        window = token_ids[start : start + effective_window].view(1, effective_window)
+        out = model(window, labels=window)
+        loss = out["loss"]
+        if loss is None:
+            raise RuntimeError("loss was not computed")
+        count = effective_window - 1
+        total_loss += float(loss.detach().cpu()) * count
+        total_tokens += count
+    return total_loss / max(total_tokens, 1)
+
+
+@torch.no_grad()
+def sliding_window_document_loss(
+    model: torch.nn.Module,
+    cfg: ExperimentConfig,
+    device: torch.device,
+    *,
+    window_size: int,
+    stride: int,
+    doc_limit: int | None = None,
+) -> dict[str, Any]:
+    """Sliding-window evaluation mirroring `evaluate_documents`'s shape.
+
+    Uses overlapping windows (stride < window_size) so every token is scored
+    with near-full backward context. Returns a point estimate only (no
+    bootstrap CI), keeping it cheaper to reason about than the chunk path.
+    """
+    if cfg.data.dataset in {"synthetic", "mqar"}:
+        batch_metrics = evaluate_batches(model, cfg, device, batches_count=max(1, doc_limit or 10))
+        loss = float(batch_metrics["loss"])
+        bpb = loss / math.log(2.0)
+        return {
+            **batch_metrics,
+            "bpb": bpb,
+            "raw_bytes": int(batch_metrics["eval_tokens"]),
+            "validation_docs": int(batch_metrics["eval_batches"]),
+        }
+
+    encoder = build_tokenizer(cfg.data.tokenizer)
+    doc_nlls: list[float] = []
+    doc_pred_tokens: list[float] = []
+    doc_bytes: list[float] = []
+    start = time.perf_counter()
+
+    for text in fineweb_validation_documents(cfg.data, limit=doc_limit):
+        raw_bytes = len(text.encode("utf-8", errors="replace"))
+        token_ids = encoder.encode(text)
+        if len(token_ids) < 2 or raw_bytes <= 0:
+            continue
+        ids_tensor = torch.tensor(token_ids, dtype=torch.long, device=device)
+        nll = sliding_window_loss(
+            model, ids_tensor, window_size=window_size, stride=stride, device=device
+        ) * max(len(token_ids) - 1, 0)
+        pred_tokens = max(len(token_ids) - 1, 0)
+        if pred_tokens > 0:
+            doc_nlls.append(nll)
+            doc_pred_tokens.append(float(pred_tokens))
+            doc_bytes.append(float(raw_bytes))
+
+    total_nll = sum(doc_nlls)
+    total_pred_tokens = sum(doc_pred_tokens)
+    total_bytes = sum(doc_bytes)
+    loss = total_nll / max(total_pred_tokens, 1.0)
+    bpb = total_nll / math.log(2.0) / max(total_bytes, 1.0)
+    return {
+        "loss": loss,
+        "perplexity": math.exp(min(loss, 20.0)),
+        "bpb": bpb,
+        "raw_bytes": int(total_bytes),
+        "eval_tokens": int(total_pred_tokens),
+        "validation_docs": len(doc_nlls),
+        "tokens_per_sec": total_pred_tokens / max(time.perf_counter() - start, 1e-9),
+    }
+
+
+@torch.no_grad()
 def evaluate(argv: list[str] | None = None) -> dict[str, Any]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
@@ -208,6 +336,19 @@ def evaluate(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--metrics-json", type=str, default=None)
+    parser.add_argument(
+        "--eval-mode",
+        choices=["chunk", "sliding"],
+        default="chunk",
+        help="chunk: non-overlapping document chunks (default, reproduces prior runs). "
+        "sliding: overlapping windows so every token gets near-full backward context.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Window stride for --eval-mode sliding. Defaults to 64 (or window_size//4).",
+    )
     args = parser.parse_args(argv)
 
     checkpoint = Path(args.checkpoint) if args.checkpoint else None
@@ -253,18 +394,31 @@ def evaluate(argv: list[str] | None = None) -> dict[str, Any]:
         checkpoint_step = _load_checkpoint_model(model, checkpoint, device)
 
     use_doc_eval = args.metric in {"bpb", "all"} or args.ci
-    metrics = (
-        evaluate_documents(
+    if args.eval_mode == "sliding":
+        eval_seq_len = getattr(cfg.data, "eval_seq_len", None)
+        window_size = eval_seq_len or cfg.data.sequence_length or cfg.model.max_seq_len
+        stride = args.stride or 64
+        metrics = sliding_window_document_loss(
             model,
             cfg,
             device,
+            window_size=window_size,
+            stride=stride,
             doc_limit=args.doc_limit,
-            bootstrap=args.ci,
-            bootstrap_samples=args.bootstrap_samples,
         )
-        if use_doc_eval
-        else evaluate_batches(model, cfg, device, batches_count=args.batches)
-    )
+    else:
+        metrics = (
+            evaluate_documents(
+                model,
+                cfg,
+                device,
+                doc_limit=args.doc_limit,
+                bootstrap=args.ci,
+                bootstrap_samples=args.bootstrap_samples,
+            )
+            if use_doc_eval
+            else evaluate_batches(model, cfg, device, batches_count=args.batches)
+        )
     metrics.update(
         {
             "variant": cfg.model.variant,

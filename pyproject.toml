@@ -3,19 +3,20 @@ name = "flower"
 version = "0.1.0"
 description = "Flow-attention memory experiments"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
     "numpy>=1.24",
     "pyyaml>=6.0",
-    # Pin torch to a CUDA-12.x-compatible release. Vast hosts vary on driver:
-    # some have CUDA 13 (where torch 2.10+/cu130 works), others have 12.8 (need
-    # torch <= 2.9 with cu128 wheels). 2.6-2.9 covers both.
-    "torch>=2.6,<2.10",
+    # torch 2.10+ ships CUDA-13-bundled wheels (the default manylinux wheel is
+    # now CUDA 13; the separate cu128/cu130 index scheme was dropped). The local
+    # RTX 5090 runs driver 610.88 (CUDA 13.3), so torch 2.13 is the target. On
+    # older vast hosts that only have CUDA 12.8, fall back to torch 2.9+cu128.
+    "torch>=2.10",
     "tqdm>=4.66",
     "datasets>=2.18",
     "transformers>=4.40",
     "tensorboard>=2.16",
-    "flash-linear-attention==0.5.0",
+    "flash-linear-attention==0.5.2",
 ]
 
 [project.optional-dependencies]
@@ -26,7 +27,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 line-length = 120
 extend-exclude = [
     ".claude",
@@ -52,7 +53,7 @@ ignore = [
 "tests/**/*.py" = ["B011"]
 
 [tool.ty.environment]
-python-version = "3.12"
+python-version = "3.13"
 
 [tool.ty.src]
 include = ["flower", "scripts", "tests"]

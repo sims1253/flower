@@ -1,11 +1,68 @@
 from __future__ import annotations
 
 import math
+import re
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
+
+
+class SDPCrossAttention(nn.Module):
+    """Compile-clean cross-attention via ``F.scaled_dot_product_attention``.
+
+    Replaces ``nn.MultiheadAttention`` for the perceiver compression step in
+    ``summary_memory`` and ``bloom_memory``. ``nn.MultiheadAttention``'s internal
+    ``.view`` / ``.contiguous`` reshapes and projection layout graph-break under
+    ``torch.compile`` (mode="reduce-overhead"), which drops the compiled region
+    back to eager; eager then materialises the full ``(B, P, T)`` attention score
+    matrix per layer and OOMs at batch 8 / seq 8192 (16 GiB allocation). SDPA is
+    the fused flash / mem-efficient path and is compile-clean, so fixing the
+    graph break fixes the OOM in the same stroke. See ``NEXT_IDEAS.md`` section 4.
+
+    Functionally a drop-in for the cross-attention it replaces: Q comes from
+    ``q_input`` (the perceiver latents), K=V come from ``kv_input`` (the full
+    token window). No causal mask — this is cross-attention *into* the window,
+    and the window's own causality is handled by the local self-attention layer.
+
+    Param count is identical to the ``nn.MultiheadAttention`` it replaces
+    (4*D*D + 4*D), so it does not perturb the param-matched bake-off. Default
+    ``nn.Linear`` init matches PyTorch's MHA defaults (the closest behavioural
+    match); ``out`` is tagged ``_is_residual_out`` so the depth-scaled init
+    scheme (``init_scheme="scaled"`` / orthogonal) scales it like the other
+    residual-output projections.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        if config.d_model % config.num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        self.num_heads = config.num_heads
+        self.head_dim = config.d_model // config.num_heads
+        bias = bool(getattr(config, "use_bias", True))
+        self.q_proj = nn.Linear(config.d_model, config.d_model, bias=bias)
+        self.k_proj = nn.Linear(config.d_model, config.d_model, bias=bias)
+        self.v_proj = nn.Linear(config.d_model, config.d_model, bias=bias)
+        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=bias)
+        self.out_proj._is_residual_out = True  # tagged for depth-scaled init
+
+    def _split(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, _ = x.shape
+        return x.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, q_input: torch.Tensor, kv_input: torch.Tensor) -> torch.Tensor:
+        # Project, split into heads, attend. Mirrors CausalSelfAttention._split /
+        # _forward_sdpa (base.py) but with separate Q and K/V projections because
+        # Q (latents) and KV (window) are different tensors. No attn_mask: this is
+        # cross-attention, so SDPA never materialises a (P, T) score tensor.
+        q = self._split(self.q_proj(q_input))
+        k = self._split(self.k_proj(kv_input))
+        v = self._split(self.v_proj(kv_input))
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).contiguous().view(q_input.shape[0], q_input.shape[1], self.num_heads * self.head_dim)
+        return self.out_proj(out)
 
 
 class MemoryRead(nn.Module):
@@ -77,3 +134,106 @@ class MemoryMixinBlock(nn.Module):
 
     def update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+
+# Attribute names whose submodules switched from nn.MultiheadAttention to
+# SDPCrossAttention. Each held an in_proj_weight / in_proj_bias / out_proj pair
+# (nn.MultiheadAttention's storage layout); SDPCrossAttention uses four separate
+# q_proj / k_proj / v_proj / out_proj Linears. Used by remap_legacy_mha_state_dict.
+_LEGACY_MHA_ATTRS = ("perceiver", "summary_attn")
+
+
+def remap_legacy_mha_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    bias: bool | None = None,
+) -> dict[str, torch.Tensor]:
+    """Rewrite a pre-S14 summary/bloom checkpoint's ``nn.MultiheadAttention``
+    parameters into the new ``SDPCrossAttention`` projection layout.
+
+    ``SDPCrossAttention`` (see NEXT_IDEAS.md section 4) replaced the
+    ``nn.MultiheadAttention`` perceiver cross-attention in ``summary_memory``
+    (``perceiver.*``) and ``bloom_memory`` (``summary_attn.*``) because MHA
+    graph-breaks under ``torch.compile`` and OOMs at long context. An old
+    checkpoint stores, per block, four MHA tensors::
+
+        blocks.{i}.{perceiver,summary_attn}.in_proj_weight  (3*D, D)
+        blocks.{i}.{perceiver,summary_attn}.in_proj_bias    (3*D,)
+        blocks.{i}.{perceiver,summary_attn}.out_proj.weight (D, D)
+        blocks.{i}.{perceiver,summary_attn}.out_proj.bias   (D,)
+
+    where ``in_proj_weight`` is the row-stacked ``[Wq; Wk; Wv]`` (the standard
+    ``nn.MultiheadAttention`` layout) and ``in_proj_bias`` is ``[bq; bk; bv]``.
+    This splits them into the three separate projection matrices /
+    biases that ``SDPCrossAttention`` holds (``q_proj`` / ``k_proj`` / ``v_proj``),
+    copies ``out_proj`` through, and drops the legacy keys so ``load_state_dict``
+    (strict) succeeds.
+
+    ``nn.MultiheadAttention`` *always* has bias, but ``SDPCrossAttention``
+    respects ``config.use_bias``: a checkpoint trained under ``use_bias=False``
+    (e.g. sweep13) still carries MHA bias tensors that the new bias-free module
+    does not expect. Pass ``bias=False`` (from ``config.use_bias``) to drop the
+    remapped bias keys so the strict load matches. Default ``None`` keeps biases
+    (correct for the ``use_bias=True`` arms).
+
+    Param-count preserving when ``bias`` matches the target: the new four-Linears
+    hold exactly ``4*D*D + 4*D`` params with bias (identical to MHA), or
+    ``4*D*D`` without.
+
+    Idempotent: a state_dict already in the new format (no ``in_proj_weight``
+    under any of ``_LEGACY_MHA_ATTRS``) passes through untouched. No-op for
+    non-summary / non-bloom state_dicts.
+    """
+    attr_alt = "|".join(_LEGACY_MHA_ATTRS)
+    in_proj_w_re = re.compile(rf"^(.*)\.({attr_alt})\.in_proj_weight$")
+    in_proj_b_re = re.compile(rf"^(.*)\.({attr_alt})\.in_proj_bias$")
+    out_proj_w_re = re.compile(rf"^(.*)\.({attr_alt})\.out_proj\.weight$")
+    out_proj_b_re = re.compile(rf"^(.*)\.({attr_alt})\.out_proj\.bias$")
+
+    # Index legacy entries by (prefix, attr) so we can emit the 4 new keys in one
+    # place per group. A single pass collects; a second pass mutates.
+    groups: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+    for key, tensor in state_dict.items():
+        for regex, tag in (
+            (in_proj_w_re, "in_proj_weight"),
+            (in_proj_b_re, "in_proj_bias"),
+            (out_proj_w_re, "out_proj.weight"),
+            (out_proj_b_re, "out_proj.bias"),
+        ):
+            m = regex.match(key)
+            if m:
+                groups.setdefault((m.group(1), m.group(2)), {})[tag] = tensor
+                break
+
+    if not groups:
+        return state_dict  # already new-format (or not a summary/bloom checkpoint)
+
+    keep_bias = bias if bias is not None else True
+    for (prefix, attr), parts in groups.items():
+        base = f"{prefix}.{attr}"
+        if "in_proj_weight" in parts:
+            wq, wk, wv = parts["in_proj_weight"].tensor_split(3, dim=0)
+            state_dict[f"{base}.q_proj.weight"] = wq
+            state_dict[f"{base}.k_proj.weight"] = wk
+            state_dict[f"{base}.v_proj.weight"] = wv
+            del state_dict[f"{base}.in_proj_weight"]
+        if keep_bias and "in_proj_bias" in parts:
+            bq, bk, bv = parts["in_proj_bias"].tensor_split(3, dim=0)
+            state_dict[f"{base}.q_proj.bias"] = bq
+            state_dict[f"{base}.k_proj.bias"] = bk
+            state_dict[f"{base}.v_proj.bias"] = bv
+            del state_dict[f"{base}.in_proj_bias"]
+        elif not keep_bias and "in_proj_bias" in parts:
+            # Target module is bias-free; drop the legacy bias so it isn't an
+            # unexpected key in the strict load.
+            del state_dict[f"{base}.in_proj_bias"]
+        # out_proj -> out_proj: weight keeps its key in both layouts. Bias keeps
+        # its key only when the target has bias; drop it otherwise.
+        if "out_proj.weight" in parts:
+            state_dict[f"{base}.out_proj.weight"] = parts["out_proj.weight"]
+        if keep_bias and "out_proj.bias" in parts:
+            state_dict[f"{base}.out_proj.bias"] = parts["out_proj.bias"]
+        elif not keep_bias and f"{base}.out_proj.bias" in state_dict:
+            del state_dict[f"{base}.out_proj.bias"]
+
+    return state_dict

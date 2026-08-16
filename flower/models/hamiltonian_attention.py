@@ -26,7 +26,15 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.flows.hamiltonian import HamiltonianFlow, WalnutsHamiltonianFlow
-from flower.models.base import CausalLM, TransformerBlock, causal_mask, scaled_dot_attention
+from flower.models.base import (
+    CausalLM,
+    TransformerBlock,
+    _get_or_build_block_mask,
+    _load_flex_attention,
+    causal_mask,
+    make_causal_local_block_mask,
+    scaled_dot_attention,
+)
 
 
 def _build_flow(head_dim: int, config: ModelConfig) -> nn.Module:
@@ -60,10 +68,19 @@ class HamiltonianSelfAttention(nn.Module):
         self.k_flow = self.q_flow if config.flow_shared else _build_flow(head_dim, config)
         self.out = nn.Linear(config.d_model, config.d_model)
         self.noise_std = config.noise_std
+        # S1 (FlexAttention) opt-in, mirroring CausalSelfAttention.
+        self.use_flex = bool(getattr(config, "flex_attention", False))
+        self._cached_block_mask = None
+        self._cached_seq_len = 0
+        self._cached_window = None
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
         return x.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _get_block_mask(self, seq_len: int, device: torch.device):
+        # Delegates to the shared, compile-safe cache logic (base.py).
+        return _get_or_build_block_mask(self, seq_len, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -73,8 +90,13 @@ class HamiltonianSelfAttention(nn.Module):
             k = k + torch.randn_like(k) * self.noise_std
         q = self.q_flow(q)
         k = self.k_flow(k)
-        mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
-        out = scaled_dot_attention(q, k, v, mask)
+        if self.use_flex:
+            flex_attention, _ = _load_flex_attention()
+            block_mask = self._get_block_mask(x.shape[1], x.device)
+            out = flex_attention(q, k, v, block_mask=block_mask)
+        else:
+            mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
+            out = scaled_dot_attention(q, k, v, mask)
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 

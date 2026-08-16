@@ -1,0 +1,218 @@
+# Throughput/VRAM bench arms for the implemented-but-never-run features.
+#
+# NOT A TRAINING SWEEP. Every arm here is fed to scripts/bench_arms.py, which
+# runs a handful of steps on synthetic tokens and reports steady-state tok/s and
+# peak VRAM. `steps: 10` exists only so the config parses; nothing trains it.
+#
+# WHAT THIS ANSWERS AND WHAT IT DOES NOT
+#   Answers: what does each unused feature COST (or save) in throughput and
+#   VRAM. That is the half of the decision this box can settle in two minutes
+#   per arm rather than 35.
+#   Does not answer: whether any of them trains better. `mtp_*` and the
+#   optimizer arms are sample-efficiency plays whose whole case is quality;
+#   pricing them is necessary, not sufficient. Quality goes through
+#   configs/comp_muon_screen_450m.yaml and a matching MTP screen.
+#
+# THE OPTIMIZER ARMS ARE HERE ONLY AS A SANITY CHECK
+#   At accum 16 the optimizer is ~2.8% of the step and this box drifts ~2%
+#   run-to-run, so bench_arms CANNOT resolve them — a doubling of optimizer cost
+#   would hide inside the noise. Use scripts/bench_optimizer_step.py for the
+#   real number. They are included here to confirm the end-to-end step does not
+#   regress in some way the isolated bench would miss (an allocator effect, a
+#   graph break), not to price them.
+#
+# BASELINE TO COMPARE AGAINST
+#   `perf_control` is the production 450M FP8 stack: 57,145 tok/s / 19.18 GB
+#   peak in docs/profiling/speedup_results.md. If the control lands far from
+#   that, the box moved and nothing else in the table means anything.
+#
+# LAUNCH (needs the GPU free)
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. \
+#     uv run python scripts/bench_arms.py \
+#     --config configs/perf_bench_450m.yaml --repeats 3 --accum 4 \
+#     --arms perf_control,mtp_1_head,mtp_2_heads,fp8_lm_head,fp8_fast_accum,window_512,window_1024,window_4096
+#
+#   Optimizer cost (the arms bench_arms cannot resolve):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. \
+#     uv run python scripts/bench_optimizer_step.py \
+#     --config configs/perf_bench_450m.yaml --step-ms 1206 --repeats 5 \
+#     --arms perf_control,opt_per_head,opt_cm_isotropic,opt_cm_full,opt_aurora
+
+sweep:
+  name: perf_bench_450m
+
+  defaults:
+    data:
+      dataset: synthetic
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 10
+      lr: 0.0025
+      warmup_steps: 500
+      grad_clip: 1.0
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      optimizer: muon
+      muon_lr: 0.002
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # The production stack, unmodified. Expect ~57,145 tok/s / 19.18 GB.
+    - name: perf_control
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # ---------------------------------------------------------------------
+    # Multi-Token Prediction. Implemented since S8 (flower/models/base.py),
+    # wired into BOTH loss paths including the Liger fused-CE one, never run.
+    # Each extra head is an untied (vocab x d_model) matrix = 16384 x 1280 =
+    # ~21M params, plus its own cross-entropy over the full vocab. That is a
+    # real cost, and the reason to bench before screening: if 2 heads cost 15%
+    # throughput, the quality screen has to clear 15% to be worth it.
+    #
+    # `frontier-speedups-2026-08.md` records MTP gains as ADDITIVE with TST,
+    # which is the 2.5x item already in flight — so the pairing is the actual
+    # target, and this prices the MTP half of it.
+    # ---------------------------------------------------------------------
+    - name: mtp_1_head
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 1
+        mtp_weight: 0.5
+
+    - name: mtp_2_heads
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 2
+        mtp_weight: 0.5
+
+    # MTP with the fused CE path OFF, to separate the head cost from the
+    # fused-CE interaction. The fused path is a hand-written Triton kernel
+    # behind `@torch._dynamo.disable`; running it 3x per step instead of 1x is
+    # 3 graph breaks, and that may dominate the arithmetic.
+    - name: mtp_2_heads_unfused
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 2
+        mtp_weight: 0.5
+        fused_linear_ce: false
+
+    # ---------------------------------------------------------------------
+    # FP8 on the LM head. Implemented in flower/precision.py, never set.
+    # READ THE GUARDRAIL FIRST: speedup_results.md states the tied LM head is
+    # deliberately never converted (it shares the embedding table through the
+    # tie, so converting it quantises the embeddings too). This arm exists to
+    # measure what that guardrail costs, not to recommend removing it.
+    # ---------------------------------------------------------------------
+    - name: fp8_lm_head
+      model:
+        <<: *vanilla_450m
+        fp8_lm_head: true
+
+    # ---------------------------------------------------------------------
+    # Fast accumulation on the two backward FP8 GEMMs (dgrad + wgrad).
+    # torchao's tensorwise recipe already fast-accums the forward GEMM; the
+    # backward GEMMs default to fp32 accumulation, so this flag covers ~2/3
+    # of the _scaled_mm bucket (28.1% of CUDA time in the fp8_stack profile).
+    # On Ada this flag was the difference between full- and half-rate FP8; on
+    # sm_120 it may be a no-op — the bench decides. Changes numerics, so a
+    # positive throughput result still needs the 600-step quality screen.
+    # ---------------------------------------------------------------------
+    - name: fp8_fast_accum
+      model: *vanilla_450m
+      training:
+        fp8_use_fast_accum: true
+
+    # ---------------------------------------------------------------------
+    # Attention window scaling. `attn_warmup_steps` ramps local_window during
+    # training and CANNOT be benched here — bench_arms never calls
+    # update_attention_windows, so the window would sit at its final value and
+    # the arm would silently equal the control. Use
+    # scripts/bench_attn_warmup.py for the ramp itself.
+    #
+    # What these arms give the ramp is its price list: throughput at each
+    # window the ramp passes through. A warmup from 512 to 2048 is worth
+    # exactly the gap between window_512 and perf_control, prorated over the
+    # warmup fraction of the run.
+    #
+    # Independently relevant to the research axis: frontier-speedups §4 records
+    # the SWAX finding that SHORTER windows improve long-context performance by
+    # forcing reliance on memory, and flags window 2048 at seq 8192 as possibly
+    # too generous for Flower's memory thesis to be testable.
+    # ---------------------------------------------------------------------
+    - name: window_512
+      model:
+        <<: *vanilla_450m
+        local_window: 512
+
+    - name: window_1024
+      model:
+        <<: *vanilla_450m
+        local_window: 1024
+
+    - name: window_4096
+      model:
+        <<: *vanilla_450m
+        local_window: 4096
+
+    # ---------------------------------------------------------------------
+    # Optimizer arms. See the header: bench_arms cannot resolve these. They are
+    # here so bench_optimizer_step.py can share one config, and as an
+    # end-to-end regression check.
+    # ---------------------------------------------------------------------
+    - name: opt_per_head
+      model: *vanilla_450m
+      training:
+        muon_per_head: true
+
+    - name: opt_cm_isotropic
+      model: *vanilla_450m
+      training:
+        comp_muon: true
+        comp_muon_isotropic: true
+
+    - name: opt_cm_full
+      model: *vanilla_450m
+      training:
+        comp_muon: true
+        comp_muon_isotropic: false
+
+    - name: opt_aurora
+      model: *vanilla_450m
+      training:
+        optimizer: aurora

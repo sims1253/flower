@@ -5,7 +5,7 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, SDPCrossAttention
 
 
 class SummaryMemoryBlock(nn.Module):
@@ -29,7 +29,11 @@ class SummaryMemoryBlock(nn.Module):
         )
         self.agg_query = nn.Parameter(torch.zeros(1, 1, config.d_model))
         self.perceiver_latents = nn.Parameter(torch.randn(1, config.memory_slots, config.d_model) * 0.02)
-        self.perceiver = nn.MultiheadAttention(config.d_model, config.num_heads, batch_first=True)
+        # SDP cross-attention (compile-clean) replaces nn.MultiheadAttention: MHA
+        # graph-breaks under torch.compile and OOMs at long context. See
+        # SDPCrossAttention docstring / NEXT_IDEAS.md section 4. Same params, same
+        # cross-attention math (Q=latents, K=V=window, no causal mask).
+        self.perceiver = SDPCrossAttention(config)
         self.short_project = nn.Linear(config.d_model, config.d_model)
         if config.memory_aggregation not in {"sum", "mean", "max", "attention", "orthogonal"}:
             raise ValueError("memory_aggregation must be sum, mean, max, attention, or orthogonal")
@@ -75,7 +79,7 @@ class SummaryMemoryBlock(nn.Module):
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         if self.config.summary_style == "perceiver":
             latents = self.perceiver_latents.expand(x.shape[0], -1, -1)
-            long_update, _ = self.perceiver(latents, x, x, need_weights=False)
+            long_update = self.perceiver(latents, x)
             token_summary = long_update
         else:
             token_summary = self._aggregate(x).expand(x.shape[0], self.config.memory_slots, x.shape[-1])

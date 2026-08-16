@@ -14,6 +14,13 @@ Background research notes (literature surveys and technique deep-dives) that
 motivate the experiments, including the two KV-cache-compaction research notes
 underpinning the "Still" compactor line of work.
 
+## [`posts/`](posts/)
+Longer-form write-ups of individual results worth framing on their own.
+- [`titans-analytical-surprise.md`](posts/titans-analytical-surprise.md) —
+  computing the Titans surprise signal with a closed-form gradient instead of a
+  per-step autograd graph; the optimisation and the subtle constant-reduction
+  trap.
+
 ## [`OVERVIEW.html`](OVERVIEW.html)
 A self-contained HTML overview of the project. Open it directly in a browser.
 

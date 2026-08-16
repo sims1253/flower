@@ -8,6 +8,27 @@ Each section is self-contained: the file(s) to modify, the current code, the tar
 
 **Source for all improvements**: KellerJordan/modded-nanogpt speedrun (records #1-#55) and Track 3 optimization benchmark (records #1-#46). https://github.com/KellerJordan/modded-nanogpt
 
+> **Measured results live in [`profiling/speedup_results.md`](profiling/speedup_results.md).**
+> This file is the *spec*; that file records what was actually measured on the
+> RTX 5090 at the 450M config, including several items here that turned out to be
+> dead ends. Read it before implementing anything below. In particular it
+> supersedes:
+>
+> - **Section 13's FP4 plan** — nvfp4 measures 1.02x bf16 with 13.9% error and
+>   mxfp4 measures 0.49x on sm_120; there is no fast FP4 GEMM for consumer
+>   Blackwell, and torchao 0.18 has no MX/NVFP4 training path at all. FP8
+>   tensorwise (1.30x at model scale) is the whole of the low-precision win.
+>   Section 13's Transformer Engine suggestion is also moot — TE is not installed
+>   and torchao covers the working path.
+> - **Section 14 Opportunity 1 / S14-5a (Newton-Schulz)** — still not worth doing,
+>   but *not* because the optimizer is free. `baseline_profile.md`'s "~0 ms,
+>   <1% of step" was a subtraction artifact; measured directly it is 134 ms/step.
+>   It is skippable because the batching is already optimal (4 shape groups, zero
+>   singletons) and it is ~2.8% at production accum.
+> - **Section 14 Opportunity 5 / S14-5b (fused linear CE)** — was *broken* under
+>   `torch.compile` on torch 2.13 and is now fixed; it is a ~1.1 GB memory win,
+>   not a speed win.
+
 ---
 
 ## Section 1: FlexAttention Migration (HIGH PRIORITY)
@@ -1165,7 +1186,7 @@ Total: ~5K + 7 kernel launches per layer per step. With K=4 and 28 layers: ~644 
 
 **Two-part fix**:
 
-Part A (easy, do immediately): Replace the Python loop over hashes with a single batched matmul. Instead of `nn.ModuleList` of K separate Linear layers, store the hashes as a single `(K, d_model, memory_slots)` weight tensor and compute all K projections in one `torch.einsum('bd,kds->bks', x, weights)`:
+Part A (easy, do immediately) — **DONE** (see `flower/models/bloom_memory.py`, `tests/test_bloom_memory.py`, commit on branch `training-speedups`): Replace the Python loop over hashes with a single batched matmul. Instead of `nn.ModuleList` of K separate Linear layers, store the hashes as a single `(K, d_model, memory_slots)` weight tensor and compute all K projections in one `torch.einsum('bd,kds->bks', x, weights)`:
 
 ```python
 # Instead of K separate nn.Linear:
@@ -1264,7 +1285,22 @@ ns_kernel = get_kernel("tboissin/newton_schulz_triton")
 
 **Priority**: P0. This is the single highest-leverage kernel change. 1 day of integration work, 2-3x optimizer step speedup.
 
+**STATUS (2026-08-04): the launch-overhead half is DONE via batched `bmm` instead of the Triton kernel.** Profiling showed the optimizer step was launch-bound, not compute-bound (wall-clock 2.7× GPU self-CUDA; GPU starved by per-param Python dispatch). A fused single-matrix Triton kernel still launches once per param, so it would not have moved that wall-clock. Batched `bmm` over same-shape param groups (`flower/optim.py`, `muon_ns_batched: true`) collapses the launches and measured **2.6× full-step / 8.5× optimizer-step** speedup at the d512/L8/seq8192 shape — see `NEXT_IDEAS.md` section 5 update. The compute-fusion half (this Triton kernel) is deferred until profiling shows matmuls themselves, not launches, dominate; at current shapes they do not.
+
 #### 5b: Liger-Kernel (Fused Linear CE, RMSNorm, SwiGLU, RoPE)
+
+**STATUS (2026-08-04): FusedLinearCrossEntropy is DONE** (config flag
+`model.fused_linear_ce`, default off). `liger-kernel>=0.8.1` was already a
+dependency. The fused path never materializes the `(B*T, vocab)` logits tensor
+during training; numerically exact vs eager (fp32 loss diff 4.8e-7, tied-weight
+grad diff 2.2e-8). Measured memory at the 450M/seq=8192/vocab=16K shape:
+**−0.83 GB (−4.1%)** — real but smaller than the >30% projected, because logits
+are ~1 GB of a 20 GB budget at that ratio (the saving scales with B*T*vocab).
+seq=32768 runs under fused CE but still OOMs on the 413M model via the SDPA
+attention *mask*, not the head — fused CE is necessary-but-not-sufficient for
+seq=32K and must pair with the compiled FlexAttention path (the bake-off
+default). Full measurement and rationale: `NEXT_IDEAS.md` §6. RMSNorm/SwiGLU/
+RoPE kernels remain P1 (separate task).
 
 Open-source Triton kernel library for LLM training. ~20% total throughput, ~60% memory reduction.
 
@@ -1477,3 +1513,43 @@ These ideas change information pathways and therefore MUST NOT be default settin
 - **Partial RoPE** (16/64 or 64 dims): Zero-parameter. Apply rotary PE to only a subset of head dims; rest attend position-invariant. Minor ablation candidate.
 
 The principle: throughput and optimizer improvements are safe. Architecture modifications are dangerous.
+
+---
+
+## Section 15: S14 training-step speedups (implemented) — CUDA graphs, warmup fix, activation checkpointing
+
+Three training-step improvements, each validated on the RTX 5090 (torch 2.13.0+cu130, sm_120). Full measurement detail and rationale: `NEXT_IDEAS.md` §8–§10.
+
+### 15.1 CUDA graphs (`compile_mode: reduce-overhead`) — works, shape-dependent
+
+Switching `compile_mode` from `default` to `reduce-overhead` enables CUDA graphs (replays a captured GPU-side graph instead of re-launching each op), eliminating per-op CPU launch overhead. **Not a 1-line flip**: `reduce-overhead` + `gradient_accumulation_steps > 1` crashes with a known PyTorch bug (pytorch/pytorch#169545). Fix implemented in `flower/train.py`: pre-allocate persistent `.grad` buffers before CUDAGraph capture + `zero_grad(set_to_none=False)`. This is the only workaround that works in torch 2.13 (mark_step_begin / cloning do not). Correctness: loss matches `default` within 2e-5.
+
+Measured (real `flower.train`, real fineweb_edu, 80 steps):
+
+| config | shape | default | reduce-overhead | speedup |
+|--------|-------|---------|-----------------|---------|
+| 100m longctx | d768/L14, seq8192, b4/accum2, flex | 77k tok/s | 83k tok/s | **+7.7%** |
+| 100m phase0 | d768/L14, seq1024, b16/accum4, SDPA | 90k tok/s | 84k tok/s | **-7.0%** |
+| bloom bake-off | d512/L8, seq8192, b4/accum2, flex | 212k tok/s | 208k tok/s | **-2.0%** |
+
+**Verdict:** reduce-overhead wins only on long-context compute-bound shapes; it is slower on short-sequence / high-launch-rate shapes. Flipped on `sweep13_100m_longctx_phase0.yaml` only; measured A/B before adopting on any other config.
+
+### 15.2 Attention-window warmup recompile bug — fixed (latent; warmup off in production)
+
+`attn_warmup_steps > 0` + `flex_attention` + compile caused `create_block_mask` to recompile once per distinct window value (flex's `mask_mod` closes over the window integer), exhausting torch.compile's recompile limit (8) and falling back to the eager dense-flex path (throughput collapsed to 16k tok/s). Fix: `ModelConfig.attn_warmup_quantize` — a step-stride that holds the window constant every N steps, bounding recompiles to `ceil(warmup_steps/quantize)`. With `quantize=8`: 8→3 recompiles, 0 limit hits, loss unchanged, legacy per-step ramp (`quantize=0`) preserved. All production configs have `attn_warmup_steps=0`, so this unblocks future warmup+compile use.
+
+### 15.3 Activation checkpointing — the seq=32K enabler
+
+`ModelConfig.activation_checkpoint: bool = False` wraps each transformer block in `torch.utils.checkpoint(..., use_reentrant=False)` during training, cutting activation memory from O(num_layers) to O(1). Correctness: loss **bit-identical** with dropout>0 (RNG state preserved).
+
+**Non-obvious blocker, fixed:** checkpoint + FlexAttention are incompatible (pytorch/pytorch#147879) — the recompute forward falls back to flex's eager dense path and OOMs. Fix: compile `flex_attention` as a standalone callable (`_load_flex_attention_compiled` in `base.py`) so the fused kernel runs during recompute too.
+
+Measured memory:
+
+| shape | no-checkpoint | checkpoint | result |
+|-------|--------------|-----------|--------|
+| 100M, seq8192, b4 | 16.45 GB | 6.97 GB | **-58%** |
+| 100M, seq32768, b1 | OOM (29.8 GB fwd) | 11.09 GB | **fits** |
+| 100M, seq32768, b2 | OOM | 13.75 GB | fits with headroom |
+
+**seq=32K now fits on the 5090** — the Section 13 gate (memory mechanisms at long context) is open on local hardware. Throughput cost ~25-33% (one extra forward per backward); favourable when memory is the binding constraint. Off by default so seq≤8K throughput runs are unaffected.

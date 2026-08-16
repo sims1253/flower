@@ -1,0 +1,201 @@
+# Compositional Muon + Aurora screen — round 2 of the optimizer axis at 450M.
+#
+# WHY THIS SCREEN EXISTS
+#   configs/muon_screen_450m.yaml set an explicit gate: the heavier methods
+#   (Compositional Muon, Newton-Muon, KL-SOAP) were "worth doing only if the
+#   cheap arms below show the optimizer is a live axis at this scale". That
+#   screen finished and the gate opened:
+#
+#     muon_contra_per_head   1.09977   -0.02808
+#     muon_per_head          1.10071   -0.02714
+#     muon_baseline          1.12785    ——
+#     muon_normuon           1.64467   +0.51682   (the global-norm bug, now fixed)
+#
+#   Per-head Muon is -0.027 val_bpb at 1500 steps, roughly 2x the measured
+#   600-step seed band of 0.0128. The optimizer moves this model.
+#
+# WHY *THESE* ARMS FOLLOW FROM THAT RESULT
+#   Per-head Muon won by changing the SCOPE of the orthogonalisation — heads
+#   stop sharing one update scale. Compositional Muon
+#   (github.com/tilde-research/comp-muon-release) is the principled version of
+#   the same move: the loss never sees W_Q and W_K separately, it sees the
+#   circuits W_Q W_K^T and W_O W_V, and CM controls the operator norm of the
+#   *composed* update. Its QK rule is head-local by construction — which is why
+#   per-head Muon works at all — and it adds the partner whitening that plain
+#   splitting lacks. So this screen asks: was per-head capturing all of the
+#   available gain, or only the part that comes free with the scope change?
+#
+#   Aurora (github.com/tilde-research/aurora-release) is here for an unrelated
+#   reason: it has been vendored in flower/optim.py since S13, config-gated, and
+#   NEVER RUN. Its claim is that Muon's polar step leaves row norms free, so
+#   tall matrices lose >25% of MLP neurons permanently. That is the same
+#   pathology NorMuon targets, and NorMuon's arm above was catastrophic for an
+#   unrelated reason (a global Frobenius normalisation, since fixed). Aurora
+#   touches the FFN, CM touches attention, so they are disjoint and could stack.
+#
+# THE METRIC IS STEPS-TO-TARGET-LOSS, NOT FINAL val_bpb
+#   Unchanged from the first screen and still the point: a 5-10% sample
+#   efficiency gain is below the seed band at this length, so compare the
+#   loss-vs-step curves. `log_interval: 25` exists for that.
+#
+# ON comp_muon_mp
+#   CM applies no spectral shape-scale (its whitening sets the scale), so its
+#   step is not automatically Muon's at the same LR. Measured at realistic init
+#   the ratio is 0.85-1.8x, which is close enough that muon_lr transfers and mp
+#   stays at 1.0 for the primary arms. `comp_muon_mp_0p5` exists because that
+#   ratio is weight-magnitude dependent and drifts as the weights grow — if the
+#   CM arms diverge early, this is the arm that says whether it was step size
+#   rather than the rule.
+#
+# LAUNCH (needs the GPU free; the 450M FP8 job owns it as of writing)
+#   FLOWER_DATA_CACHE=data_cache PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/comp_muon_screen_450m.yaml \
+#     --output-dir runs/comp_muon_screen_450m
+
+sweep:
+  name: comp_muon_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      # FP8 stack held FIXED across every arm, exactly as in muon_screen_450m,
+      # so these numbers are directly comparable to that screen's.
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # Control. Identical to muon_screen_450m's `muon_baseline` (1.12785), so it
+    # doubles as a cross-screen drift check: if this lands somewhere else, the
+    # box or the data pipeline moved and the comparison above is void.
+    - name: cm_baseline
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # The reference point this screen has to beat: the winner of screen 1,
+    # re-run here so CM is compared against per-head and not only against
+    # plain Muon. CM SHOULD beat per-head; if it only beats baseline, the
+    # partner whitening bought nothing over the scope change.
+    - name: cm_per_head_ref
+      model: *vanilla_450m
+      training:
+        muon_per_head: true
+
+    # CM, isotropic whitening. Each head's inverse Gram root is approximated by
+    # one scalar, which degenerates to a partner-RESCALED per-head Muon. This is
+    # the honest ablation against `cm_per_head_ref`: same scope, same cost,
+    # the only difference is the partner scaling.
+    - name: cm_isotropic
+      model: *vanilla_450m
+      training:
+        comp_muon: true
+        comp_muon_isotropic: true
+
+    # CM, full matrix whitening — the method as published. Adds a coupled
+    # Newton-Schulz inverse Gram root per head (25 bmms on 64x64 blocks per
+    # circuit). Muon is ~2.8% of step time at accum 16, so even a large relative
+    # optimizer cost is small absolute; measure it, do not assume it.
+    - name: cm_full
+      model: *vanilla_450m
+      training:
+        comp_muon: true
+        comp_muon_isotropic: false
+
+    # Step-size control for the CM arms. If cm_full/cm_isotropic diverge or
+    # underperform early, this separates "the rule is wrong for us" from
+    # "the effective LR was off".
+    - name: cm_full_mp_0p5
+      model: *vanilla_450m
+      training:
+        comp_muon: true
+        comp_muon_isotropic: false
+        comp_muon_mp: 0.5
+
+    # Aurora alone. Vendored since S13, never executed. Square matrices reduce
+    # exactly to Muon, so this arm only changes the rectangular weights — the
+    # SwiGLU gate/up/down and the fused qkv.
+    - name: aurora
+      model: *vanilla_450m
+      training:
+        optimizer: aurora
+
+    # Aurora with the released defaults made explicit rather than implicit, and
+    # weight decay on. `aurora_weight_decay` defaults to 0.0 in this codebase
+    # but the release ships 0.025, and the neuron-death claim is about row norms
+    # collapsing — decay is not obviously neutral to it.
+    - name: aurora_wd
+      model: *vanilla_450m
+      training:
+        optimizer: aurora
+        aurora_pp_iterations: 2
+        aurora_pp_beta: 0.5
+        aurora_weight_decay: 0.025
+
+    # Disjoint-scope stack: Aurora owns the FFN (tall matrices), CM owns
+    # attention. NOTE this arm cannot run as written — comp_muon requires
+    # optimizer='muon' and raises otherwise, by design, so the flag cannot be
+    # silently ignored. It is left here commented as the obvious follow-up if
+    # BOTH families win independently; it needs Aurora to grow a circuit hook
+    # first, which is real work and not worth doing on spec.
+    # - name: aurora_plus_cm
+    #   model: *vanilla_450m
+    #   training:
+    #     optimizer: aurora
+    #     comp_muon: true

@@ -1,0 +1,155 @@
+# Multi-Token Prediction: is the measured 5%/head throughput cost paid back?
+#
+# WHY THIS SCREEN
+#   `mtp_extra_heads` has been implemented since S8 (flower/models/base.py,
+#   wired into BOTH loss paths including the Liger fused-CE one), test-covered,
+#   and set by no config that has ever run. The August 2026 unused-feature audit
+#   surfaced it as the highest-value dead flag.
+#
+#   Its price is now measured (docs/profiling/bench_perf_arms.txt and
+#   bench_perf_arms_rerun.txt):
+#       mtp_extra_heads 0   59,854 tok/s   1.000x   19.18 GB
+#       mtp_extra_heads 1   56,882 tok/s   0.950x   19.64 GB
+#       mtp_extra_heads 2   54,291 tok/s   0.907x   20.10 GB
+#   ~5% throughput and ~0.46 GB per head. Cheap enough to be worth a screen,
+#   expensive enough that it has to actually deliver.
+#
+# WHY IT MIGHT PAY
+#   docs/research/frontier-speedups-2026-08.md records MTP gains as ADDITIVE
+#   with TST, which is the 2.5x throughput item already screened
+#   (configs/tst_screen_450m.yaml). If MTP holds up here, the pairing is the
+#   real target and this screen is the cheaper half of it.
+#
+# EVAL IS APPLES-TO-APPLES, WHICH IS WHY THIS SCREEN IS CLEAN
+#   The extra heads are auxiliary: they predict t+2, t+3 during TRAINING only,
+#   and the main tied head still predicts t+1. Validation runs the main head
+#   alone, so val_bpb is directly comparable across arms with no adjustment —
+#   unlike the window screen, where the arms genuinely see different context.
+#   The extra parameters (~21M/head at 16K vocab x d1280) are also not used at
+#   eval, so this is not a parameter-count confound either.
+#
+# THE TWO COMPARISONS
+#   matched steps (mtp1/mtp2 vs mtp0_control)  -> does the auxiliary loss make
+#       the t+1 head better per step? This is MTP's actual claim.
+#   matched wall-clock (mtp2_isotime)          -> 1500 x 0.907 = 1360 steps, the
+#       same wall-clock as the control. This is the deployment question: does
+#       the sample-efficiency gain survive paying 9.3% fewer steps for it?
+#   MTP has to win the SECOND one to be worth turning on by itself. Winning only
+#   the first still matters, because the TST pairing changes the arithmetic.
+#
+# SEED BAND
+#   As in the other 1500-step screens: the 600-step reseed band was 0.01282 and
+#   the 1500-step band is unmeasured. Treat gaps under ~0.01 as inconclusive,
+#   not as null. Compare the loss-vs-step curves (log_interval 25), not just the
+#   final number.
+#
+# LAUNCH (queued as stage 6 of scripts/queue_investigations.sh)
+#   PYTHONPATH=. uv run python -m flower.sweep \
+#     --config configs/mtp_screen_450m.yaml \
+#     --output-dir runs/mtp_screen_450m
+
+sweep:
+  name: mtp_screen_450m
+
+  defaults:
+    data:
+      dataset: fineweb_edu
+      tokenizer: "custom:tokenizers/fineweb_16k.json"
+      sequence_length: 8192
+      eval_seq_len: 8192
+      bytes_per_token: 4.279
+
+    training:
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      eval_batch_size: 1
+      steps: 1500
+      lr: 0.0025
+      warmup_steps: 500
+      lr_schedule: wsd
+      lr_decay_frac: 0.2
+      lr_final_frac: 0.0
+      grad_clip: 1.0
+      log_interval: 25
+      eval_interval: 500
+      checkpoint_interval: 100000
+      save_checkpoints: false
+      device: auto
+      seed: 0
+      seeds: [0]
+      log_backend: tensorboard
+      composite_eval: false
+      optimizer: muon
+      ema_decay: 0.997
+      muon_lr: 0.002
+      muon_momentum: 0.95
+      weight_decay: 0.01
+      weight_decay_exclude_embeddings: true
+      validation_steps: 30
+      validation_interval: 500
+      vram_fraction: 0.95
+      precision: bf16
+      compile_model: true
+      compile_mode: max-autotune-no-cudagraphs
+      fp8_linear: true
+      fp8_recipe: tensorwise
+      fp8_keep_bf16_blocks: 1
+
+  variants:
+    # Same control as every other 450M screen; should land at 1.12785.
+    - name: mtp0_control
+      model: &vanilla_450m
+        variant: vanilla_local
+        vocab_size: 16384
+        d_model: 1280
+        num_heads: 20
+        num_layers: 20
+        ffn_dim: 5120
+        max_seq_len: 8192
+        local_window: 2048
+        rope_base: 10000.0
+        dropout: 0.0
+        norm_type: rmsnorm
+        ffn_activation: swiglu
+        ffn_param_match: true
+        qk_norm: true
+        use_bias: false
+        init_scheme: scaled
+        init_std: 0.02
+        bf16_cross_entropy: true
+        flex_attention: true
+        fused_linear_ce: true
+
+    # One auxiliary head (t+2). mtp_weight 0.5 is the implemented default.
+    - name: mtp1
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 1
+        mtp_weight: 0.5
+
+    # Two auxiliary heads (t+2, t+3).
+    - name: mtp2
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 2
+        mtp_weight: 0.5
+
+    # Deployment arm: 1500 x 0.907 = 1360 steps = the control's wall-clock.
+    - name: mtp2_isotime
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 2
+        mtp_weight: 0.5
+      training:
+        steps: 1360
+
+    # Lower auxiliary weight. mtp_weight 0.5 is the codebase default but was
+    # never tuned against anything, and an auxiliary loss that is too strong
+    # trades the t+1 objective for the t+2/t+3 ones — which is the failure mode
+    # that would show up as mtp1/mtp2 losing at matched steps. This arm exists
+    # so that outcome is diagnosable rather than just "MTP does not work here".
+    - name: mtp2_w025
+      model:
+        <<: *vanilla_450m
+        mtp_extra_heads: 2
+        mtp_weight: 0.25

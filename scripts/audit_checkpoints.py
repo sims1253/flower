@@ -26,6 +26,8 @@ import yaml
 
 from flower.config import load_config
 from flower.models import build_model
+from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+from flower.models.memory import remap_legacy_mha_state_dict
 
 
 def _embedded_config(payload: dict[str, Any], ckpt: Path) -> dict[str, Any] | None:
@@ -62,6 +64,22 @@ def audit_one(ckpt: Path) -> dict[str, Any]:
         row["step"] = payload.get("step") if isinstance(payload, dict) else None
         model = build_model(cfg.model)
         state = payload.get("model", payload) if isinstance(payload, dict) else payload
+        # S14 Opportunity 2 Part A: bloom_memory's K-hash ModuleList became a
+        # single `hash_weights` Parameter. Remap legacy checkpoints so they
+        # aren't false-flagged as mismatches (eval.py/train.py already remap
+        # on load). No-op for new-format / non-bloom state_dicts.
+        if cfg.model.variant == "bloom_memory":
+            state = remap_legacy_bloom_state_dict(
+                state, num_hashes=cfg.model.bloom_num_hashes
+            )
+        # S14 Opportunity: summary_memory / bloom_memory replaced their
+        # nn.MultiheadAttention perceiver with a compile-clean SDPCrossAttention.
+        # Remap legacy MHA in_proj_*/out_proj.* keys so pre-fix summary/bloom
+        # checkpoints aren't false-flagged as mismatches. `bias` from config
+        # (nn.MultiheadAttention always had bias; SDPCrossAttention respects
+        # use_bias). No-op for new-format / other-variant state_dicts (mirrors
+        # the eval/train load paths).
+        state = remap_legacy_mha_state_dict(state, bias=getattr(cfg.model, "use_bias", True))
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing or unexpected:
             row["status"] = "shape-or-key-mismatch"

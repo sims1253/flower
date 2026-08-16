@@ -15,7 +15,7 @@ import torch
 from flower.config import load_config
 from flower.data import token_batches, validation_token_batches
 from flower.models import build_model
-from flower.models.base import count_parameters
+from flower.models.base import count_parameters, prebuild_attention_masks
 from flower.optim import build_optimizer
 from flower.shm_guard import start_shm_watchdog
 
@@ -62,6 +62,29 @@ def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
+
+
+def configure_vram_limit(device: torch.device, fraction: float = 0.85) -> None:
+    """Cap the CUDA caching allocator so an oversized batch raises a hard OOM
+    instead of silently spilling into host RAM.
+
+    On WSL2 the WDDM memory manager does NOT raise OutOfMemoryError when the
+    GPU runs out — it spills into shared host RAM over PCIe and throughput
+    collapses by an order of magnitude. A run that looks very slow is usually a
+    run that overshot VRAM. Capping the allocator at `fraction` of total VRAM
+    forces a real OOM (which the batch-size comments in the configs and the
+    bench scripts already size against), so the failure mode is loud. No-op on
+    CPU. The default 0.85 leaves headroom for fragmentation and for the small
+    non-tensor allocations PyTorch makes outside the caching allocator.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.set_per_process_memory_fraction(fraction, device.index or 0)
+    except (RuntimeError, ValueError):
+        # Already set (e.g. a parent process configured it) or unsupported —
+        # never let the guard itself crash a run.
+        pass
 
 
 def set_global_seed(seed: int) -> None:
@@ -214,6 +237,50 @@ def log_learning_rates(writer: ScalarLogger, optims: list[torch.optim.Optimizer]
             writer.add_scalar(f"train/lr/{opt_name}_{opt_index}_group_{group_index}", group["lr"], step)
 
 
+def update_attention_windows(model: torch.nn.Module, step: int, cfg) -> None:
+    """Expand attention windows over training (S2, window warmup).
+
+    Linearly ramps every attention module's local_window from
+    cfg.model.attn_warmup_start to cfg.model.local_window over
+    cfg.model.attn_warmup_steps steps, then holds at local_window.
+    No-op when attn_warmup_steps == 0 (the default: use local_window always).
+
+    When ``attn_warmup_quantize > 0`` the ramp is quantised: the target window
+    only changes every ``quantize`` steps, so a warmup of N steps produces at
+    most ``ceil(N / quantize)`` distinct windows instead of N. Each distinct
+    window forces a FlexAttention ``create_block_mask`` recompile (its
+    ``mask_mod`` closure captures the window), so without quantising the ramp
+    exhausts torch.compile's recompile limit and flex falls back to the eager
+    dense path. Quantising keeps the recompile count under the limit (default
+    8) while preserving the ramp's training-dynamics benefit. The final window
+    is always ``local_window``; ``quantize`` is a step-stride (number of steps
+    between window changes), not a window-value grid.
+    """
+    if getattr(cfg.model, "attn_warmup_steps", 0) == 0:
+        return
+    target = cfg.model.local_window
+    if step >= cfg.model.attn_warmup_steps:
+        target = cfg.model.local_window
+    else:
+        # `quantize` is a step-stride: only advance the ramp every `quantize`
+        # steps, holding the window constant in between. This bounds the number
+        # of distinct windows (= create_block_mask recompiles) to
+        # ceil(warmup_steps / quantize). Without it the per-step ramp exhausts
+        # torch.compile's recompile limit. Snap the *effective step* down to
+        # the nearest quantize boundary so each plateau is constant.
+        quantize = int(getattr(cfg.model, "attn_warmup_quantize", 0) or 0)
+        eff_step = step if quantize <= 1 else (step // quantize) * quantize
+        frac = eff_step / max(1, cfg.model.attn_warmup_steps)
+        target = int(round(cfg.model.attn_warmup_start + frac * (cfg.model.local_window - cfg.model.attn_warmup_start)))
+    for module in model.modules():
+        lw = getattr(module, "local_window", None)
+        if lw is not None and lw != target:
+            module.local_window = target
+            # Invalidate the FlexAttention block-mask cache (S1).
+            if hasattr(module, "_cached_block_mask"):
+                module._cached_block_mask = None
+
+
 def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
@@ -283,13 +350,43 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     cfg = load_config(args.config, overrides)
     set_global_seed(int(cfg.training.seed))
     device = resolve_device(cfg.training.device)
+    configure_vram_limit(device, fraction=getattr(cfg.training, "vram_fraction", 0.85))
     amp_dtype = configure_precision(cfg.training.precision, device)
     model = build_model(cfg.model).to(device)
+    # FP8 linear conversion must happen BEFORE build_optimizer: swapping in
+    # Float8Linear rebinds the weight Parameters, so an optimizer built first
+    # would hold references to the discarded originals and silently train
+    # nothing. It must also precede torch.compile so the compiled graph sees
+    # the FP8 modules. See flower/precision.py for the measurement behind the
+    # recipe choice and the guardrails.
+    from flower.precision import maybe_convert_fp8
+
+    model, fp8_info = maybe_convert_fp8(model, cfg.training, device)
     # Optimizers are always built on the eager module: torch.compile returns a
     # wrapper whose .parameters() are the same objects, but keeping the eager
     # reference makes state_dict keys stable across compiled/uncompiled runs.
     optim_or_list = build_optimizer(model, cfg.training)
     eager_model = model
+    # CUDAGraph (reduce-overhead) + gradient accumulation is a known
+    # torch.compile limitation: the captured graph pins the `.grad` tensor
+    # addresses, but accumulation reuses them across micro-steps and the graph
+    # replay then reads a buffer that a later replay has already overwritten
+    # ("accessing gradient tensor output of CUDAGraphs that has been
+    # overwritten... when a .grad tensor is allocated during CUDAGraph capture").
+    # The error's own suggested fix is to allocate stable `.grad` buffers
+    # *outside* CUDAGraph capture before the compiled backward runs, so the
+    # graph captures their (now-stable) addresses. We do that by directly
+    # assigning `p.grad = torch.zeros_like(p)` before the training loop (see
+    # below) and keeping those buffers allocated across the run
+    # (zero_grad(set_to_none=False) below). With accum == 1 this is unnecessary,
+    # so we skip it. See pytorch/pytorch#169545 — standard workarounds
+    # (mark_step_begin, cloning) do not fix it; only pre-allocated buffers do.
+    use_persistent_grads = (
+        cfg.training.compile_model
+        and cfg.training.compile_mode == "reduce-overhead"
+        and int(cfg.training.gradient_accumulation_steps) > 1
+        and device.type == "cuda"
+    )
     if cfg.training.compile_model:
         # The diagnostics walk uses dir()/getattr over every submodule, which
         # Dynamo cannot trace; leaving it on would graph-break every forward.
@@ -297,12 +394,75 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         if getattr(eager_model, "collect_module_diagnostics", False):
             eager_model.collect_module_diagnostics = False
             print("[compile] module diagnostics disabled (untraceable by Dynamo)")
+        # Eagerly build every flex-attention BlockMask before compiling so the
+        # compiled forward only reads the cached masks. Building them inside the
+        # graph mutates module state, which cudagraph mode flags as tensor
+        # aliasing across the per-layer reads ("accessing tensor output of
+        # CUDAGraphs that has been overwritten"). No-op when flex is off.
+        if device.type == "cuda":
+            prebuild_attention_masks(eager_model, cfg.data.sequence_length, device)
+            # S9 TST phase 1 runs at the COMPRESSED length T/s, which needs its
+            # own BlockMask. Prebuilding it here keeps mask construction out of
+            # the compiled graph for both phases (building it inside mutates
+            # module state, which cudagraph mode flags as tensor aliasing).
+            if getattr(cfg.training, "tst_enabled", False):
+                bag = max(1, int(getattr(cfg.training, "tst_bag_size", 1)))
+                if bag > 1:
+                    prebuild_attention_masks(eager_model, cfg.data.sequence_length // bag, device)
         model = torch.compile(model, mode=cfg.training.compile_mode, dynamic=False)
     optims = optim_or_list if isinstance(optim_or_list, list) else [optim_or_list]
+    # S12.4: EMA weight averaging for evaluation.
+    ema_model: torch.nn.Module | None = None
+    if getattr(cfg.training, "ema_decay", 0.0) > 0:
+        import copy
+
+        ema_model = copy.deepcopy(eager_model)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+        # Materialise the parameter lists once for the multi-tensor EMA update
+        # below. Pairing is positional and safe because ema_model is a deepcopy
+        # of eager_model, so .parameters() yields the same structure in the same
+        # order. The explicit length check turns any future divergence (e.g. a
+        # variant that adds parameters after the copy) into a loud failure here
+        # rather than a whole run of silently mis-paired weight averaging.
+        #
+        # Caching `.data` is safe because every optimizer in flower/optim.py
+        # mutates parameters in place (`p.data -= ...`); none rebinds `p.data`
+        # to a new tensor, which would leave these references stale.
+        ema_params = [p.data for p in ema_model.parameters()]
+        model_params = [p.data for p in eager_model.parameters()]
+        if len(ema_params) != len(model_params):
+            raise RuntimeError(
+                f"EMA/model parameter count mismatch ({len(ema_params)} vs {len(model_params)})"
+            )
+        # The EMA copy runs validation forwards eagerly (it is NOT wrapped in
+        # torch.compile, unlike `model` below). A flex-attention forward that
+        # misses the fused compiled kernel falls back to the unfused math path,
+        # which materialises the full (B, H, T, T) score matrix per layer. At
+        # the 450M config (seq 8192, 16 heads) that is ~8 GB per allocation and
+        # OOMs on top of the compiled training model's ~24 GB of live inductor
+        # workspaces. On WSL2/WDDM the overshoot does not raise a clean
+        # OutOfMemoryError — it spills to host shared memory and the next CUDA
+        # kernel fails with `cudaErrorUnknown` (the bloom_memory 450M sweep-13
+        # step-1000 crash, surfaced at currentStreamCaptureStatusMayInitCtx).
+        # `_load_flex_attention_compiled` is the codebase's existing primitive
+        # for exactly this (used when activation_checkpointing triggers an
+        # eager recompute): a standalone-compiled fused flex kernel that never
+        # materialises the dense scores. Forcing `_flex_needs_compile=True` on
+        # the EMA copy's flex attention drops the eval peak from OOM (>32 GB)
+        # to ~11.5 GB, matching the compiled model. No-op when flex is off
+        # (use_flex is False) — there is no dense-score fallback to avoid.
+        from flower.models.base import CausalSelfAttention
+
+        for module in ema_model.modules():
+            if isinstance(module, CausalSelfAttention) and getattr(module, "use_flex", False):
+                module._flex_needs_compile = True
     initialize_lr_schedule(optims)
     batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
+    eval_bs = cfg.training.eval_batch_size or cfg.training.batch_size
     val_batches = (
-        validation_token_batches(cfg.data, cfg.training.batch_size, device)
+        validation_token_batches(cfg.data, eval_bs, device)
         if cfg.training.validation_steps > 0
         else None
     )
@@ -326,7 +486,23 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             latest = ckpts[-1]
             print(f"[resume] loading checkpoint {latest}")
             payload = torch.load(latest, map_location=device, weights_only=True)
-            eager_model.load_state_dict(payload["model"])
+            # S14 Opportunity 2 Part A: bloom_memory's K-hash ModuleList became a
+            # single `hash_weights` Parameter. Remap legacy checkpoints so an
+            # in-flight bloom run resumed after the upgrade keeps its learned
+            # hashes. No-op for new-format / non-bloom state_dicts.
+            from flower.models.bloom_memory import remap_legacy_bloom_state_dict
+            from flower.models.memory import remap_legacy_mha_state_dict
+
+            state = remap_legacy_bloom_state_dict(payload["model"])
+            # S14 Opportunity: summary_memory / bloom_memory replaced their
+            # nn.MultiheadAttention perceiver with a compile-clean
+            # SDPCrossAttention. Remap legacy MHA in_proj_*/out_proj.* keys to
+            # the new q/k/v/out_proj layout. `bias` comes from the config:
+            # nn.MultiheadAttention always had bias, but SDPCrossAttention
+            # respects use_bias, so a use_bias=False checkpoint must drop them.
+            # No-op for new-format state_dicts.
+            state = remap_legacy_mha_state_dict(state, bias=getattr(cfg.model, "use_bias", True))
+            eager_model.load_state_dict(state)
             for opt, opt_state in zip(optims, payload.get("optimizers", []), strict=False):
                 opt.load_state_dict(opt_state)
             resume_step = int(payload.get("step", 0))
@@ -350,19 +526,66 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     start = time.perf_counter()
     last_log_time = start
     last_log_tokens = 0
-    log_interval = max(1, min(cfg.training.eval_interval, cfg.training.steps))
+    # Scalar-logging cadence. Historically this was derived from `eval_interval`,
+    # which is 1000 in the production configs — so a 10,000-step run recorded
+    # only 11 loss points. That is far too coarse to see a loss spike, a grad-norm
+    # excursion, or any of the instabilities the Muon literature's stability
+    # fixes (MuonClip and friends) exist to address: at 1000-step resolution an
+    # instability and a recovery are one indistinguishable sample. `log_interval`
+    # now decouples the two; 0 keeps the legacy behaviour so old configs
+    # reproduce their logging exactly.
+    explicit_log_interval = int(getattr(cfg.training, "log_interval", 0) or 0)
+    log_interval = max(
+        1,
+        min(
+            explicit_log_interval or cfg.training.eval_interval,
+            cfg.training.steps,
+        ),
+    )
     last_loss = 0.0
     tokens = 0
+    # Gradient-norm statistics, accumulated on device between log points so the
+    # per-step cost is one add and one compare (no host sync). Reset each time
+    # they are logged, so each point summarises its own interval rather than the
+    # whole run to date.
+    grad_norm_sum = torch.zeros((), device=device)
+    grad_clipped_sum = torch.zeros((), device=device)
+    grad_norm_max = torch.zeros((), device=device)
+    grad_stat_steps = 0
 
     model.train()
     shm_watchdog = start_shm_watchdog()
+    # CUDAGraph + grad-accum warmup (see `use_persistent_grads` above):
+    # pre-allocate a zeroed `.grad` tensor for every trainable parameter *before*
+    # CUDAGraph capture, so the graph pins those (now-stable) addresses instead
+    # of allocating fresh `.grad` tensors during capture (which then get
+    # overwritten on the next replay — the "accessing gradient tensor output of
+    # CUDAGraphs that has been overwritten" error). This is the fix the error
+    # message itself suggests ("preallocating zeroed .grad tensors") and the only
+    # one that works in torch 2.13 (mark_step_begin / cloning do not — see
+    # pytorch/pytorch#169545). We allocate directly rather than via an eager
+    # backward so flex-attention stays on its fused compiled kernel (the eager
+    # backward would materialise the T x T scores matrix and can OOM at long
+    # context). The buffers are kept across the run via zero_grad(set_to_none=
+    # False) below. Skipped unless the combination is active, so default-mode
+    # and accum==1 runs are unaffected. Cost: +1x params worth of `.grad`
+    # memory, which is already the steady-state cost of any backward.
+    if use_persistent_grads:
+        for p in eager_model.parameters():
+            if p.requires_grad:
+                p.grad = torch.zeros_like(p)
+        print("[compile] persistent .grad buffers allocated for reduce-overhead + grad accumulation")
     try:
         for step in range(resume_step + 1, cfg.training.steps + 1):
+            update_attention_windows(eager_model, step, cfg)
             if hasattr(eager_model, "set_step"):
                 eager_model.set_step(step)
             accum_steps = max(1, int(cfg.training.gradient_accumulation_steps))
             for opt in optims:
-                opt.zero_grad(set_to_none=True)
+                # Keep pre-allocated `.grad` buffers (stable addresses for
+                # CUDAGraph replay) when reduce-overhead + accumulation is on;
+                # otherwise free them (the standard, lower-memory path).
+                opt.zero_grad(set_to_none=not use_persistent_grads)
             # Accumulate the loss on-device: the previous float(...cpu()) here
             # forced a host sync once per micro-step (8x per optimizer step at
             # accum=8), serialising the pipeline for a number only read at
@@ -371,6 +594,28 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             last_diagnostics: dict[str, Any] = {}
             for _ in range(accum_steps):
                 input_ids, labels = unpack_batch(next(batches))
+                # S9: Token Superposition Training phase 1 — compress to bags.
+                #
+                # BOTH inputs and labels must be bagged. Previously only the
+                # inputs were, which left `labels` 2-D against a 3-D input and
+                # crashed the forward ("too many values to unpack") — and the
+                # model call sits outside the try/except below, so the guard did
+                # not catch it either. `tst_enabled: true` was unusable.
+                #
+                # The model averages each bag's embeddings (one position per
+                # bag, so T/s positions instead of T — the source of the
+                # speedup) and scores against the next bag's token SET via
+                # multi-hot CE. See CausalLM._multi_hot_cross_entropy.
+                tst_phase_1 = False
+                if getattr(cfg.training, "tst_enabled", False):
+                    phase_1_steps = int(cfg.training.steps * float(getattr(cfg.training, "tst_phase_ratio", 0.0)))
+                    tst_phase_1 = step <= phase_1_steps
+                if tst_phase_1:
+                    from flower.data import compress_to_bags
+
+                    bag = int(cfg.training.tst_bag_size)
+                    input_ids = compress_to_bags(input_ids, bag)
+                    labels = compress_to_bags(labels, bag)
                 with autocast_ctx(device, amp_dtype):
                     out = model(input_ids, labels=labels)
                     loss = out["loss"]
@@ -380,7 +625,19 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 step_loss += loss.detach()
                 tokens += input_ids.numel()
                 last_diagnostics = out.get("diagnostics", {}) or {}
-            torch.nn.utils.clip_grad_norm_(eager_model.parameters(), cfg.training.grad_clip)
+            # `clip_grad_norm_` already computes the total pre-clip gradient
+            # norm; it was being discarded. It is the single most informative
+            # stability signal available for free — a run that is going unstable
+            # shows grad-norm excursions and a rising clip rate well before the
+            # loss curve visibly breaks. Accumulated ON DEVICE and only synced at
+            # logging time, so this adds no per-step host sync.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                eager_model.parameters(), cfg.training.grad_clip
+            )
+            grad_norm_sum += grad_norm.detach()
+            grad_clipped_sum += (grad_norm.detach() > cfg.training.grad_clip).to(grad_norm.dtype)
+            grad_norm_max = torch.maximum(grad_norm_max, grad_norm.detach())
+            grad_stat_steps += 1
             apply_lr_schedule(
                 optims,
                 step,
@@ -392,8 +649,31 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             )
             for opt in optims:
                 opt.step()
-            last_loss = float(step_loss) / accum_steps
+            if ema_model is not None:
+                with torch.no_grad():
+                    decay = float(cfg.training.ema_decay)
+                    # Multi-tensor form of the same two ops the per-parameter
+                    # loop ran, in the same order, so it is BIT-EXACT against
+                    # previous runs (verified). The loop issued 2 kernel launches
+                    # per parameter (284 for this 142-tensor model) every step
+                    # for pure-bandwidth work; _foreach_ groups them.
+                    #
+                    # Deliberately NOT torch._foreach_lerp_, which computes the
+                    # algebraically identical e + (1-d)(m - e) with different
+                    # rounding — measured ~5e-7 drift in fp32. The EMA feeds
+                    # eval weights, and this codebase's runs are compared at
+                    # 0.0004 BPB resolution, so a free bit-exact form is worth
+                    # preferring over a marginally faster inexact one.
+                    torch._foreach_mul_(ema_params, decay)
+                    torch._foreach_add_(ema_params, model_params, alpha=1.0 - decay)
             should_log = step == 1 or step % log_interval == 0 or step == cfg.training.steps
+            if should_log:
+                # `float(step_loss)` is a host sync; paying it every step would
+                # reintroduce exactly the sync the on-device loss accumulator
+                # above exists to avoid. The value is only read at logging
+                # time, and `should_log` includes the final step, so the
+                # closing metrics always see the last value.
+                last_loss = float(step_loss) / accum_steps
             if writer is not None and should_log:
                 now = time.perf_counter()
                 interval_elapsed = max(now - last_log_time, 1e-9)
@@ -402,6 +682,23 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 writer.add_scalar("train/perplexity", math.exp(min(last_loss, 20.0)), step)
                 writer.add_scalar("train/lr", optims[0].param_groups[0]["lr"], step)
                 log_learning_rates(writer, optims, step)
+                # Stability signals. `grad_norm_max` and `grad_clip_frac` are the
+                # two that move first when training is going wrong: a rising clip
+                # fraction means the optimizer is being throttled more and more
+                # often, and a max far above the mean means isolated spikes that
+                # a mean would hide. Both are interval statistics, reset below.
+                if grad_stat_steps > 0:
+                    writer.add_scalar(
+                        "train/grad_norm", float(grad_norm_sum) / grad_stat_steps, step
+                    )
+                    writer.add_scalar("train/grad_norm_max", float(grad_norm_max), step)
+                    writer.add_scalar(
+                        "train/grad_clip_frac", float(grad_clipped_sum) / grad_stat_steps, step
+                    )
+                    grad_norm_sum.zero_()
+                    grad_clipped_sum.zero_()
+                    grad_norm_max.zero_()
+                    grad_stat_steps = 0
                 writer.add_scalar("throughput/tokens_per_sec", tokens_per_sec, step)
                 # Surface any scalar fields the model put in its diagnostics dict
                 # (variant-specific signals like hamiltonian_energy_drift_mean,
@@ -430,7 +727,8 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 and step % cfg.training.validation_interval == 0
             ):
                 val_metrics = evaluate(
-                    model, val_batches, cfg.training.validation_steps, device, amp_dtype,
+                    ema_model if ema_model is not None else model,
+                    val_batches, cfg.training.validation_steps, device, amp_dtype,
                     bytes_per_token=cfg.data.bytes_per_token,
                 )
                 if writer is not None:
@@ -482,10 +780,15 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         "seed": int(cfg.training.seed),
         "gpu_memory_allocated": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
     }
+    # Record the FP8 layout (recipe, how many Linears were converted) so a run's
+    # numerical setup is readable from its own metrics rather than only from the
+    # config that launched it. Empty dict when fp8_linear is off.
+    metrics.update(fp8_info)
     if val_batches is not None:
         metrics.update(
             evaluate(
-                model, val_batches, cfg.training.validation_steps, device, amp_dtype,
+                ema_model if ema_model is not None else model,
+                val_batches, cfg.training.validation_steps, device, amp_dtype,
                 bytes_per_token=cfg.data.bytes_per_token,
             )
         )

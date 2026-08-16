@@ -21,6 +21,16 @@ This implementation gives Flower a dependency-free Titans variant where:
   via create_graph=True (Titans uses test-time updates, but for training we keep
   full differentiability so the memory-write rule itself is learned).
 
+Analytical fast path (``ModelConfig.titans_analytical_surprise=True``, S14
+Opportunity 3 — research contribution): the inner surprise gradient has a
+closed form, so we compute it directly with einsum + element-wise ops instead
+of building/destroying an inner autograd graph every step. This is exact (it
+matches ``torch.autograd.grad`` at fp32 ~1e-9) and the outer CE gradient still
+flows through key_proj/val_proj/alpha_logit/write_scale, because every op in
+the analytical path is a standard differentiable PyTorch op. See
+``_surprise_analytical`` for the derivation and NEXT_IDEAS.md §7 for the
+research framing.
+
 This is structurally different from `summary_memory.py` (which uses max-pool +
 MLP) and from the prior `titans_mac.py` stand-in (which used `|summary - memory|`
 as a learned MLP gate, with no gradient signal at all).
@@ -75,12 +85,69 @@ class TitansMACBlock(nn.Module):
         Attention weights are softmax over slots; the predicted value is the weighted
         average of slot contents. The loss is mean-squared error per element so the
         gradient magnitudes are stable across batch/dim.
+
+        Used by the legacy autograd surprise path (when
+        `titans_analytical_surprise=False`). The analytical path does not call
+        this; it differentiates the same expression in closed form.
         """
         long_mem = memory[:, : self.config.memory_slots]
         scores = torch.einsum("bsd,bd->bs", long_mem, key) / (long_mem.shape[-1] ** 0.5)
         weights = torch.softmax(scores, dim=-1)
         predicted = torch.einsum("bs,bsd->bd", weights, long_mem)
         return F.mse_loss(predicted, value)
+
+    def _surprise_analytical(
+        self, long_mem: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        """Closed-form gradient of the inner MSE retrieval loss w.r.t. memory slots.
+
+        Exact replacement for the legacy ``torch.autograd.grad(_inner_loss(...))``
+        path. S14 Opportunity 3 (research contribution — analytical Titans
+        surprise without autograd; see NEXT_IDEAS.md §7). Every op below is a
+        standard differentiable PyTorch op, so the *outer* CE gradient still
+        flows through key_proj / val_proj / alpha_logit / write_scale and through
+        cross-layer memory — only the *inner* graph build/destroy is removed.
+
+        Derivation (per batch element; ``D`` is d_model, ``B`` is batch):
+
+            s_s   = <M_s, k> / sqrt(D)        score per slot
+            w_s   = softmax(s)_s              weight per slot
+            p     = sum_s w_s M_s             predicted value
+            a     = p - v                     residual
+            loss  = ||a||^2 / (B*D)           MSE (mean over B and D)
+
+        Two gradient paths through M_s — direct (M_s in p) and through-softmax
+        (M_s in s_s, which feeds every weight via the softmax Jacobian):
+
+            d(loss)/d(M_s) = (2/(B*D)) * w_s * [ a + (<a, M_s - p>/sqrt(D)) * k ]
+
+        The factor 2/(B*D) (not 2/D) comes from ``F.mse_loss``'s mean reduction
+        over BOTH batch and feature dims; it must be kept to match the autograd
+        path exactly and to preserve alpha_logit/write_scale semantics across
+        checkpoints. Returns the NEGATIVE gradient (the Titans surprise signal,
+        i.e. the direction that reduces the inner loss).
+
+        Args:
+            long_mem: (B, S, D) — the long-memory prefix.
+            key:      (B, D)    — projected key.
+            value:    (B, D)    — projected target value.
+
+        Returns:
+            (B, S, D) surprise = -d(loss)/d(M_s).
+        """
+        B, S, D = long_mem.shape
+        sqrt_d = D ** 0.5
+        scores = torch.einsum("bsd,bd->bs", long_mem, key) / sqrt_d       # (B,S)
+        w = torch.softmax(scores, dim=-1)                                 # (B,S)
+        p = torch.einsum("bs,bsd->bd", w, long_mem)                       # (B,D)
+        a = p - value                                                     # (B,D)
+        # <a, M_s - p> per slot — the softmax-Jacobian coupling term.
+        dot = torch.einsum("bd,bsd->bs", a, long_mem - p.unsqueeze(1))    # (B,S)
+        factor = 2.0 / (B * D)                                            # MSE mean reduction
+        grad = factor * w.unsqueeze(-1) * (
+            a.unsqueeze(1) + (dot / sqrt_d).unsqueeze(-1) * key.unsqueeze(1)
+        )                                                                 # (B,S,D)
+        return -grad  # negative gradient == Titans surprise
 
     def _surprise_update(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Compute the Titans surprise signal and apply it as a memory update."""
@@ -89,22 +156,27 @@ class TitansMACBlock(nn.Module):
         value = self.val_proj(summary)
 
         long_mem = memory[:, : self.config.memory_slots]
-        # The surprise gradient must be taken w.r.t. the memory tensor with grad enabled.
-        # We detach the input memory and request grad on a fresh leaf so the surprise
-        # gradient is well-defined even if the input was produced under no_grad.
-        probe = long_mem.detach().requires_grad_(True)
-        # Inner loss uses the probe in place of `long_mem` inside _inner_loss. To keep
-        # the inner-loss computation aligned with the slot-slice convention, we
-        # construct a memory-shaped tensor with the probe in the long-mem prefix.
-        probe_memory = (
-            torch.cat([probe, memory[:, self.config.memory_slots :]], dim=1)
-            if memory.shape[1] > self.config.memory_slots
-            else probe
-        )
-        inner = self._inner_loss(probe_memory, key, value)
-        # create_graph=True lets the outer cross-entropy backprop through the surprise.
-        (surprise_grad,) = torch.autograd.grad(inner, probe, create_graph=self.training, retain_graph=True)
-        surprise = -surprise_grad  # negative gradient = direction that reduces inner loss
+        if self.config.titans_analytical_surprise:
+            # Analytical path: closed-form inner gradient, no autograd graph.
+            surprise = self._surprise_analytical(long_mem, key, value)
+        else:
+            # Legacy path: build an inner autograd graph and differentiate it
+            # once per step. create_graph=True in training keeps the outer CE
+            # gradient flowing through the surprise. enable_grad() is needed so
+            # the inner graph is built even when the caller is under no_grad
+            # (eval); the analytical path above does not need it.
+            with torch.enable_grad():
+                probe = long_mem.detach().requires_grad_(True)
+                probe_memory = (
+                    torch.cat([probe, memory[:, self.config.memory_slots :]], dim=1)
+                    if memory.shape[1] > self.config.memory_slots
+                    else probe
+                )
+                inner = self._inner_loss(probe_memory, key, value)
+                (surprise_grad,) = torch.autograd.grad(
+                    inner, probe, create_graph=self.training, retain_graph=True
+                )
+            surprise = -surprise_grad
 
         alpha = torch.sigmoid(self.alpha_logit).view(1, -1, 1)  # (1, S, 1)
         new_long = (1.0 - alpha) * long_mem + alpha * self.write_scale * surprise
@@ -121,10 +193,10 @@ class TitansMACBlock(nn.Module):
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))
-        # Run surprise computation under grad even at eval time so the gradient is
-        # available; the result is detached afterwards if we are in no_grad context.
-        with torch.enable_grad():
-            memory = self._surprise_update(memory, x)
+        memory = self._surprise_update(memory, x)
+        # Eval does not backprop: detach the memory state so it does not carry a
+        # graph out of a no_grad context. (The analytical path has no inner
+        # graph, so no enable_grad context is needed either way.)
         if not torch.is_grad_enabled():
             memory = memory.detach()
         return x, memory
