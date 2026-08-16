@@ -154,3 +154,190 @@ def test_unknown_schedule_raises(device):
         _legacy(g, 5, "quintic")  # missing the 5
     with pytest.raises(ValueError):
         _ns_schedule("typo", 5)
+
+
+def test_contra_muon_damps_large_singular_directions():
+    """Contra-Muon must damp update directions in proportion to gradient sigma.
+
+    Newton-Schulz maps every singular value to 1, discarding the gradient's
+    spectral profile. Contra-Muon subtracts a normalised copy of the
+    pre-orthogonalisation update so that large-sigma directions are reduced MORE
+    than small ones, relatively boosting the small directions.
+
+    This is asserted in the GRADIENT'S OWN singular basis, not on sorted singular
+    values: Contra-Muon reorders the sorted spectrum, so a max/min ratio moves the
+    wrong way and looks like a regression when the implementation is correct.
+    """
+    import torch.nn as nn
+
+    from flower.optim import Muon
+
+    torch.manual_seed(0)
+    a = torch.randn(64, 32)
+    u0, _, v0h = torch.linalg.svd(a, full_matrices=False)
+    sigma = torch.linspace(3.0, 0.05, 32)  # strongly skewed, known spectrum
+    grad = u0 @ torch.diag(sigma) @ v0h
+
+    def gains(contra: float) -> torch.Tensor:
+        m = nn.Linear(32, 64, bias=False)
+        opt = Muon(
+            m.parameters(), lr=1.0, momentum=0.0, nesterov=False,
+            ns_batched=False, contra_muon=contra,
+        )
+        m.weight.grad = grad.clone()
+        before = m.weight.detach().clone()
+        opt.step()
+        upd = before - m.weight.detach()
+        return torch.einsum("ij,ik,kj->j", u0, upd, v0h.T)
+
+    delta = gains(0.4) - gains(0.0)
+    # Every direction is damped...
+    assert (delta <= 1e-6).all(), "Contra-Muon should not amplify any direction"
+    # ...and the damping must scale with the gradient's singular value.
+    corr = torch.corrcoef(torch.stack([sigma, delta]))[0, 1]
+    assert corr < -0.95, f"damping not proportional to gradient sigma (corr={corr:.3f})"
+
+
+def test_contra_muon_zero_is_exactly_off():
+    """contra_muon=0.0 must reproduce the existing update bit-for-bit."""
+    import torch.nn as nn
+
+    from flower.optim import Muon
+
+    def run(contra: float) -> torch.Tensor:
+        torch.manual_seed(0)
+        m = nn.Linear(32, 64, bias=False)
+        opt = Muon(m.parameters(), lr=0.1, momentum=0.9, ns_batched=False, contra_muon=contra)
+        torch.manual_seed(1)
+        for _ in range(3):
+            m.weight.grad = torch.randn(64, 32)
+            opt.step()
+        return m.weight.detach().clone()
+
+    assert torch.equal(run(0.0), run(0.0))
+    assert not torch.equal(run(0.0), run(0.2)), "contra_muon=0.2 had no effect"
+
+
+def test_per_head_map_tags_attention_matrices_with_correct_axes():
+    """qkv splits rows (3*heads blocks); the output projection splits columns."""
+    from flower.config import ModelConfig
+    from flower.models import build_model
+    from flower.optim import build_head_block_map
+
+    cfg = ModelConfig(
+        variant="vanilla_local", vocab_size=64, d_model=64, num_heads=4,
+        num_layers=2, ffn_dim=128, max_seq_len=32, local_window=8,
+    )
+    m = build_model(cfg)
+    hm = build_head_block_map(m)
+    by_name = {n: hm[id(p)] for n, p in m.named_parameters() if id(p) in hm}
+
+    assert len(by_name) == 4, f"expected 2 matrices x 2 layers, got {sorted(by_name)}"
+    for n, (axis, blocks) in by_name.items():
+        if "qkv" in n:
+            assert (axis, blocks) == (0, 12), f"{n}: qkv must split rows into 3*heads"
+        else:
+            assert (axis, blocks) == (1, 4), f"{n}: out proj must split cols into heads"
+
+
+def test_per_head_orthogonalises_each_head_block_independently():
+    """The point of per-head Muon: every head gets its own unit-norm update.
+
+    Under whole-matrix NS the singular values of the FULL matrix are ~1, so any
+    individual head block is well below 1 and heads share one update scale.
+    """
+    from flower.optim import _ns_schedule, _per_head_orthogonalise, _zeropower_via_newtonschulz5
+
+    torch.manual_seed(0)
+    coeffs = _ns_schedule("quintic5", 5)
+    u = torch.randn(192, 64)  # 12 head blocks of 16 rows
+
+    per_head = _per_head_orthogonalise(u, (0, 12), coeffs)
+    assert per_head.shape == u.shape
+
+    def block_svs(x):
+        return torch.stack([torch.linalg.svdvals(b) for b in x.view(12, 16, 64)])
+
+    ph, whole = block_svs(per_head), block_svs(_zeropower_via_newtonschulz5(u, 5, "quintic5"))
+    assert ph.min() > 0.5, "per-head blocks should each be near-orthogonal"
+    assert ph.mean() > whole.mean() * 1.5, (
+        f"per-head block scale {ph.mean():.3f} not clearly above whole-matrix {whole.mean():.3f}"
+    )
+
+
+def test_per_head_falls_back_when_shape_does_not_divide():
+    """A variant with an odd attention layout must degrade to standard Muon."""
+    from flower.optim import _ns_schedule, _per_head_orthogonalise
+
+    coeffs = _ns_schedule("quintic5", 5)
+    u = torch.randn(50, 64)  # 50 rows is not divisible by 12
+    out = _per_head_orthogonalise(u, (0, 12), coeffs)
+    assert out.shape == u.shape and torch.isfinite(out).all()
+
+
+def test_per_head_is_opt_in():
+    from flower.config import ModelConfig, TrainingConfig
+    from flower.models import build_model
+    from flower.optim import build_optimizer
+
+    cfg = ModelConfig(
+        variant="vanilla_local", vocab_size=64, d_model=64, num_heads=4,
+        num_layers=2, ffn_dim=128, max_seq_len=32, local_window=8,
+    )
+    m = build_model(cfg)
+
+    def head_map_size(flag: bool) -> int:
+        opts = build_optimizer(m, TrainingConfig(optimizer="muon", muon_per_head=flag))
+        opts = opts if isinstance(opts, list) else [opts]
+        muon = next(o for o in opts if type(o).__name__ == "Muon")
+        return len(muon._head_map)
+
+    assert head_map_size(False) == 0, "per-head must be off by default"
+    assert head_map_size(True) == 4
+
+
+def test_normuon_equalises_row_scales_without_changing_step_size():
+    """NorMuon must REDISTRIBUTE scale across rows, not shrink the update.
+
+    The original implementation was `ortho / ortho.norm()` — one global
+    Frobenius normalisation. An orthogonalised (m, n) matrix has
+    ||ortho||_F ~= sqrt(min(m,n)), so that divided every update by ~36 at
+    d_model=1280: a silent 36x learning-rate cut. The 1500-step Muon screen
+    measured it at +0.517 val_bpb (train loss 4.64 vs 3.16).
+
+    Both properties are asserted: row scales become equal (the method), and the
+    Frobenius norm is preserved (so an A/B measures the method, not an LR change).
+    """
+    import torch.nn as nn
+
+    from flower.optim import Muon
+
+    def update_for(norm_update: bool) -> torch.Tensor:
+        torch.manual_seed(0)
+        m = nn.Linear(64, 128, bias=False)
+        opt = Muon(
+            m.parameters(), lr=1.0, momentum=0.0, nesterov=False,
+            ns_batched=False, norm_update=norm_update,
+        )
+        torch.manual_seed(1)
+        m.weight.grad = torch.randn(128, 64) * torch.linspace(0.1, 3.0, 128)[:, None]
+        before = m.weight.detach().clone()
+        opt.step()
+        return before - m.weight.detach()
+
+    plain, normed = update_for(False), update_for(True)
+
+    # 1. Row RMS spread must shrink substantially.
+    def spread(x):
+        rms = x.pow(2).mean(dim=1).sqrt()
+        return (rms.max() / rms.min()).item()
+
+    assert spread(normed) < spread(plain) / 2, (
+        f"row scales not equalised: {spread(normed):.3f} vs {spread(plain):.3f}"
+    )
+
+    # 2. Overall step size must be preserved (this is what the old code broke).
+    ratio = normed.norm() / plain.norm()
+    assert 0.5 < ratio < 2.0, (
+        f"NorMuon changed the step size by {ratio:.3f}x; it must redistribute, not rescale"
+    )

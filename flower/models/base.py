@@ -27,6 +27,8 @@ def _load_flex_attention() -> tuple[Any, Any]:
     if _flex_attention is None:
         from torch.nn.attention.flex_attention import (
             create_block_mask as _cbm,
+        )
+        from torch.nn.attention.flex_attention import (
             flex_attention as _fa,
         )
 
@@ -112,6 +114,7 @@ def _selective_checkpoint_context_fn(*, threshold_bytes: int = _SELECTIVE_CKPT_B
     it works on any torch version that ships ``create_selective_checkpoint_contexts``.
     """
     import functools
+
     from torch.utils.checkpoint import (
         CheckpointPolicy,
         create_selective_checkpoint_contexts,
@@ -129,6 +132,75 @@ def _selective_checkpoint_context_fn(*, threshold_bytes: int = _SELECTIVE_CKPT_B
         return CheckpointPolicy.MUST_SAVE
 
     return functools.partial(create_selective_checkpoint_contexts, policy_fn)
+
+
+@torch._dynamo.disable
+def _call_liger_fce(liger_fce: Any, lin_weight: torch.Tensor, shift_input: torch.Tensor, shift_labels: torch.Tensor):
+    """Invoke Liger's fused linear+CE outside the Dynamo graph.
+
+    WHY THE GRAPH BREAK IS MANDATORY (not an optimisation)
+      Liger's kernel calls `torch.addmm(..., out_dtype=...)` internally, which
+      dispatches to the `aten.addmm.dtype` overload. Inductor's lowering routes
+      that to `tuned_addmm()`, which only accepts 3 positional arguments, so
+      compiling through it raises
+
+          InductorError: LoweringException: TypeError:
+          tuned_addmm() takes 3 positional arguments but 4 were given
+
+      Measured on torch 2.13.0+cu130 with and without FP8, so it is a plain
+      Liger + torch.compile incompatibility on this build, not an FP8
+      interaction. Before this wrapper, setting `fused_linear_ce: true`
+      together with `compile_model: true` crashed the run during the first
+      compile — i.e. the flag was unusable in exactly the configuration it was
+      written for.
+
+      Disabling Dynamo here costs one graph break at the very end of the
+      forward, after every transformer block has already been captured, and the
+      kernel it guards is hand-written Triton that gains nothing from inductor
+      lowering. `torch._dynamo.disable` (rather than a config-level ban) keeps
+      the memory saving available, which is the entire point of S14-5b: the
+      (B*T, vocab) logits tensor is never materialised.
+    """
+    return liger_fce(lin_weight, shift_input, shift_labels)
+
+
+def _fake_quant_e4m3(x: torch.Tensor) -> torch.Tensor:
+    """Straight-through per-tensor e4m3 quantize-dequantize.
+
+    WHAT THIS IS FOR
+      Deciding whether an FP8 attention kernel is worth building, WITHOUT
+      building its backward pass first.
+
+      `flower/kernels/fp8_swa_attention.py` implements an FP8 sliding-window
+      attention forward that is measured at 1.36x flex's forward once tuned — so
+      the speed is real. What is not known is whether FP8-precision attention
+      degrades trained quality, and that question cannot be answered by a
+      forward-only kernel. Writing the backward is a large, numerically delicate
+      job to undertake on spec.
+
+      This is the cheap substitute: the forward sees genuinely e4m3-rounded
+      Q/K/V while flex still does the actual attention (so autograd works
+      unchanged), and the straight-through estimator passes gradients through
+      the rounding. That is the standard QAT trick, and it makes the quality
+      question answerable with one ordinary training run.
+
+    WHAT IT DOES NOT SIMULATE
+      The softmax probabilities P. Those live inside flex's kernel and cannot be
+      intercepted from here. A real FP8 kernel also quantizes P, which measured
+      as an independent 9.4x error contributor. So this simulation is a LOWER
+      BOUND on the damage: if quality degrades under this, the real kernel is
+      strictly worse and the direction is closed.
+
+    Per-tensor scaling (not per-head) deliberately: per-head measured identical
+    (18.4x either way), because the error is e4m3 mantissa-limited rather than
+    scale-limited.
+    """
+    amax = x.detach().abs().amax().clamp(min=1e-12)
+    scale = amax / 448.0
+    q = (x.detach() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    dq = q.to(x.dtype) * scale
+    # Straight-through: forward value is dq, gradient flows to x untouched.
+    return x + (dq - x).detach()
 
 
 def make_causal_local_block_mask(
@@ -473,6 +545,13 @@ class CausalSelfAttention(nn.Module):
         # S1 (FlexAttention). Opt-in; the SDPA path stays the default so the
         # existing (non-flex) tests and published runs reproduce bit-for-bit.
         self.use_flex = bool(getattr(config, "flex_attention", False))
+        # FP8-attention quality probe. Rounds Q/K/V to e4m3 in the forward with a
+        # straight-through gradient, so the cost of FP8-precision attention can
+        # be measured in a normal training run before any FP8 attention kernel
+        # backward is written. See _fake_quant_e4m3 for the full rationale and
+        # for what it does NOT simulate. Off by default; this is a measurement
+        # instrument, not a speedup (it is slightly SLOWER than plain bf16).
+        self.fp8_attention_sim = bool(getattr(config, "fp8_attention_sim", False))
         # S14-checkpoint: when activation checkpointing wraps the block forward,
         # flex must use its standalone-compiled fused kernel so the recompute
         # (which the outer torch.compile graph does not cover) still runs fused
@@ -522,6 +601,10 @@ class CausalSelfAttention(nn.Module):
         if self.qk_norm is not None:
             q, k = self.qk_norm(q), self.qk_norm(k)
         q, k = self.rope(q, k)
+        if self.fp8_attention_sim:
+            # Quantize AFTER QK-norm and RoPE, i.e. exactly the tensors a real
+            # FP8 attention kernel would consume. See _fake_quant_e4m3.
+            q, k, v = _fake_quant_e4m3(q), _fake_quant_e4m3(k), _fake_quant_e4m3(v)
         return q, k, v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -831,6 +914,36 @@ class CausalLM(nn.Module):
         self._liger_fce = cls()
         return True
 
+    def _multi_hot_cross_entropy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Multi-hot CE for Token Superposition Training phase 1 (S9).
+
+        In TST phase 1 each position holds a BAG of `s` consecutive tokens whose
+        embeddings were averaged on the way in, so the natural target for
+        position i is the SET of `s` tokens in bag i+1 — not a single token.
+        The objective is the mean negative log-likelihood over that set:
+
+            L = -1/(L*s) * sum_i sum_{t in bag_{i+1}} log p(t | bag_{<=i})
+
+        which is exactly cross-entropy against a uniform multi-hot target. It is
+        computed by gathering the `s` target log-probabilities rather than
+        materialising a (B, L, V) one-hot tensor, and rather than repeating the
+        logits `s` times — at vocab 16384 either of those would dominate the
+        memory this technique exists to save.
+
+        `logits` is (B, L, V) and `labels` is (B, L, s), both already at the
+        COMPRESSED length L = T/s. The usual next-token shift applies at the bag
+        level: bag i predicts bag i+1.
+        """
+        if labels.size(1) < 2:
+            # Fewer than two bags: nothing to predict. Return a real zero that
+            # still carries grad_fn so the backward graph stays well-formed.
+            return logits.sum() * 0.0
+        shift_logits = logits[:, :-1]  # (B, L-1, V)
+        shift_labels = labels[:, 1:]  # (B, L-1, s)
+        logp = torch.log_softmax(shift_logits.float(), dim=-1)
+        picked = logp.gather(-1, shift_labels)  # (B, L-1, s)
+        return -picked.mean()
+
     def _fused_cross_entropy(
         self,
         x_normed: torch.Tensor,
@@ -870,12 +983,24 @@ class CausalLM(nn.Module):
             return x_normed.new_zeros(())
         shift_input = x_normed[:, : T - offset].reshape(-1, x_normed.size(-1))
         shift_labels = labels[:, offset:].reshape(-1)
-        return self._liger_fce(lin_weight, shift_input, shift_labels)
+        return _call_liger_fce(self._liger_fce, lin_weight, shift_input, shift_labels)
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
         # Allow seq_len > max_seq_len during eval (Sweep 7 A1: eval_seq_len > max_seq_len).
         # RoPE cache extends lazily; local attention mask is computed on-the-fly.
-        x = self.token(input_ids)
+        #
+        # S9 / Token Superposition Training: a 3-D `input_ids` of shape
+        # (B, T/s, s) is a BAGGED batch — each position holds `s` consecutive
+        # token ids whose embeddings are averaged into one superposed vector.
+        # The transformer then runs over T/s positions instead of T, which is
+        # where TST's speedup comes from. 2-D input is the ordinary NTP path.
+        bagged = input_ids.dim() == 3
+        if bagged:
+            # Mean over the bag axis. `token` is (V, D), so indexing with a 3-D
+            # id tensor yields (B, T/s, s, D); averaging gives (B, T/s, D).
+            x = self.token(input_ids).mean(dim=2)
+        else:
+            x = self.token(input_ids)
         memory = None
         diagnostics: dict[str, Any] = {}
         # A2 looped transformer: run the block stack `loop_count` times. Memory state
@@ -986,6 +1111,14 @@ class CausalLM(nn.Module):
         # `logits` stays None and every eval/logprob consumer (which runs in
         # eval mode or without labels) keeps the eager path below. Falls back to
         # eager automatically if Liger is unavailable or the device is not CUDA.
+        # S9 TST: bagged labels are (B, T/s, s) and need the multi-hot objective,
+        # which neither the eager nor the Liger CE path implements. Handled first
+        # so the flags below cannot route a bagged batch into a 2-D loss.
+        if labels is not None and labels.dim() == 3:
+            logits = self._compute_logits(x_normed)
+            loss = self._multi_hot_cross_entropy(logits, labels)
+            return {"logits": logits, "loss": loss, "memory": memory, "diagnostics": diagnostics}
+
         use_fused_ce = (
             self.fused_linear_ce
             and self.training
@@ -1014,7 +1147,20 @@ class CausalLM(nn.Module):
                 # tied head above still handles the t+1 prediction. `x_normed` is
                 # reused verbatim - the FP8 path only affects the tied matmul, the
                 # MTP heads are always plain BF16 Linears.
-                if self.mtp_heads is not None:
+                #
+                # `self.training` GUARD IS LOAD-BEARING. MTP is a TRAINING-ONLY
+                # auxiliary objective: at eval we want the quality of the t+1
+                # head alone, which is what val_bpb is compared across arms.
+                # Without this guard the eval loss silently became
+                # `main + mtp_weight * sum(aux)`, because the fused path above is
+                # itself gated on `self.training` and so eval always falls into
+                # THIS branch. The first MTP screen measured val_bpb 1.128 ->
+                # 2.036 (1 head) -> 3.069 (2 heads), which reads as catastrophic
+                # divergence but is entirely the leak: those ratios imply t+2 and
+                # t+3 losses of 1.61x and 1.83x the main loss, monotone in offset
+                # exactly as predicting further ahead should be. Guarded by
+                # tests/test_mtp_eval_loss.py.
+                if self.mtp_heads is not None and self.training:
                     for i, mtp_head in enumerate(self.mtp_heads):
                         offset = i + 2  # predict t+2, t+3, ...
                         mtp_logits = mtp_head(x_normed)

@@ -22,7 +22,7 @@ from flower.config import ExperimentConfig, ModelConfig, TrainingConfig
 from flower.data import compress_to_bags
 from flower.eval import sliding_window_loss
 from flower.models import build_model
-from flower.models.base import CausalSelfAttention, FeedForward, causal_mask, make_causal_local_block_mask
+from flower.models.base import CausalSelfAttention
 from flower.optim import CautiousAdamW, Muon, build_optimizer
 from flower.train import update_attention_windows
 
@@ -389,26 +389,40 @@ def test_norm_update_defaults_off():
     assert TrainingConfig().norm_update is False
 
 
-def test_norm_update_produces_unit_norm_update_direction():
-    torch.manual_seed(0)
-    p = torch.randn(8, 8)
-    p0 = p.clone()
-    p.grad = torch.randn(8, 8)
-    lr = 0.1
-    opt = Muon([p], lr=lr, norm_update=True, momentum=0.0, nesterov=False)
-    opt.step()
-    # delta = (p0 - p) / (lr * scale); scale = max(1, sqrt(d_out/d_in)) = 1 for square.
-    scale = max(1.0, (p.size(0) / p.size(1)) ** 0.5)
-    delta = (p0 - p) / (lr * scale)
-    assert delta.norm().item() == pytest.approx(1.0, abs=1e-3)
+def test_norm_update_redistributes_row_scale_without_resizing_the_step():
+    """NorMuon equalises PER-ROW scale; it must not change the step size.
 
-    # Without norm_update the direction is NOT unit-norm.
-    p2 = torch.randn(8, 8)
-    p2_0 = p2.clone()
-    p2.grad = torch.randn(8, 8)
-    Muon([p2], lr=lr, norm_update=False, momentum=0.0, nesterov=False).step()
-    delta2 = (p2_0 - p2) / (lr * scale)
-    assert delta2.norm().item() != pytest.approx(1.0, abs=1e-3)
+    This test previously asserted the update was normalised to unit Frobenius
+    norm, which is what the code did before the fix documented in
+    `flower/optim.py` — a single global normalisation that shrank every update by
+    ~sqrt(min(m, n)) and so silently cut the Muon LR ~36x at d_model=1280. The
+    1500-step screen measured it at +0.517 val_bpb. The rule is now a pure
+    redistribution across rows, so ||delta|| is PRESERVED, not set to 1.
+    """
+    torch.manual_seed(0)
+    lr = 0.1
+
+    def delta_for(norm_update: bool) -> torch.Tensor:
+        torch.manual_seed(0)
+        p = torch.randn(8, 8)
+        p0 = p.clone()
+        p.grad = torch.randn(8, 8)
+        Muon([p], lr=lr, norm_update=norm_update, momentum=0.0, nesterov=False).step()
+        # scale = max(1, sqrt(d_out/d_in)) = 1 for a square matrix.
+        return (p0 - p) / lr
+
+    on, off = delta_for(True), delta_for(False)
+
+    # Step size preserved: this is what makes the A/B measure the method rather
+    # than an implicit LR change.
+    assert on.norm().item() == pytest.approx(off.norm().item(), rel=1e-3)
+
+    # Row scales equalised: that is the actual content of the rule.
+    rms_on = on.pow(2).mean(dim=1).sqrt()
+    rms_off = off.pow(2).mean(dim=1).sqrt()
+    assert rms_on.std() < rms_off.std() / 3, (
+        f"row RMS spread {rms_on.std():.4f} not clearly below baseline {rms_off.std():.4f}"
+    )
 
 
 def test_build_optimizer_routes_norm_update():
@@ -565,7 +579,8 @@ def test_smooth_swiglu_equivalent_to_standard():
     # fp32 rounding on near-zero outputs, so element-wise closeness is loose.
     # Assert high directional agreement instead: the two outputs must point the
     # same way (cosine similarity near 1) and stay within the same magnitude.
-    flat = lambda t: t.flatten().unsqueeze(0)
+    def flat(t):
+        return t.flatten().unsqueeze(0)
     cos = torch.nn.functional.cosine_similarity(flat(out_standard), flat(out_smooth)).item()
     assert cos > 0.95
     mean_abs = out_standard.abs().mean().item()
@@ -1107,9 +1122,11 @@ def test_activation_checkpoint_ffn_reduces_memory_and_beats_full_throughput_ish(
     import gc
 
     no_ckpt = peak(False)
-    gc.collect(); torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
     ffn_ckpt = peak("ffn")
-    gc.collect(); torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
     full_ckpt = peak(True)
     # ffn saves memory vs none, but keeps more than full (attention stays live).
     assert ffn_ckpt < no_ckpt, f"ffn did not reduce memory: {ffn_ckpt:.2f} >= {no_ckpt:.2f}"

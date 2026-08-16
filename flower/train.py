@@ -353,6 +353,15 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     configure_vram_limit(device, fraction=getattr(cfg.training, "vram_fraction", 0.85))
     amp_dtype = configure_precision(cfg.training.precision, device)
     model = build_model(cfg.model).to(device)
+    # FP8 linear conversion must happen BEFORE build_optimizer: swapping in
+    # Float8Linear rebinds the weight Parameters, so an optimizer built first
+    # would hold references to the discarded originals and silently train
+    # nothing. It must also precede torch.compile so the compiled graph sees
+    # the FP8 modules. See flower/precision.py for the measurement behind the
+    # recipe choice and the guardrails.
+    from flower.precision import maybe_convert_fp8
+
+    model, fp8_info = maybe_convert_fp8(model, cfg.training, device)
     # Optimizers are always built on the eager module: torch.compile returns a
     # wrapper whose .parameters() are the same objects, but keeping the eager
     # reference makes state_dict keys stable across compiled/uncompiled runs.
@@ -392,6 +401,14 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         # CUDAGraphs that has been overwritten"). No-op when flex is off.
         if device.type == "cuda":
             prebuild_attention_masks(eager_model, cfg.data.sequence_length, device)
+            # S9 TST phase 1 runs at the COMPRESSED length T/s, which needs its
+            # own BlockMask. Prebuilding it here keeps mask construction out of
+            # the compiled graph for both phases (building it inside mutates
+            # module state, which cudagraph mode flags as tensor aliasing).
+            if getattr(cfg.training, "tst_enabled", False):
+                bag = max(1, int(getattr(cfg.training, "tst_bag_size", 1)))
+                if bag > 1:
+                    prebuild_attention_masks(eager_model, cfg.data.sequence_length // bag, device)
         model = torch.compile(model, mode=cfg.training.compile_mode, dynamic=False)
     optims = optim_or_list if isinstance(optim_or_list, list) else [optim_or_list]
     # S12.4: EMA weight averaging for evaluation.
@@ -403,6 +420,22 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         ema_model.eval()
         for p in ema_model.parameters():
             p.requires_grad_(False)
+        # Materialise the parameter lists once for the multi-tensor EMA update
+        # below. Pairing is positional and safe because ema_model is a deepcopy
+        # of eager_model, so .parameters() yields the same structure in the same
+        # order. The explicit length check turns any future divergence (e.g. a
+        # variant that adds parameters after the copy) into a loud failure here
+        # rather than a whole run of silently mis-paired weight averaging.
+        #
+        # Caching `.data` is safe because every optimizer in flower/optim.py
+        # mutates parameters in place (`p.data -= ...`); none rebinds `p.data`
+        # to a new tensor, which would leave these references stale.
+        ema_params = [p.data for p in ema_model.parameters()]
+        model_params = [p.data for p in eager_model.parameters()]
+        if len(ema_params) != len(model_params):
+            raise RuntimeError(
+                f"EMA/model parameter count mismatch ({len(ema_params)} vs {len(model_params)})"
+            )
         # The EMA copy runs validation forwards eagerly (it is NOT wrapped in
         # torch.compile, unlike `model` below). A flex-attention forward that
         # misses the fused compiled kernel falls back to the unfused math path,
@@ -493,9 +526,32 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     start = time.perf_counter()
     last_log_time = start
     last_log_tokens = 0
-    log_interval = max(1, min(cfg.training.eval_interval, cfg.training.steps))
+    # Scalar-logging cadence. Historically this was derived from `eval_interval`,
+    # which is 1000 in the production configs — so a 10,000-step run recorded
+    # only 11 loss points. That is far too coarse to see a loss spike, a grad-norm
+    # excursion, or any of the instabilities the Muon literature's stability
+    # fixes (MuonClip and friends) exist to address: at 1000-step resolution an
+    # instability and a recovery are one indistinguishable sample. `log_interval`
+    # now decouples the two; 0 keeps the legacy behaviour so old configs
+    # reproduce their logging exactly.
+    explicit_log_interval = int(getattr(cfg.training, "log_interval", 0) or 0)
+    log_interval = max(
+        1,
+        min(
+            explicit_log_interval or cfg.training.eval_interval,
+            cfg.training.steps,
+        ),
+    )
     last_loss = 0.0
     tokens = 0
+    # Gradient-norm statistics, accumulated on device between log points so the
+    # per-step cost is one add and one compare (no host sync). Reset each time
+    # they are logged, so each point summarises its own interval rather than the
+    # whole run to date.
+    grad_norm_sum = torch.zeros((), device=device)
+    grad_clipped_sum = torch.zeros((), device=device)
+    grad_norm_max = torch.zeros((), device=device)
+    grad_stat_steps = 0
 
     model.train()
     shm_watchdog = start_shm_watchdog()
@@ -539,6 +595,17 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             for _ in range(accum_steps):
                 input_ids, labels = unpack_batch(next(batches))
                 # S9: Token Superposition Training phase 1 — compress to bags.
+                #
+                # BOTH inputs and labels must be bagged. Previously only the
+                # inputs were, which left `labels` 2-D against a 3-D input and
+                # crashed the forward ("too many values to unpack") — and the
+                # model call sits outside the try/except below, so the guard did
+                # not catch it either. `tst_enabled: true` was unusable.
+                #
+                # The model averages each bag's embeddings (one position per
+                # bag, so T/s positions instead of T — the source of the
+                # speedup) and scores against the next bag's token SET via
+                # multi-hot CE. See CausalLM._multi_hot_cross_entropy.
                 tst_phase_1 = False
                 if getattr(cfg.training, "tst_enabled", False):
                     phase_1_steps = int(cfg.training.steps * float(getattr(cfg.training, "tst_phase_ratio", 0.0)))
@@ -546,10 +613,9 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 if tst_phase_1:
                     from flower.data import compress_to_bags
 
-                    try:
-                        input_ids = compress_to_bags(input_ids, int(cfg.training.tst_bag_size))
-                    except Exception:
-                        tst_phase_1 = False
+                    bag = int(cfg.training.tst_bag_size)
+                    input_ids = compress_to_bags(input_ids, bag)
+                    labels = compress_to_bags(labels, bag)
                 with autocast_ctx(device, amp_dtype):
                     out = model(input_ids, labels=labels)
                     loss = out["loss"]
@@ -559,7 +625,19 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 step_loss += loss.detach()
                 tokens += input_ids.numel()
                 last_diagnostics = out.get("diagnostics", {}) or {}
-            torch.nn.utils.clip_grad_norm_(eager_model.parameters(), cfg.training.grad_clip)
+            # `clip_grad_norm_` already computes the total pre-clip gradient
+            # norm; it was being discarded. It is the single most informative
+            # stability signal available for free — a run that is going unstable
+            # shows grad-norm excursions and a rising clip rate well before the
+            # loss curve visibly breaks. Accumulated ON DEVICE and only synced at
+            # logging time, so this adds no per-step host sync.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                eager_model.parameters(), cfg.training.grad_clip
+            )
+            grad_norm_sum += grad_norm.detach()
+            grad_clipped_sum += (grad_norm.detach() > cfg.training.grad_clip).to(grad_norm.dtype)
+            grad_norm_max = torch.maximum(grad_norm_max, grad_norm.detach())
+            grad_stat_steps += 1
             apply_lr_schedule(
                 optims,
                 step,
@@ -574,10 +652,28 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             if ema_model is not None:
                 with torch.no_grad():
                     decay = float(cfg.training.ema_decay)
-                    for ema_p, model_p in zip(ema_model.parameters(), eager_model.parameters()):
-                        ema_p.data.mul_(decay).add_(model_p.data, alpha=1.0 - decay)
-            last_loss = float(step_loss) / accum_steps
+                    # Multi-tensor form of the same two ops the per-parameter
+                    # loop ran, in the same order, so it is BIT-EXACT against
+                    # previous runs (verified). The loop issued 2 kernel launches
+                    # per parameter (284 for this 142-tensor model) every step
+                    # for pure-bandwidth work; _foreach_ groups them.
+                    #
+                    # Deliberately NOT torch._foreach_lerp_, which computes the
+                    # algebraically identical e + (1-d)(m - e) with different
+                    # rounding — measured ~5e-7 drift in fp32. The EMA feeds
+                    # eval weights, and this codebase's runs are compared at
+                    # 0.0004 BPB resolution, so a free bit-exact form is worth
+                    # preferring over a marginally faster inexact one.
+                    torch._foreach_mul_(ema_params, decay)
+                    torch._foreach_add_(ema_params, model_params, alpha=1.0 - decay)
             should_log = step == 1 or step % log_interval == 0 or step == cfg.training.steps
+            if should_log:
+                # `float(step_loss)` is a host sync; paying it every step would
+                # reintroduce exactly the sync the on-device loss accumulator
+                # above exists to avoid. The value is only read at logging
+                # time, and `should_log` includes the final step, so the
+                # closing metrics always see the last value.
+                last_loss = float(step_loss) / accum_steps
             if writer is not None and should_log:
                 now = time.perf_counter()
                 interval_elapsed = max(now - last_log_time, 1e-9)
@@ -586,6 +682,23 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                 writer.add_scalar("train/perplexity", math.exp(min(last_loss, 20.0)), step)
                 writer.add_scalar("train/lr", optims[0].param_groups[0]["lr"], step)
                 log_learning_rates(writer, optims, step)
+                # Stability signals. `grad_norm_max` and `grad_clip_frac` are the
+                # two that move first when training is going wrong: a rising clip
+                # fraction means the optimizer is being throttled more and more
+                # often, and a max far above the mean means isolated spikes that
+                # a mean would hide. Both are interval statistics, reset below.
+                if grad_stat_steps > 0:
+                    writer.add_scalar(
+                        "train/grad_norm", float(grad_norm_sum) / grad_stat_steps, step
+                    )
+                    writer.add_scalar("train/grad_norm_max", float(grad_norm_max), step)
+                    writer.add_scalar(
+                        "train/grad_clip_frac", float(grad_clipped_sum) / grad_stat_steps, step
+                    )
+                    grad_norm_sum.zero_()
+                    grad_clipped_sum.zero_()
+                    grad_norm_max.zero_()
+                    grad_stat_steps = 0
                 writer.add_scalar("throughput/tokens_per_sec", tokens_per_sec, step)
                 # Surface any scalar fields the model put in its diagnostics dict
                 # (variant-specific signals like hamiltonian_energy_drift_mean,
@@ -667,6 +780,10 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         "seed": int(cfg.training.seed),
         "gpu_memory_allocated": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
     }
+    # Record the FP8 layout (recipe, how many Linears were converted) so a run's
+    # numerical setup is readable from its own metrics rather than only from the
+    # config that launched it. Empty dict when fp8_linear is off.
+    metrics.update(fp8_info)
     if val_batches is not None:
         metrics.update(
             evaluate(

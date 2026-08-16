@@ -157,6 +157,31 @@ gives a hermetic train/val split over the streaming dataset (since the upstream
 `sample-10BT` config exposes only a `train` split)."""
 
 
+def _local_parquet_doc_iter(files: list[str], text_field: str) -> Iterator[str]:
+    """Stream documents from local parquet shards one row-group batch at a time.
+
+    This deliberately bypasses `datasets.load_dataset("parquet", ...)` for the
+    FLOWER_DATA_CACHE path: measured 2026-08-16, the datasets streaming stack
+    holds ~2.5 GB resident PER DATALOADER WORKER at steady state (two workers
+    per training run = ~5 GB of a 31 GB WSL VM, and each worker is a fork that
+    pays it privately — the suspected contributor to a VM OOM that killed a
+    12-hour run at 83%). Direct pyarrow iteration of the same shards plateaus
+    ~2.2 GB lower per worker at identical document order (files in the given
+    order, rows in parquet order), pinned bit-equal against the datasets path
+    by tests/test_data.py::test_local_parquet_doc_iter_matches_datasets_streaming.
+    Row groups in these shards are 1,000 rows (~5 MB), so `iter_batches` at
+    1,000 streams one row group at a time.
+    """
+    import pyarrow.parquet as pq
+
+    for path in files:
+        parquet = pq.ParquetFile(path)
+        for batch in parquet.iter_batches(batch_size=1000, columns=[text_field]):
+            for text in batch.column(text_field).to_pylist():
+                if text:
+                    yield text
+
+
 class _FineWebChunkStream(IterableDataset):
     """Background-worker-friendly tokenized chunk stream over FineWeb-Edu.
 
@@ -213,12 +238,8 @@ class _FineWebChunkStream(IterableDataset):
             while True:
                 try:
                     if local_parquets:
-                        dataset = load_dataset(
-                            "parquet",
-                            data_files=local_parquets,
-                            split="train",
-                            streaming=self.config.streaming,
-                        )
+                        # Always streams (memory: see _local_parquet_doc_iter).
+                        docs: Iterator[str] = _local_parquet_doc_iter(local_parquets, text_field)
                     else:
                         dataset = load_dataset(
                             "HuggingFaceFW/fineweb-edu",
@@ -226,13 +247,13 @@ class _FineWebChunkStream(IterableDataset):
                             split="train",
                             streaming=self.config.streaming,
                         )
+                        docs = (row.get(text_field, "") for row in dataset)
                     if self.split_role == "validation":
-                        sliced = islice(dataset, VAL_DOCS)
+                        sliced = islice(docs, VAL_DOCS)
                     else:  # train
-                        sliced = islice(dataset, VAL_DOCS, None)
+                        sliced = islice(docs, VAL_DOCS, None)
                     sharded = islice(sliced, worker_id, None, num_workers)
-                    for row in sharded:
-                        text = row.get(text_field, "")
+                    for text in sharded:
                         if text:
                             yield text
                     consecutive_failures = 0  # successful pass
@@ -278,12 +299,7 @@ def fineweb_validation_documents(config: DataConfig, limit: int | None = None) -
         local_parquets = sorted(glob(f"{cache_dir}/sample/10BT/*.parquet"))
 
     if local_parquets:
-        dataset = load_dataset(
-            "parquet",
-            data_files=local_parquets,
-            split="train",
-            streaming=config.streaming,
-        )
+        doc_source: Iterator[str] = _local_parquet_doc_iter(local_parquets, text_field)
     else:
         dataset = load_dataset(
             "HuggingFaceFW/fineweb-edu",
@@ -291,9 +307,9 @@ def fineweb_validation_documents(config: DataConfig, limit: int | None = None) -
             split="train",
             streaming=config.streaming,
         )
+        doc_source = (row.get(text_field, "") for row in dataset)
 
-    for row in islice(dataset, take):
-        text = row.get(text_field, "")
+    for text in islice(doc_source, take):
         if text:
             yield text
 
@@ -328,8 +344,22 @@ def _fineweb_loader(
             yield batch.to(device, non_blocking=pin_memory)
 
 
-def fineweb_token_stream(config: DataConfig, batch_size: int, device: torch.device) -> Iterator[torch.Tensor]:
-    return _fineweb_loader(config, batch_size, device, "train")
+def fineweb_token_stream(
+    config: DataConfig,
+    batch_size: int,
+    device: torch.device,
+    *,
+    num_workers: int | None = None,
+    prefetch_factor: int | None = None,
+) -> Iterator[torch.Tensor]:
+    return _fineweb_loader(
+        config,
+        batch_size,
+        device,
+        "train",
+        num_workers=config.num_workers if num_workers is None else num_workers,
+        prefetch_factor=config.prefetch_factor if prefetch_factor is None else prefetch_factor,
+    )
 
 
 def token_batches(
@@ -339,9 +369,19 @@ def token_batches(
     *,
     split: str | None = None,
     seed: int = 1234,
-    num_workers: int = 2,
-    prefetch_factor: int = 4,
+    num_workers: int | None = None,
+    prefetch_factor: int | None = None,
 ) -> Iterator[torch.Tensor]:
+    # None = take the value from DataConfig. Previously the train path ignored
+    # these kwargs entirely and always ran on the _fineweb_loader default of 2
+    # workers, so `data.num_workers` was silently inert for training.
+    #
+    # This was a plumbing bug, NOT a throughput bug: the loader was measured at
+    # 1,079,869 tok/s with 2 workers against a ~52k tok/s consumption rate
+    # (scripts/bench_data_workers.py), i.e. ~20x headroom. Raising the worker
+    # count does not speed training up. See DataConfig.num_workers.
+    workers = config.num_workers if num_workers is None else num_workers
+    prefetch = config.prefetch_factor if prefetch_factor is None else prefetch_factor
     if config.dataset == "synthetic":
         return iter(SyntheticTokenStream(config, batch_size, device, seed=seed))
     if config.dataset == "mqar":
@@ -353,14 +393,20 @@ def token_batches(
         if role not in {"train", "validation"}:
             role = "train"
         if role == "train":
-            return fineweb_token_stream(config, batch_size, device)
+            return fineweb_token_stream(
+                config,
+                batch_size,
+                device,
+                num_workers=workers,
+                prefetch_factor=prefetch,
+            )
         return _fineweb_loader(
             config,
             batch_size,
             device,
             role,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
+            num_workers=workers,
+            prefetch_factor=prefetch,
         )
     raise ValueError(f"Unknown dataset: {config.dataset}")
 

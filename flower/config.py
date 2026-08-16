@@ -254,6 +254,15 @@ class ModelConfig:
     # mtp_weight. 0 disables (standard next-token loss).
     mtp_extra_heads: int = 0
     mtp_weight: float = 0.5
+    # FP8-attention quality probe (NOT a speedup — it is slightly slower than
+    # bf16). Rounds Q/K/V to e4m3 in the attention forward with a
+    # straight-through gradient, so the quality cost of FP8-precision attention
+    # can be measured in an ordinary training run without first writing an FP8
+    # attention backward. Simulates Q/K/V only, not the softmax probabilities,
+    # so it is a LOWER BOUND on a real FP8 kernel's error. See
+    # flower/models/base.py::_fake_quant_e4m3 and
+    # flower/kernels/fp8_swa_attention.py.
+    fp8_attention_sim: bool = False
     # S10: Smooth-SwiGLU. Per-channel scale on the `up` projection that makes
     # the SwiGLU multiply numerically equivalent but with a narrower dynamic
     # range, stabilising FP8/FP4 training. No-op for GELU FFNs.
@@ -382,6 +391,21 @@ class DataConfig:
     # computes true per-document BPB for final numbers; this is the cheap
     # in-loop approximation.)
     bytes_per_token: float | None = None
+    # DataLoader worker count for the *training* stream. The baseline profile
+    # (docs/profiling/baseline_profile.md) reaches 52.2k tok/s on synthetic
+    # tokens while the real 450M runs logged 41.9-44.8k — a ~17% gap that is
+    # entirely tokenization throughput.
+    #
+    # NOT order-preserving: each worker holds its own streaming iterator and
+    # shards documents by `islice(worker_id, None, num_workers)`, so the worker
+    # count determines which documents land in which batch. Changing it
+    # perturbs the training data order the same way a different data seed
+    # would — the token *set* is unchanged, the interleaving is not. Runs at
+    # different worker counts are therefore seed-comparable, not bit-comparable;
+    # the 450M seed band (0.0004 BPB) is the yardstick for that. 2 is the
+    # legacy default and reproduces the published runs.
+    num_workers: int = 2
+    prefetch_factor: int = 4
 
 
 @dataclass
@@ -428,7 +452,39 @@ class TrainingConfig:
     #   bf16 -> TF32 matmuls + bf16 autocast for the forward/backward
     # bf16 needs no GradScaler (unlike fp16); master weights stay fp32.
     # ------------------------------------------------------------------
+    # Scalar-logging cadence, in steps. 0 = legacy behaviour (derive it from
+    # `eval_interval`), which in the production configs means logging every 1000
+    # steps — only 11 points in a 10k-step run, far too coarse to see a loss
+    # spike or a gradient-norm excursion. Set this to 25-50 for any run whose
+    # stability you intend to reason about.
+    log_interval: int = 0
     precision: str = "fp32"  # fp32 | tf32 | bf16
+    # ------------------------------------------------------------------
+    # FP8 linear-layer training (torchao). Targets the cutlass GEMM bucket that
+    # the baseline profile measures at 62.1% of kernel time. Requires
+    # precision: bf16 (FP8 layers consume bf16 activations) and CUDA sm_89+.
+    #
+    # Measured at the 450M block shape on sm_120: tensorwise 1.39x, rowwise
+    # 1.01x. Rowwise is safer numerically but buys nothing on this GPU, so
+    # tensorwise is the default and the guardrails carry the risk — see
+    # flower/precision.py. Pair with model.smooth_swiglu (S10).
+    #
+    # Off by default: FP8 changes numerics, so every published run reproduces.
+    # ------------------------------------------------------------------
+    fp8_linear: bool = False
+    fp8_recipe: str = "tensorwise"  # tensorwise | rowwise
+    # Number of transformer blocks at each end kept in bf16. The first block
+    # sees raw embeddings and the last feeds the LM head; both carry the widest
+    # activation ranges. Nemotron-H uses 4 at 28 layers; 1 at 20 layers is the
+    # proportionate floor. 0 converts every block.
+    fp8_keep_bf16_blocks: int = 1
+    # cuBLASLt fast accumulation for the two *backward* FP8 GEMMs (dgrad,
+    # wgrad). torchao's tensorwise recipe already fast-accums the forward GEMM;
+    # the backward GEMMs default to fp32 accumulation, together ~2/3 of the
+    # _scaled_mm bucket (28.1% of CUDA time in the fp8_stack profile). May be
+    # a no-op on sm_120 — bench_arms decides. Changes numerics (lower-precision
+    # K accumulation), so quality-screen before adopting.
+    fp8_use_fast_accum: bool = False
     compile_model: bool = False
     compile_mode: str = "default"  # default | reduce-overhead | max-autotune
     # Sweep 2: optimizer choice. "adamw" = legacy default. "muon" = Muon for 2D weights + AdamW for 1D/embeddings/heads.
@@ -452,6 +508,51 @@ class TrainingConfig:
     #   cubic5   = 5x cubic (1.5,-0.5,0), 10 matmuls (-33% orth compute, ~1e-3 val loss per arXiv:2606.00371)
     #   hybrid_v4 = 8x quintic + 2x stabilize (2,-1.5,0.5) pinning singular values to 1 (DeepSeek-V4)
     muon_ns_schedule: str = "quintic5"
+    # Nesterov momentum on the Muon group. True reproduces every existing run
+    # (it was hardcoded True and not configurable, so it could not be tested).
+    # NVIDIA's large-scale optimizer study (arXiv:2607.20548, up to 100M-token
+    # batches) reports Nesterov did not help for either Muon or SOAP and was
+    # skipped for both — so this is worth an A/B here rather than an assumption.
+    # Turning it off also removes one add per parameter per step.
+    muon_nesterov: bool = True
+    # Contra-Muon (github.com/nilin/contra-muon). Subtracts `contra_muon` times
+    # the Frobenius-normalised pre-orthogonalisation update from the Newton-Schulz
+    # output, which damps large singular directions more than small ones and so
+    # increases singular-value diversity. Multiple nanoGPT Track-3 records.
+    # 0.0 = off (reproduces every existing run). The reference uses
+    # CONTRA_MUON=0.4 meaning an effective 0.2 coefficient; start there.
+    contra_muon: float = 0.0
+    # Per-head / Group Muon (arXiv:2605.08933; Kimi K3 §2.5). Orthogonalise each
+    # attention head's block separately instead of the fused QKV / output matrix,
+    # so every head gets its own unit-spectral-norm update rather than sharing
+    # one across all heads. Kimi K3 runs this at 2.8T params for stability;
+    # nanoGPT PR #253 measured ~10 fewer steps. False reproduces existing runs.
+    muon_per_head: bool = False
+    # Compositional Muon (github.com/tilde-research/comp-muon-release). Muon
+    # controls the operator norm of each matrix in isolation, but the loss sees
+    # the composed circuits W_Q W_K^T and W_O W_V. CM whitens each factor's
+    # gradient by its partner's inverse Gram root before and after the spectral
+    # sign, so the *product's* update is what gets norm-controlled.
+    #
+    # This is the principled generalisation of `muon_per_head`, which was the
+    # best arm in the 1500-step Muon screen (-0.027 val_bpb): CM's QK rule is
+    # head-local by construction and adds the partner whitening plain per-head
+    # splitting lacks. CM takes precedence over `muon_per_head` on the attention
+    # matrices — they are the same parameters, and stacking them is undefined.
+    comp_muon: bool = False
+    # Whitening regime. True = isotropic (replace each head's inverse Gram root
+    # with one scalar), which degenerates to a partner-rescaled per-head Muon at
+    # near-zero cost over `muon_per_head` and is the honest ablation against it.
+    # False = the full coupled-Newton-Schulz matrix inverse root: 25 extra bmms
+    # on (head_dim, head_dim) blocks per circuit, the method as published.
+    comp_muon_isotropic: bool = False
+    # Gram damping `lam` in C = (W^T W + lam I)^{1/2}. The released default.
+    comp_muon_damping: float = 1e-2
+    # CM learning-rate multiplier on top of `muon_lr`. CM applies no spectral
+    # shape-scale, so its effective step differs from Muon's at the same LR; this
+    # is the knob for matching them without moving `muon_lr` (which would also
+    # move every non-attention matrix).
+    comp_muon_mp: float = 1.0
     # S14 Opportunity 1/5a (NEXT_IDEAS.md section 5): batch the Newton-Schulz
     # iteration over same-shape params — one `bmm` per NS line per shape group
     # instead of one `mm` per param. The optimizer step is launch-bound (GPU idle
