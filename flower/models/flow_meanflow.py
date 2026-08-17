@@ -32,7 +32,7 @@ from torch import nn
 from flower.config import ModelConfig
 from flower.diag import clear, should_collect, stash
 from flower.models.base import CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, causal_chunked_map, causal_running_mean
 
 
 def _sinkhorn_plan(cost: torch.Tensor, *, epsilon: float, iters: int) -> torch.Tensor:
@@ -85,9 +85,38 @@ class MeanFlowField(nn.Module):
             t = t.expand(z.shape[0])
         if r.dim() == 0:
             r = r.expand(z.shape[0])
+        # _meanflow_loss samples t/r with torch.rand, which is fp32 even in a
+        # pure-bf16 model; match z's dtype so the time-embedding Linear never
+        # sees mixed dtypes (bf16 training crashed here before).
+        t = t.to(dtype=z.dtype)
+        r = r.to(dtype=z.dtype)
         time = self.time(torch.stack([t, r], dim=-1))  # (B, D)
         cond_emb = self.cond_proj(cond)  # (B, D)
         bias = (time + cond_emb).unsqueeze(1)  # (B, 1, D)
+        return self.net(torch.cat([z, bias.expand_as(z)], dim=-1))
+
+    def forward_positions(
+        self,
+        z: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-position variant for causal_memory=True. Same parameters, same
+        math as ``forward``, but every position carries its own condition:
+        z is (B, T, S, D), cond is (B, T, D), and t/r are scalars or (B,)
+        shared across positions (exactly like ``forward`` shares them across
+        slots)."""
+        if t.dim() == 0:
+            t = t.expand(z.shape[0])
+        if r.dim() == 0:
+            r = r.expand(z.shape[0])
+        # Same dtype guard as ``forward``: rand-sampled t/r are fp32.
+        t = t.to(dtype=z.dtype)
+        r = r.to(dtype=z.dtype)
+        time = self.time(torch.stack([t, r], dim=-1).unsqueeze(1).expand(-1, z.shape[1], -1))  # (B, T, D)
+        cond_emb = self.cond_proj(cond)  # (B, T, D)
+        bias = (time + cond_emb).unsqueeze(2)  # (B, T, 1, D)
         return self.net(torch.cat([z, bias.expand_as(z)], dim=-1))
 
 
@@ -118,6 +147,10 @@ class MeanFlowMemoryBlock(nn.Module):
     def _initial_memory(self, x: torch.Tensor) -> torch.Tensor:
         return x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S, D) per-position memory state for causal_memory=True."""
+        return x.new_zeros(x.shape[0], x.shape[1], self.config.memory_slots, self.config.d_model)
+
     def _meanflow_loss(
         self,
         z0: torch.Tensor,
@@ -126,12 +159,35 @@ class MeanFlowMemoryBlock(nn.Module):
     ) -> torch.Tensor:
         # Sample r <= t in [0, 1] per batch element. (Independent samples reduce
         # variance vs. a single shared (t, r) for the whole batch.)
+        #
+        # Under causal_memory=True the states are per-position (B, T, S, D) and
+        # cond is (B, T, D); the loss generalises by treating the position axis
+        # exactly like the slot axis of the legacy (B, S, D) form.
+        #
+        # NOTE ON THE OT-CFM BATCH COUPLING (meanflow_ot_cfm=True), investigated
+        # and deliberately LEFT UNCHANGED here: the Sinkhorn plan pairs z0/z1
+        # across the BATCH dimension (einsum "ij,jsd->isd"). That couples
+        # different training samples *in the auxiliary training loss only* —
+        # the aux loss never feeds the forward logits, so it is NOT a forward
+        # causality leak (positions' logits remain functions of tokens <= t
+        # regardless). It IS a training-loss concern: (a) as designed, each
+        # batch element's regression target is a soft mixture of the OTHER
+        # elements' memories (the standard OT-CFM choice, but it means the aux
+        # gradient for sample i depends on samples j != i); (b) under
+        # causal_memory the cost flattens (T, S, D) per element, so the plan
+        # now couples whole per-position state trajectories rather than
+        # single-window banks. Whether that coupling is desirable for the
+        # causal per-position states is deferred — semantics preserved.
         bsz = z0.shape[0]
         device = z0.device
+        causal = z0.dim() == 4
         u = torch.rand(bsz, device=device)
         v = torch.rand(bsz, device=device)
-        t = torch.maximum(u, v)
-        r = torch.minimum(u, v)
+        # Cast the rand-sampled times to the states' dtype at the source: in a
+        # pure-bf16 model, fp32 t/r would promote the interpolant/target to
+        # fp32 and crash the field's bf16 linears (bf16 training regression).
+        t = torch.maximum(u, v).to(dtype=z0.dtype)
+        r = torch.minimum(u, v).to(dtype=z0.dtype)
 
         # Optional OT-CFM coupling: pair z0 with z1 across the batch.
         z1_paired = z1
@@ -140,25 +196,47 @@ class MeanFlowMemoryBlock(nn.Module):
                 # Cost = squared distance between flattened slot tensors. Cheap and
                 # invariant to slot order would require Sinkhorn over slots first;
                 # we accept the per-batch pairing as the standard OT-CFM choice.
-                flat_z0 = z0.reshape(bsz, -1)
-                flat_z1 = z1.reshape(bsz, -1)
+                # cdist has no bf16 kernel (NotImplementedError on pure-bf16
+                # models); this branch is under no_grad, so compute the plan in
+                # fp32 and cast back — numerically identical for fp32 runs.
+                flat_z0 = z0.reshape(bsz, -1).float()
+                flat_z1 = z1.reshape(bsz, -1).float()
                 cost = torch.cdist(flat_z0, flat_z1, p=2.0).pow(2)
                 plan = _sinkhorn_plan(
                     cost,
                     epsilon=self.config.meanflow_ot_epsilon,
                     iters=self.config.meanflow_ot_iters,
-                )
+                ).to(z0.dtype)
             # Soft re-mixing of z1 according to the transport plan. The B factor
             # restores per-row marginal mass (Sinkhorn enforces 1/B marginals).
-            z1_paired = bsz * torch.einsum("ij,jsd->isd", plan, z1)
+            if causal:
+                z1_paired = bsz * torch.einsum("ij,j...->i...", plan, z1)
+            else:
+                z1_paired = bsz * torch.einsum("ij,jsd->isd", plan, z1)
 
-        # Straight-line interpolant. Broadcast t over slot/feature dims.
-        t_b = t.view(-1, 1, 1)
-        z_t = (1.0 - t_b) * z0 + t_b * z1_paired
+        if causal:
+            # Straight-line interpolant, per position; t broadcasts over (T, S, D).
+            t_b = t.view(-1, 1, 1, 1)
+            z_t = (1.0 - t_b) * z0 + t_b * z1_paired
 
-        # MeanFlow target on a straight path: constant velocity z1 - z0.
-        target = z1_paired - z0
-        pred = self.field(z_t, t, r, cond)
+            # MeanFlow target on a straight path: constant velocity z1 - z0.
+            target = z1_paired - z0
+            # Chunked over T: the field's (B, T, S, 2D) concat is its widest
+            # intermediate (~2x the lead tensor), so halve the chunk budget.
+            pred = causal_chunked_map(
+                lambda z_c, c_c: self.field.forward_positions(z_c, t, r, c_c),
+                z_t,
+                cond,
+                max_temp_elements=2**27,
+            )
+        else:
+            # Straight-line interpolant. Broadcast t over slot/feature dims.
+            t_b = t.view(-1, 1, 1)
+            z_t = (1.0 - t_b) * z0 + t_b * z1_paired
+
+            # MeanFlow target on a straight path: constant velocity z1 - z0.
+            target = z1_paired - z0
+            pred = self.field(z_t, t, r, cond)
         loss = F.mse_loss(pred, target)
         return loss * self.config.meanflow_loss_weight
 
@@ -167,21 +245,36 @@ class MeanFlowMemoryBlock(nn.Module):
         x: torch.Tensor,
         memory: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        causal = self.config.causal_memory
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if causal else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))
 
-        cond = x.mean(dim=1)
-        z0 = memory
-        # 1-step inference always (train + eval): M_new = M_old + u_theta(M_old, 1, 0, cond).
-        # The LM cross-entropy backprops into the field via this endpoint use, so the
-        # field's "what should memory become?" signal is the LM loss itself.
-        ones = x.new_ones(())
-        zeros = x.new_zeros(())
-        u_endpoint = self.field(z0, ones, zeros, cond)
-        new_memory = z0 + u_endpoint
+        if causal:
+            # Condition is the prefix mean at t (legacy: whole-window mean, which
+            # includes future tokens); the field evaluates per position. Chunked
+            # over T to bound the field's intermediates (budget halved: the
+            # field's cat([z, bias]) input is 2x the lead tensor's width).
+            cond = causal_running_mean(x)  # (B, T, D)
+            ones = x.new_ones(())
+            zeros = x.new_zeros(())
+            u_endpoint = causal_chunked_map(
+                lambda z_c, c_c: self.field.forward_positions(z_c, ones, zeros, c_c),
+                memory,
+                cond,
+                max_temp_elements=2**27,
+            )
+        else:
+            cond = x.mean(dim=1)
+            # 1-step inference always (train + eval): M_new = M_old + u_theta(M_old, 1, 0, cond).
+            # The LM cross-entropy backprops into the field via this endpoint use, so the
+            # field's "what should memory become?" signal is the LM loss itself.
+            ones = x.new_ones(())
+            zeros = x.new_zeros(())
+            u_endpoint = self.field(memory, ones, zeros, cond)
+        new_memory = memory + u_endpoint
 
         aux = None
         if self.training:
@@ -189,8 +282,8 @@ class MeanFlowMemoryBlock(nn.Module):
             # endpoint velocity along the straight path. Target is the endpoint
             # prediction with stop-grad, so the aux loss is a self-distillation of
             # the field across the (t, r) interval — no separate "target network".
-            z1 = (z0 + u_endpoint).detach()
-            aux = self._meanflow_loss(z0, z1, cond)
+            z1 = (memory + u_endpoint).detach()
+            aux = self._meanflow_loss(memory, z1, cond)
         return x, new_memory, aux
 
 
