@@ -34,6 +34,25 @@ research framing.
 This is structurally different from `summary_memory.py` (which uses max-pool +
 MLP) and from the prior `titans_mac.py` stand-in (which used `|summary - memory|`
 as a learned MLP gate, with no gradient signal at all).
+
+Batch-size dependence of the write magnitude
+(``ModelConfig.titans_per_sample_loss``): the inner associative-retrieval MSE
+is by default reduced with a mean over BOTH the batch and feature dims (factor
+2/(B*D); the legacy autograd path's ``F.mse_loss`` default is the same B*D
+mean). The Titans write is ``alpha * write_scale * surprise``, and surprise is
+the inner gradient, so every memory write scales with 1/B — memory at batch 1
+runs ~B times "hotter" than at batch B. Training runs at
+``training.batch_size`` while ``flower/eval.py``'s document-level paths
+(``evaluate_documents``, ``sliding_window_document_loss``) score one document
+at a time (B=1), so doc-level bpb was computed with batch_size-x larger memory
+writes than training ever produced, and the two eval paths disagreed with each
+other. ``titans_per_sample_loss=True`` switches BOTH surprise paths (analytical
+and autograd) to a per-sample reduction — sum over batch, mean over D only
+(factor 2/D) — making the memory dynamics batch-size-invariant and the B=1
+document eval consistent with B=N training. ``causal_memory=True`` writes are
+per-position and already per-row (factor 2/D per (batch, position) row), so
+the flag is a no-op there. False (default) reproduces every published run
+bit-for-bit.
 """
 
 from __future__ import annotations
@@ -48,7 +67,15 @@ from flower.models.memory import MemoryRead, causal_last_tokens
 
 
 class TitansMACBlock(nn.Module):
-    """Memory block whose write rule uses negative gradient of an inner KV loss."""
+    """Memory block whose write rule uses negative gradient of an inner KV loss.
+
+    The write magnitude depends on the inner-loss reduction: legacy (default)
+    reduces the inner MSE with a mean over batch AND dims, so memory writes
+    scale with 1/batch_size; ``config.titans_per_sample_loss=True`` reduces
+    per sample (sum over batch, mean over D) so the write dynamics are
+    batch-size-invariant and the B=1 document eval matches B=N training. See
+    the module docstring for the full story.
+    """
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -88,8 +115,19 @@ class TitansMACBlock(nn.Module):
         value:  (B, D)
 
         Attention weights are softmax over slots; the predicted value is the weighted
-        average of slot contents. The loss is mean-squared error per element so the
-        gradient magnitudes are stable across batch/dim.
+        average of slot contents. The legacy reduction is mean-squared error
+        per element over B*D (stable gradient magnitudes across batch/dim but
+        batch-size-dependent dynamics); with titans_per_sample_loss it is a
+        sum over batch and mean over D (batch-invariant dynamics).
+
+        Reduction (``ModelConfig.titans_per_sample_loss``):
+          False (legacy) -> mean over B and D (F.mse_loss default, factor
+             2/(B*D)). The surprise — and therefore every memory write —
+             scales with 1/B; batch-dependent by construction.
+          True -> sum over B, mean over D only (factor 2/D). Each sample's
+             inner problem contributes its own full MSE gradient, so the
+             memory write for sample b does not shrink as the batch grows
+             (batch-size-invariant dynamics).
 
         Used by the legacy autograd surprise path (when
         `titans_analytical_surprise=False`). The analytical path does not call
@@ -99,6 +137,9 @@ class TitansMACBlock(nn.Module):
         scores = torch.einsum("bsd,bd->bs", long_mem, key) / (long_mem.shape[-1] ** 0.5)
         weights = torch.softmax(scores, dim=-1)
         predicted = torch.einsum("bs,bsd->bd", weights, long_mem)
+        if self.config.titans_per_sample_loss:
+            # Per-sample: sum over batch, mean over D. (sum over B*D) / D.
+            return F.mse_loss(predicted, value, reduction="sum") / predicted.shape[-1]
         return F.mse_loss(predicted, value)
 
     def _surprise_analytical(
@@ -129,7 +170,18 @@ class TitansMACBlock(nn.Module):
         The factor 2/(B*D) (not 2/D) comes from ``F.mse_loss``'s mean reduction
         over BOTH batch and feature dims; it must be kept to match the autograd
         path exactly and to preserve alpha_logit/write_scale semantics across
-        checkpoints. Returns the NEGATIVE gradient (the Titans surprise signal,
+        checkpoints.
+
+        With ``ModelConfig.titans_per_sample_loss=True`` the inner loss is
+        instead reduced per sample — sum over batch, mean over D — so the
+        factor becomes 2/D and the surprise (hence every memory write) is
+        batch-size-invariant: memory writes at B=1 match those at B=N, which
+        is what makes the B=1 document-level eval in flower/eval.py consistent
+        with batch_size training. The closed form above is unchanged except
+        for the scalar factor, so the analytical and autograd paths still
+        match exactly with the flag on.
+
+        Returns the NEGATIVE gradient (the Titans surprise signal,
         i.e. the direction that reduces the inner loss).
 
         Args:
@@ -148,7 +200,9 @@ class TitansMACBlock(nn.Module):
         a = p - value                                                     # (B,D)
         # <a, M_s - p> per slot — the softmax-Jacobian coupling term.
         dot = torch.einsum("bd,bsd->bs", a, long_mem - p.unsqueeze(1))    # (B,S)
-        factor = 2.0 / (B * D)                                            # MSE mean reduction
+        # Legacy: MSE mean reduction over B and D -> 2/(B*D) (batch-dependent
+        # writes). Per-sample: sum over B, mean over D -> 2/D (invariant).
+        factor = 2.0 / D if self.config.titans_per_sample_loss else 2.0 / (B * D)
         grad = factor * w.unsqueeze(-1) * (
             a.unsqueeze(1) + (dot / sqrt_d).unsqueeze(-1) * key.unsqueeze(1)
         )                                                                 # (B,S,D)
@@ -207,9 +261,20 @@ class TitansMACBlock(nn.Module):
         (2/(B*T*D)). The batch-wide mean would make the memory at t depend on
         the number of positions in the window — a length leak that breaks
         prefix-truncation invariance.
+
+        Interaction with ``titans_per_sample_loss``: the row-count rescale is
+        only needed to cancel the legacy mean's 1/rows factor. With
+        ``titans_per_sample_loss=True`` both surprise paths already reduce
+        per row (factor 2/D each), so the rescale is skipped and the flag is
+        an identity on this path (equal in exact arithmetic, ulp-different in
+        floating point; the tests allow 1e-5) — the causal write is per-row
+        either way.
         """
         bsz, seq_len, _, dim = memory.shape
         rows = bsz * seq_len
+        # 1 under per-sample reduction (already per-row), rows under the
+        # legacy B-dependent reduction (cancels its 1/rows factor).
+        per_row_scale = 1 if self.config.titans_per_sample_loss else rows
         summary = torch.cummax(x, dim=1).values  # (B, T, D)
         key = self.key_proj(summary).reshape(rows, dim)
         value = self.val_proj(summary).reshape(rows, dim)
@@ -218,7 +283,7 @@ class TitansMACBlock(nn.Module):
         s = self.config.memory_slots
         long_flat = long_mem.reshape(rows, s, dim)
         if self.config.titans_analytical_surprise:
-            surprise = self._surprise_analytical(long_flat, key, value) * rows  # (B*T, S, D)
+            surprise = self._surprise_analytical(long_flat, key, value) * per_row_scale  # (B*T, S, D)
         else:
             with torch.enable_grad():
                 probe = long_flat.detach().requires_grad_(True)
@@ -229,7 +294,7 @@ class TitansMACBlock(nn.Module):
                     ).reshape(rows, -1, dim)
                 else:
                     probe_memory = probe
-                inner = self._inner_loss(probe_memory, key, value) * rows
+                inner = self._inner_loss(probe_memory, key, value) * per_row_scale
                 (surprise_grad,) = torch.autograd.grad(
                     inner, probe, create_graph=self.training, retain_graph=True
                 )

@@ -336,6 +336,45 @@ class ModelConfig:
     # preserved. False reproduces the legacy autograd path bit-for-bit (old
     # runs and checkpoints reproduce).
     titans_analytical_surprise: bool = False
+    # Titans inner-loss reduction (train/eval consistency fix).
+    #
+    # THE BUG: the inner associative-retrieval MSE is reduced with a mean over
+    # the batch AND feature dims (factor 2/(B*D) in the analytical surprise
+    # path; the legacy autograd path's F.mse_loss default is the same B*D
+    # mean). Titans memory writes are alpha * write_scale * surprise, so every
+    # write scales with 1/B: measured at init, mean |memory| after block 0 is
+    # ~7.8e-4 at B=1 vs ~4.7e-5 at B=16 — memory writes at batch 1 are ~16x
+    # larger than anything a batch-16 training run ever produced. Training
+    # runs at training.batch_size, but flower/eval.py's document-level paths
+    # (evaluate_documents, sliding_window_document_loss) score one document at
+    # a time (B=1), so titans doc-level bpb is computed with batch_size-x
+    # larger memory writes than training, and the two eval paths disagree with
+    # each other.
+    #
+    # False (default) keeps the legacy B-dependent reduction and reproduces
+    # every published run bit-for-bit.
+    #
+    # True switches BOTH surprise paths (analytical and autograd) to a
+    # per-sample reduction: sum over batch, mean over D only (factor 2/D).
+    # Memory dynamics become batch-size-invariant and the B=1 document eval
+    # sees the same write magnitudes as B=N training.
+    #
+    # Interaction with causal_memory: the causal write path is per-position
+    # and already per-row (each (batch, position) row's surprise is the
+    # gradient of its OWN MSE with factor 2/D — the per-position fix from the
+    # causal-memory branch), so titans_per_sample_loss is a bitwise identity
+    # when causal_memory=True (factor 2/D == 2/(1*D) at B=1... more precisely
+    # the flag's rescale-by-rows cancels exactly in real arithmetic and is
+    # ulp-different in fp); it only affects the non-causal window-aggregated
+    # write.
+    #
+    # Note the flag is also a bitwise identity at B=1 on the non-causal path
+    # (2/D == 2/(1*D)), so it changes nothing about the B=1 doc-level eval
+    # paths themselves — the consistency it delivers comes from TRAINING with
+    # it on (B=N dynamics then match B=1 eval). Enabling it mid-run makes the
+    # run incomparable to its own prefix; runs with it on are not comparable
+    # to runs with it off.
+    titans_per_sample_loss: bool = False
     # ------------------------------------------------------------------
     # Causal memory writes (correctness fix).
     #
