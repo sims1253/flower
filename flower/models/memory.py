@@ -117,6 +117,89 @@ def causal_last_tokens(x: torch.Tensor, n: int) -> torch.Tensor:
     return padded.unfold(dimension=1, size=n, step=1).permute(0, 1, 3, 2).contiguous()
 
 
+def causal_chunked_map(
+    fn,
+    *tensors: torch.Tensor,
+    dim: int = 1,
+    max_temp_elements: int = 2**28,
+) -> torch.Tensor:
+    """Apply a positionwise ``fn`` chunk-wise along ``dim`` to bound temp memory.
+
+    The causal write paths evaluate per-slot flows/fields at EVERY position,
+    so their intermediate tensors carry a (B, T, ...) leading block instead of
+    a (B, ...) one. Every op inside those nets is independent along the
+    position axis, so slicing on ``dim``, applying ``fn``, and concatenating
+    back is exact (each row is computed by the identical kernels on identical
+    data). Chunks are sized so one fn-evaluation's largest plausible
+    intermediate stays around ``max_temp_elements`` (~1 GiB in fp32); when the
+    axis already fits in one chunk, ``fn`` is called once on the full tensors
+    (single-chunk fast path — no behaviour change at all for small shapes).
+    """
+    lead = tensors[0]
+    size = lead.shape[dim]
+    others = 1
+    for axis, length in enumerate(lead.shape):
+        if axis != dim:
+            others *= length
+    step = max(1, max_temp_elements // max(1, others))
+    if step >= size:
+        return fn(*tensors)
+    index = [slice(None)] * lead.dim()
+    chunks: list[torch.Tensor] = []
+    for start in range(0, size, step):
+        index[dim] = slice(start, min(start + step, size))
+        chunks.append(fn(*[t[tuple(index)] for t in tensors]))
+    return torch.cat(chunks, dim=dim)
+
+
+# Default chunk budget for the energy-read logsumexp: ~2**28 elements, i.e. a
+# hair under 1 GiB for an fp32 temporary — the largest broadcast temp the
+# energy read materialises per chunk. See ``_energy_read``.
+_ENERGY_CHUNK_ELEMENTS = 2**28
+
+
+def _energy_read_unchunked(scores_f: torch.Tensor, v_f: torch.Tensor, beta_f: torch.Tensor) -> torch.Tensor:
+    """log-sum-exp energy read over the full (B, H, Q, M) score block.
+
+    UNCHUNKED REFERENCE — kept private and only used when the block fits the
+    chunk budget (and by the parity test). Materialises the (B, H, Q, M, D)
+    broadcast of ``scores[..., None] + v[:, :, None, :, :]``, which at the
+    long-context shapes ``energy_read`` targets (e.g. B=16, H=16, Q=8192,
+    M=16, D=64) is ~8.6 GiB in fp32 — a silent OOM at exactly the configs the
+    flag was written for. ``_energy_read`` is the chunked drop-in.
+    """
+    log_partition = torch.logsumexp(beta_f * scores_f, dim=-1).unsqueeze(-1)
+    return (torch.logsumexp(beta_f * (scores_f.unsqueeze(-1) + v_f.unsqueeze(2)), dim=-2) - log_partition) / beta_f
+
+
+def _energy_read(
+    scores_f: torch.Tensor,
+    v_f: torch.Tensor,
+    beta_f: torch.Tensor,
+    *,
+    max_temp_elements: int | None = None,
+) -> torch.Tensor:
+    """Query-axis-chunked energy read (exact; see ``_energy_read_unchunked``).
+
+    Every query row's logsumexp is independent, so chunking over the query
+    axis is row-wise bitwise exact. Only the query axis is sliced — ``v_f``
+    is indexed by the memory axis and stays whole. ``max_temp_elements``
+    defaults to ``_ENERGY_CHUNK_ELEMENTS`` resolved at call time (so tests
+    can force chunking by patching the module constant).
+    """
+    if max_temp_elements is None:
+        max_temp_elements = _ENERGY_CHUNK_ELEMENTS
+    q_len = scores_f.shape[2]
+    per_query = scores_f.numel() // q_len * v_f.shape[-1]
+    step = max(1, max_temp_elements // max(1, per_query))
+    if step >= q_len:
+        return _energy_read_unchunked(scores_f, v_f, beta_f)
+    chunks = [
+        _energy_read_unchunked(scores_f[:, :, start : start + step], v_f, beta_f) for start in range(0, q_len, step)
+    ]
+    return torch.cat(chunks, dim=2)
+
+
 class SDPCrossAttention(nn.Module):
     """Compile-clean cross-attention via ``F.scaled_dot_product_attention``.
 
@@ -251,23 +334,16 @@ class MemoryRead(nn.Module):
             scores = scores + bias
         if self.energy_read:
             beta = self.energy_log_beta.exp().clamp_min(1e-6).to(device=scores.device)
-            scores_f = scores.float()
-            v_f = v.float()
-            log_partition = torch.logsumexp(beta.float() * scores_f, dim=-1).unsqueeze(-1)
-            out = (
-                torch.logsumexp(beta.float() * (scores_f.unsqueeze(-1) + v_f.unsqueeze(2)), dim=-2)
-                - log_partition
-            ) / beta.float()
-            out = out.to(dtype=v.dtype)
+            # Query-chunked logsumexp: exact per query row, but the (B, H, Q,
+            # M, D) broadcast temp stays bounded (see _energy_read).
+            out = _energy_read(scores.float(), v.float(), beta.float()).to(dtype=v.dtype)
         else:
             attn = torch.softmax(scores, dim=-1)
             out = attn @ v
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
-    def _bias_causal(
-        self, q_len: int, m_len: int, device: torch.Device, dtype: torch.dtype
-    ) -> torch.Tensor | None:
+    def _bias_causal(self, q_len: int, m_len: int, device: torch.Device, dtype: torch.dtype) -> torch.Tensor | None:
         """Kernel bias for the per-position read, broadcastable to (B, H, T, 1, S).
 
         Same construction as ``_bias`` but with an extra position axis: each
@@ -316,16 +392,33 @@ class MemoryRead(nn.Module):
             scores = scores + bias
         if self.energy_read:
             beta = self.energy_log_beta.exp().clamp_min(1e-6).to(device=scores.device)
-            scores_f = scores.float()
-            v_f = v.float()
-            log_partition = torch.logsumexp(beta.float() * scores_f, dim=-1).unsqueeze(-1)
-            # scores_f.unsqueeze(-1): (B,H,T,1,S,1); v_f.unsqueeze(3): (B,H,T,1,S,hd);
-            # logsumexp over the S axis (dim=-2) -> (B, H, T, 1, 1, hd).
-            out = (
-                torch.logsumexp(beta.float() * (scores_f.unsqueeze(-1) + v_f.unsqueeze(3)), dim=-2)
-                - log_partition
-            ) / beta.float()
-            out = out.to(dtype=v.dtype).squeeze(3).squeeze(-2)  # (B, H, T, hd)
+            beta_f = beta.float()
+
+            # Same logsumexp energy read as the legacy path, per position; the
+            # position axis is chunked (both scores and v carry T at dim 2) so
+            # the (B, H, T, S, hd) broadcast temp stays bounded.
+            def _energy_block(scores_c: torch.Tensor, v_c: torch.Tensor) -> torch.Tensor:
+                log_partition = torch.logsumexp(beta_f * scores_c, dim=-1).unsqueeze(-1)
+                out = (
+                    torch.logsumexp(beta_f * (scores_c.unsqueeze(-1) + v_c.unsqueeze(3)), dim=-2) - log_partition
+                ) / beta_f
+                # The query axis (dim 3) is ALWAYS singleton here, so squeeze(3)
+                # is well-defined for any chunk size — including 1. (A trailing
+                # positional squeeze(-2) would eat the position axis itself
+                # when a chunk is a single position.)
+                return out.squeeze(3).to(dtype=v.dtype)
+
+            # Budget correction: the broadcast temp carries v's head_dim too,
+            # which the (B, H, T, 1, S) lead tensor does not — scale the
+            # per-chunk budget down by head_dim so the (B, H, Tc, S, hd)
+            # temporary stays under ~1 GiB.
+            out = causal_chunked_map(
+                _energy_block,
+                scores.float(),
+                v.float(),
+                dim=2,
+                max_temp_elements=_ENERGY_CHUNK_ELEMENTS // max(1, v.shape[-1]),
+            )
         else:
             attn = torch.softmax(scores, dim=-1)  # (B, H, T, 1, S)
             out = (attn @ v).squeeze(-2)  # (B, H, T, hd)

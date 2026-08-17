@@ -17,6 +17,7 @@ the existing slot toward the new token information.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from typing import Any
 
@@ -27,13 +28,17 @@ from torch import nn
 from flower.config import ModelConfig
 from flower.flows.coupling import ConditionalCouplingFlow
 from flower.models.base import CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, causal_chunked_map, causal_last_tokens, causal_prefix_attention
 
 
 class _PerSlotFlow(nn.Module):
     """Conditional coupling flow applied independently to each slot.
 
     The slot dimension D may be odd; if so we pad to even, run the flow, and unpad.
+
+    Accepts z of shape (B, S, D) (legacy) or (B, T, S, D) (causal_memory=True
+    per-position states): everything but the last dim is folded into the flow's
+    batch, so the same parameters serve both paths.
     """
 
     def __init__(self, slot_dim: int, cond_dim: int, hidden_dim: int, layers: int) -> None:
@@ -43,16 +48,16 @@ class _PerSlotFlow(nn.Module):
         self.flow = ConditionalCouplingFlow(self.padded_dim, cond_dim, layers=layers, hidden_dim=hidden_dim)
 
     def forward(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # z: (B, S, D)  cond: (B, S, cond_dim)
-        bsz, slots, _ = z.shape
-        flat_z = z.reshape(bsz * slots, self.slot_dim)
-        flat_cond = cond.reshape(bsz * slots, -1)
+        # z: (B, S, D) or (B, T, S, D); cond matches z's leading dims.
+        rows = z.numel() // self.slot_dim
+        flat_z = z.reshape(rows, self.slot_dim)
+        flat_cond = cond.reshape(rows, -1)
         if self.padded_dim != self.slot_dim:
             flat_z = F.pad(flat_z, (0, self.padded_dim - self.slot_dim))
         out = self.flow(flat_z, flat_cond)
         if self.padded_dim != self.slot_dim:
             out = out[:, : self.slot_dim]
-        return out.reshape(bsz, slots, self.slot_dim)
+        return out.reshape(z.shape)
 
 
 class FlowPMABlock(nn.Module):
@@ -89,7 +94,37 @@ class FlowPMABlock(nn.Module):
         slots = self.config.memory_slots + (self.config.short_memory_slots if self.config.hierarchical_memory else 0)
         return x.new_zeros(x.shape[0], slots, self.config.d_model)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S_total, D) per-position memory state for causal_memory=True."""
+        slots = self.config.memory_slots + (self.config.short_memory_slots if self.config.hierarchical_memory else 0)
+        return x.new_zeros(x.shape[0], x.shape[1], slots, self.config.d_model)
+
+    def _causal_pma(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-position prefix PMA summaries using ``self.pma``'s MHA weights.
+
+        Same parameters as the whole-window ``self.pma(seeds, x, x)`` call
+        (in_proj / out_proj, no new params) and the same math (per-head
+        scaling 1/sqrt(head_dim)), but every position t's pooled summaries
+        attend to x[:, :t+1] only. Returns (B, T, S, D) where S is the seed
+        count (= memory_slots). Mirrors flow_ot_memory._causal_source_attn.
+        """
+        bsz, seq_len, d_model = x.shape
+        heads = self.pma.num_heads
+        head_dim = d_model // heads
+        w_q, w_k, w_v = self.pma.in_proj_weight.chunk(3, dim=0)
+        b_q, b_k, b_v = self.pma.in_proj_bias.chunk(3, dim=0)
+        seeds = self.seeds.expand(bsz, -1, -1)
+        q = F.linear(seeds, w_q, b_q).view(bsz, -1, heads, head_dim).permute(0, 2, 1, 3)  # (B, H, S, hd)
+        k = F.linear(x, w_k, b_k).view(bsz, seq_len, heads, head_dim).permute(0, 2, 1, 3)  # (B, H, T, hd)
+        v = F.linear(x, w_v, b_v).view(bsz, seq_len, heads, head_dim).permute(0, 2, 1, 3)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(head_dim)  # (B, H, S, T)
+        ctx = causal_prefix_attention(scores, v)  # (B, H, T, S, hd)
+        ctx = ctx.permute(0, 2, 3, 1, 4).reshape(bsz, seq_len, -1, d_model)  # (B, T, S, D)
+        return self.pma.out_proj(ctx)
+
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if self.config.causal_memory:
+            return self._update_memory_causal(memory, x)
         long_mem = memory[:, : self.config.memory_slots]
         seeds = self.seeds.expand(x.shape[0], -1, -1)
         # PMA cross-attention: seeds query token sequence to produce per-slot summaries.
@@ -107,9 +142,29 @@ class FlowPMABlock(nn.Module):
             short = F.pad(short, (0, 0, self.config.short_memory_slots - short.shape[1], 0))
         return torch.cat([transported, short], dim=1)
 
+    def _update_memory_causal(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """causal_memory=True write: memory is a per-position state (B, T, S_total, D).
+
+        Same seed cross-attention -> conditioning projection -> per-slot flow
+        pipeline as ``_update_memory`` (identical parameters), but the pooled
+        summary at t attends to tokens <= t only and the flow transports the
+        slot state at t. The hierarchical short-memory slice becomes the last
+        n tokens of the prefix ending at t (left-padded for early positions),
+        exactly like the other causal short-memory writes. The per-slot flow
+        runs chunked over T to bound its intermediates (causal_chunked_map).
+        """
+        long_mem = memory[:, :, : self.config.memory_slots]  # (B, T, S, D)
+        pooled = self._causal_pma(x)  # (B, T, S, D)
+        cond = self.cond_proj(pooled)
+        transported = causal_chunked_map(self.slot_flow, long_mem, cond)
+        if not self.config.hierarchical_memory:
+            return transported
+        short = causal_last_tokens(x, self.config.short_memory_slots)  # (B, T, n, D)
+        return torch.cat([transported, short], dim=2)
+
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if self.config.causal_memory else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))

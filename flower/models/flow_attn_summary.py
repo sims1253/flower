@@ -9,6 +9,14 @@ from flower.models.summary_memory import SummaryMemoryBlock
 
 
 def build_fa_sm_model(config: ModelConfig) -> CausalLM:
+    """fa_sm = SummaryMemoryBlock with a flow-attention local layer and an
+    EulerFlow-transported MemoryRead.
+
+    causal_memory=True is honoured with no changes here: SummaryMemoryBlock
+    (fixed in the causal-memory PR) writes per-position causal summaries and
+    MemoryRead dispatches on the (B, T, S, D) memory state — the EulerFlow
+    transport is last-dim-only, so it is causal in both modes. Measured at
+    exactly 0 last-token leak under causal_memory=True."""
     blocks = []
     for _ in range(config.num_layers):
         block = SummaryMemoryBlock(
