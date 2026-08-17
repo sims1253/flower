@@ -662,6 +662,10 @@ BF16_CAUSAL_CASES = [
     ("flow_meanflow", {}),
     ("flow_pma", {}),
     ("flow_pma", {"hierarchical_memory": True}),  # causal_last_tokens short write
+    # OT-CFM auxiliary loss: torch.cdist has no bf16 kernel — the plan must be
+    # computed in fp32 under no_grad and cast back (found while re-verifying
+    # this PR; crashes with NotImplementedError otherwise on pure-bf16 models).
+    ("flow_meanflow", {"meanflow_ot_cfm": True}),
 ]
 
 

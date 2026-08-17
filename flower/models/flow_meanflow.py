@@ -195,14 +195,17 @@ class MeanFlowMemoryBlock(nn.Module):
                 # Cost = squared distance between flattened slot tensors. Cheap and
                 # invariant to slot order would require Sinkhorn over slots first;
                 # we accept the per-batch pairing as the standard OT-CFM choice.
-                flat_z0 = z0.reshape(bsz, -1)
-                flat_z1 = z1.reshape(bsz, -1)
+                # cdist has no bf16 kernel (NotImplementedError on pure-bf16
+                # models); this branch is under no_grad, so compute the plan in
+                # fp32 and cast back — numerically identical for fp32 runs.
+                flat_z0 = z0.reshape(bsz, -1).float()
+                flat_z1 = z1.reshape(bsz, -1).float()
                 cost = torch.cdist(flat_z0, flat_z1, p=2.0).pow(2)
                 plan = _sinkhorn_plan(
                     cost,
                     epsilon=self.config.meanflow_ot_epsilon,
                     iters=self.config.meanflow_ot_iters,
-                )
+                ).to(z0.dtype)
             # Soft re-mixing of z1 according to the transport plan. The B factor
             # restores per-row marginal mass (Sinkhorn enforces 1/B marginals).
             if causal:
