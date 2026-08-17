@@ -602,10 +602,12 @@ class StillLM(nn.Module):
     ) -> dict[str, Any]:
         """Forward pass: teacher (full cache) + student (compact cache) + KL loss.
 
-        During base warmup (step < compact_from_step): single forward pass, CE
-        loss only, base frozen (validated at construction: base_warmup_steps
-        must not exceed compact_from_step, or the dual-pass phase would start
-        with a still-trainable base).
+        During base warmup (step < base_warmup_steps): single forward pass,
+        CE loss only, base TRAINABLE — the warmup's whole point is to pretrain
+        the base before distillation; it is frozen from base_warmup_steps
+        onward (validated at construction: base_warmup_steps must not exceed
+        compact_from_step, or the dual-pass phase would start with a
+        still-trainable base).
         After warmup: dual teacher/student pass, KL distillation + optional CE,
         + optional attention-match (still_attn_match_weight > 0) and MeanFlow
         self-consistency (still_meanflow_loss_weight > 0) terms.

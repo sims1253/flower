@@ -409,17 +409,78 @@ class TestMeanFlowWiring:
         )
 
     def test_consistency_term_reaches_meanflow_net(self, meanflow_config):
-        """backward() through the weighted term grads the MeanFlow velocity net."""
-        from flower.models import build_model
+        """The consistency-loss tensors the compactors return are IN the total
+        loss's autograd graph (pullfrog review follow-up).
 
-        model = build_model(meanflow_config)
-        model.train()
-        input_ids = torch.randint(0, 128, (2, 32), dtype=torch.long)
-        out = model(input_ids, labels=input_ids.clone())
-        out["loss"].backward()
-        for i, comp in enumerate(model.compactors):
-            g = comp.meanflow_net.fc3.weight.grad
-            assert g is not None and g.abs().sum() > 0, f"layer {i} meanflow_net got no grad"
+        Why not "fc3 grad differs with the weight on/off": fc3 also receives
+        gradient from the KL path through the one-step endpoint u0, and at the
+        fixture's config/seeds the consistency term itself evaluates to ~1e-16
+        (the un-zeroed fc3 still sees near-zero features), so a magnitude-based
+        diff is either vacuously equal or noise. Graph membership is the
+        property that actually broke originally (loss computed then
+        discarded), so pin THAT: capture the exact tensors _consistency_loss
+        returns and assert autograd.grad(total_loss, captured) is defined.
+        """
+        from flower.models import build_model
+        import flower.models.still_flow2 as sf2
+
+        captured: list[torch.Tensor] = []
+        orig = sf2.StillCompactorMeanFlow._consistency_loss
+
+        def spy(self, *args, **kwargs):
+            out = orig(self, *args, **kwargs)
+            captured.append(out)
+            return out
+
+        sf2.StillCompactorMeanFlow._consistency_loss = spy
+        try:
+            model = build_model(meanflow_config)
+            model.train()
+            model.meanflow_loss_weight = 0.5
+            for comp in model.compactors:
+                torch.nn.init.normal_(comp.meanflow_net.fc3.weight, std=0.05)
+                torch.nn.init.normal_(comp.meanflow_net.fc3.bias, std=0.05)
+            input_ids = torch.randint(0, 128, (2, 32), dtype=torch.long)
+            out = model(input_ids, labels=input_ids.clone())
+            assert captured, "no compactor ran _consistency_loss in training mode"
+            grads = torch.autograd.grad(
+                out["loss"], captured, allow_unused=True, retain_graph=True
+            )
+            for i, g in enumerate(grads):
+                assert g is not None, (
+                    f"layer {i}: the consistency-loss tensor is not part of the "
+                    "total loss graph — meanflow objective computed but discarded"
+                )
+        finally:
+            sf2.StillCompactorMeanFlow._consistency_loss = orig
+
+    def test_consistency_term_grads_velocity_net_direct(self, meanflow_config):
+        """With non-degenerate inputs the consistency loss grads fc3 directly.
+
+        Companion to the graph-membership test: at the MODEL level the term can
+        evaluate to ~1e-16 (near-zero features at init), so gradient magnitude
+        is pinned at the COMPACTOR level with random keys/values, where the
+        existing live-after-unzeroing test already shows the loss is > 0."""
+        from flower.models.still_flow2 import StillCompactorMeanFlow
+
+        # Direct construction (num_kv_heads=2, head_dim=16), matching the
+        # live-after-unzeroing test's shapes.
+        comp = StillCompactorMeanFlow(
+            num_kv_heads=2, head_dim=16, compact_len=8, d_latent=32,
+            meanflow_steps=2, identity_init=True,
+        )
+        comp.train()
+        torch.nn.init.normal_(comp.meanflow_net.fc3.weight, std=0.05)
+        torch.nn.init.normal_(comp.meanflow_net.fc3.bias, std=0.05)
+        keys = torch.randn(2, 2, 32, 16)
+        values = torch.randn(2, 2, 32, 16)
+        result = comp(keys, values, return_compact_cache=True)
+        loss = result["meanflow_loss"]
+        assert loss.item() > 1e-6, f"degenerate consistency loss: {loss.item()}"
+        comp.zero_grad(set_to_none=True)
+        loss.backward()
+        g = comp.meanflow_net.fc3.weight.grad
+        assert g is not None and g.abs().sum() > 0, "fc3 got no grad from the consistency loss"
 
     def test_default_weight_discards_loss(self):
         """still_meanflow_loss_weight defaults to 0.0 (legacy no-change)."""
@@ -623,6 +684,17 @@ class TestWarmupGatingValidation:
         from flower.models import build_model
 
         model = build_model(self._cfg(warmup=5, compact_from=10))
+        assert model is not None
+
+    def test_warmup_equal_to_compact_from_builds(self):
+        """The boundary every production config actually uses (e.g. 1500/1500,
+        2000/2000, 0/0) is the permitted equality: the base unfreeze lands
+        exactly on the phase switch, so the dual-pass phase starts with the
+        base already frozen. Pin it so a future tightening to strict `<`
+        cannot silently invalidate every existing still config."""
+        from flower.models import build_model
+
+        model = build_model(self._cfg(warmup=10, compact_from=10))
         assert model is not None
 
 
