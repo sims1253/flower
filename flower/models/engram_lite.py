@@ -68,18 +68,39 @@ class EngramLiteBlock(nn.Module):
 
 
 class EngramLiteLM(CausalLM):
+    """Engram-lite LM built on CausalLM's shared fields.
+
+    Construction goes through ``CausalLM.__init__`` so every shared field the
+    base owns (token/blocks/ln/tied head, ``fp8_lm_head``, ``bf16_cross_entropy``,
+    ``fused_linear_ce``, ``activation_checkpoint``, MTP heads, attn_res
+    plumbing, the ``_static_diagnostics`` cache and the init schemes) exists on
+    this variant too. Previously the class hand-built the four shared modules
+    and called ``nn.Module.__init__`` directly, so a sweep enabling any of
+    those base flags silently did nothing here. Param counts and state_dict
+    keys are unchanged for default configs (build_norm defaults to the same
+    LayerNorm; MTP heads stay absent unless requested).
+
+    The variant keeps only its extra: a forward that routes the raw
+    ``input_ids`` into every block for the n-gram residual (CausalLM.forward
+    threads a memory state through the blocks instead, which these blocks do
+    not take).
+    """
+
     def __init__(self, config: ModelConfig) -> None:
-        nn.Module.__init__(self)
-        self.config = config
-        self.token = nn.Embedding(config.vocab_size, config.d_model)
-        self.blocks = nn.ModuleList([EngramLiteBlock(config) for _ in range(config.num_layers)])
-        self.ln = nn.LayerNorm(config.d_model)
-        self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.head.weight = self.token.weight
+        # Blocks are constructed first because CausalLM.__init__ takes the
+        # block list as an argument; from there the parent owns the shared
+        # modules (token embedding, blocks, final norm, tied head).
+        blocks = [EngramLiteBlock(config) for _ in range(config.num_layers)]
+        super().__init__(config, blocks)
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
-        if input_ids.shape[1] > self.config.max_seq_len:
-            raise ValueError("input length exceeds max_seq_len")
+        # No max_seq_len cap: eval may run beyond the training length (Sweep 7
+        # A1 relies on eval_seq_len > max_seq_len, and base CausalLM allows it
+        # -- base.py:989). This is sound here because the n-gram hash is
+        # position-independent (it hashes only the trailing n token ids, never
+        # an absolute position), CausalSelfAttention builds its local causal
+        # mask on-the-fly for any seq_len, and RotaryEmbedding extends its
+        # cos/sin cache lazily. Nothing in this variant is tied to max_seq_len.
         x = self.token(input_ids)
         loops = max(1, getattr(self.config, "loop_count", 1))
         for _ in range(loops):
@@ -89,7 +110,13 @@ class EngramLiteLM(CausalLM):
         loss = None
         if labels is not None:
             loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:].reshape(-1))
-        diagnostics = {"parameter_count": count_parameters(self), "config": asdict(self.config)}
+        diagnostics: dict[str, Any] = {}
+        if self._static_diagnostics is None:
+            self._static_diagnostics = {
+                "parameter_count": count_parameters(self),
+                "config": asdict(self.config),
+            }
+        diagnostics.update(self._static_diagnostics)
         return {"logits": logits, "loss": loss, "diagnostics": diagnostics}
 
 
