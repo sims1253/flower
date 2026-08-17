@@ -40,7 +40,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from flower.diag import should_collect, stash
+from flower.diag import clear, should_collect, stash
 
 
 class DepthRouter(nn.Module):
@@ -97,9 +97,13 @@ class DepthRouter(nn.Module):
         # Routing-collapse diagnostic: the papers track mean max-softmax-weight
         # (AttnRes ~0.2 deep vs Delta ~0.6). Picked up by CausalLM's walker.
         # Stashed on-device (see flower/diag.py); the old float(...) here was a
-        # per-step host sync and a graph break under compile.
+        # per-step host sync and a graph break under compile. When not
+        # collecting, clear any value stashed by an earlier eager forward so
+        # the walker can never report it as current (flower/diag.clear).
         if should_collect():
             stash(self, "attn_res_max_weight", weights.max(dim=-1).values.mean())
+        else:
+            clear(self, "attn_res_max_weight")
         return hidden + self.gate[site] * mixed
 
 

@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
-from flower.diag import should_collect, stash
+from flower.diag import clear, should_collect, stash
 from flower.models.base import CausalSelfAttention, FeedForward
 from flower.models.memory import MemoryRead
 
@@ -235,13 +235,19 @@ class MeanFlowMemoryLM(nn.Module):
         # every forward and a graph break under compile. Now stashed on-device
         # under the standard guard (flower/diag.py); the diagnostics dict carries
         # the same 0-d tensor under the same key, and the logging step in
-        # train.py does the single host transfer.
-        if aux_losses and should_collect():
-            stash(self, "meanflow_aux_loss", torch.stack(aux_losses).mean())
+        # train.py does the single host transfer. When not collecting (under
+        # torch.compile), any value left by an earlier eager forward is cleared
+        # — otherwise the dict below would report that stale number (or a
+        # fabricated 0.0) as if it were the current step's loss.
+        if should_collect():
+            if aux_losses:
+                stash(self, "meanflow_aux_loss", torch.stack(aux_losses).mean())
+        else:
+            clear(self, "meanflow_aux_loss")
         diagnostics = {
             "parameter_count": sum(p.numel() for p in self.parameters() if p.requires_grad),
             "config": self._asdict(self.config),
-            "meanflow_aux_loss": getattr(self, "last_diag_meanflow_aux_loss", 0.0),
+            "meanflow_aux_loss": getattr(self, "last_diag_meanflow_aux_loss", None),
         }
         return {"logits": logits, "loss": loss, "diagnostics": diagnostics}
 

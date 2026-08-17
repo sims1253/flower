@@ -15,8 +15,11 @@ rules, both of which are easy to get wrong inline (several sites did):
    be computed-but-never-read — pure cost.
 
 `should_collect()` is the single guard for both rules; `stash()` is the
-write side. The pattern was established in bloom_memory._bloom_route; this
-module exists so new sites copy one honest helper instead of a comment.
+write side and `clear()` the invalidate side — a forward that does not
+refresh the value (the not-collecting branch) must clear it, or the walker
+will happily emit the last eager value as if it were current. The stash
+pattern was established in bloom_memory._bloom_route; this module exists so
+new sites copy one honest helper instead of a comment.
 """
 
 from __future__ import annotations
@@ -47,3 +50,19 @@ def stash(module: nn.Module, key: str, tensor: torch.Tensor) -> None:
     stashing keeps no reference to the activation it was reduced from.
     """
     setattr(module, f"last_diag_{key}", tensor.detach())
+
+
+def clear(module: nn.Module, key: str) -> None:
+    """Drop the stashed `last_diag_<key>` so it cannot be read as current.
+
+    The counterpart to `stash` for forwards that did NOT refresh the value:
+    call this in the `else` of the `should_collect()` guard. Under
+    torch.compile the stash branch is skipped forever, but the attribute set
+    by an earlier eager forward (warmup, a validation pass on the same
+    instance) survives — and the walker would emit that stale number as if
+    it came from the current step. Setting `None` (rather than deleting)
+    also pins "never collected" uniformly: the walker skips non-tensor,
+    non-float values, so nothing stale or fabricated is reported. A later
+    eager forward simply overwrites it via `stash` again.
+    """
+    setattr(module, f"last_diag_{key}", None)

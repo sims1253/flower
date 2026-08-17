@@ -37,8 +37,8 @@ from flower.models.base import (
     CausalLM,
     TransformerBlock,
     _get_or_build_block_mask,
+    _get_or_build_causal_bool_mask,
     _load_flex_attention,
-    causal_mask,
 )
 
 
@@ -92,29 +92,8 @@ class HamiltonianSelfAttention(nn.Module):
         return _get_or_build_block_mask(self, seq_len, device)
 
     def _get_causal_bool_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Cached (T, T) bool causal/local mask (True = attend).
-
-        Keyed on (seq_len, local_window, device) so the dense path does not
-        rebuild the mask every forward. Under torch.compile this is read-only,
-        mirroring `_get_or_build_block_mask`: an in-graph
-        `self._cached_attn_mask = ...` assignment is captured by Dynamo and
-        aliases the tensor across the per-layer reads, which cudagraph mode
-        rejects. A cold cache under compile rebuilds without storing — the
-        pre-caching per-forward behaviour, so no regression, just no win.
-        """
-        hit = (
-            self._cached_attn_mask is not None
-            and seq_len == self._cached_mask_seq_len
-            and self.local_window == self._cached_mask_window
-            and self._cached_attn_mask.device == device
-        )
-        if torch.compiler.is_compiling():
-            return self._cached_attn_mask if hit else causal_mask(seq_len, device, self.local_window)
-        if not hit:
-            self._cached_attn_mask = causal_mask(seq_len, device, self.local_window)
-            self._cached_mask_seq_len = seq_len
-            self._cached_mask_window = self.local_window
-        return self._cached_attn_mask
+        # Delegates to the shared, compile-safe cache logic (base.py).
+        return _get_or_build_causal_bool_mask(self, seq_len, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)

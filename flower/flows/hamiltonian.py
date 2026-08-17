@@ -65,7 +65,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from flower.diag import should_collect
+from flower.diag import clear, should_collect, stash
 
 
 def _log_cosh(z: torch.Tensor) -> torch.Tensor:
@@ -136,7 +136,11 @@ class HamiltonianFlow(nn.Module):
         else:
             self.register_parameter("log_mass", None)
         # Diagnostic: explicit H drift across the flow. Detached, no grad.
-        self.register_buffer("last_diag_hamiltonian_energy_drift", torch.zeros(()), persistent=False)
+        # Stashed as a plain attribute via flower/diag.py (not a buffer) so the
+        # not-collecting branch can clear it without breaking a later eager
+        # `.copy_()` on the same instance — train.py keeps calling the eager
+        # model (validation) after compiled training steps.
+        self.last_diag_hamiltonian_energy_drift: torch.Tensor | None = None
 
     def _mass_scale(self) -> torch.Tensor | None:
         if self.log_mass is None:
@@ -177,8 +181,8 @@ class HamiltonianFlow(nn.Module):
         # The energy-drift diagnostic costs two extra `_hamiltonian` evaluations
         # per forward (~2x the flow's own FLOPs). Gate it on the shared
         # diagnostic guard (flower/diag.py): under torch.compile the walker that
-        # reads the buffer is disabled, so those evaluations would be pure
-        # overhead and the buffer writes would graph-break the region.
+        # reads the stash is disabled, so those evaluations would be pure
+        # overhead and the stash writes would graph-break the region.
         collect = should_collect()
         if collect:
             with torch.no_grad():
@@ -189,7 +193,11 @@ class HamiltonianFlow(nn.Module):
         if collect:
             with torch.no_grad():
                 h_final = self._hamiltonian(q, p)
-                self.last_diag_hamiltonian_energy_drift.copy_((h_final - h_init).pow(2).mean())
+                stash(self, "hamiltonian_energy_drift", (h_final - h_init).pow(2).mean())
+        else:
+            # Not refreshed this forward: drop any value an earlier eager
+            # forward stashed so it is never reported as current.
+            clear(self, "hamiltonian_energy_drift")
         return torch.cat([q, p], dim=-1)
 
 
@@ -233,8 +241,10 @@ class WalnutsHamiltonianFlow(HamiltonianFlow):
         self.energy_threshold = float(energy_threshold)
         self.max_subdivisions = int(max_subdivisions)
         # Mean and max substep counts from the last forward, for logging.
-        self.register_buffer("last_diag_hamiltonian_substeps_mean", torch.zeros(()), persistent=False)
-        self.register_buffer("last_diag_hamiltonian_substeps_max", torch.zeros(()), persistent=False)
+        # Plain stash attributes (see HamiltonianFlow.__init__ for why not
+        # buffers): cleared on forwards that do not refresh them.
+        self.last_diag_hamiltonian_substeps_mean: torch.Tensor | None = None
+        self.last_diag_hamiltonian_substeps_max: torch.Tensor | None = None
 
     def _trial_macro(self, q: torch.Tensor, p: torch.Tensor, step_idx: int, n_sub: int) -> tuple[torch.Tensor, torch.Tensor]:
         macro_dt = 1.0 / self.steps
@@ -277,9 +287,15 @@ class WalnutsHamiltonianFlow(HamiltonianFlow):
             substep_log.append(chosen_n)
         if collect:
             with torch.no_grad():
-                steps_tensor = torch.tensor(substep_log, dtype=torch.float32, device=self.last_diag_hamiltonian_substeps_mean.device)
-                self.last_diag_hamiltonian_substeps_mean.copy_(steps_tensor.mean())
-                self.last_diag_hamiltonian_substeps_max.copy_(steps_tensor.max())
+                steps_tensor = torch.tensor(substep_log, dtype=torch.float32, device=q.device)
+                stash(self, "hamiltonian_substeps_mean", steps_tensor.mean())
+                stash(self, "hamiltonian_substeps_max", steps_tensor.max())
                 h_final_total = self._hamiltonian(q, p)
-                self.last_diag_hamiltonian_energy_drift.copy_((h_final_total - h_init_total).pow(2).mean())
+                stash(self, "hamiltonian_energy_drift", (h_final_total - h_init_total).pow(2).mean())
+        else:
+            # Not refreshed this forward: drop any values an earlier eager
+            # forward stashed so they are never reported as current.
+            clear(self, "hamiltonian_substeps_mean")
+            clear(self, "hamiltonian_substeps_max")
+            clear(self, "hamiltonian_energy_drift")
         return torch.cat([q, p], dim=-1)

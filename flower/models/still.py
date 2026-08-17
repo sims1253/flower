@@ -510,6 +510,14 @@ class StillCompactorSpectral(StillCompactor):
             d = self.head_dim
             # Key: random orthogonal-ish projection (rows of the weight are random unit vectors).
             kw = self.key_signal.weight  # (r_k, d)
+            # Value-dead by intent: the weight is fully overwritten a few
+            # lines below. The call exists ONLY because it consumes global
+            # RNG draws, and every draw after it (the kaiming_normal_ below
+            # and all subsequent inits) is part of the seeded stream — this
+            # repo pins bit-repro of published runs, so removing the call
+            # silently shifted every seeded spectral-compactor init
+            # downstream.
+            nn.init.orthogonal_(self.key_reconstruct.weight)  # (d, r_k)
             # Actually init key_reconstruct as the pseudo-inverse of key_signal.
             nn.init.kaiming_normal_(kw, a=0.0)
             # key_reconstruct should be the transpose-ish of key_signal for identity-like behavior.

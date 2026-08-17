@@ -14,7 +14,13 @@ import pytest
 import torch
 
 from flower.config import ModelConfig
-from flower.models.still import StillCompactor, StillCompactorOT, _apply_rope, _inverse_rope
+from flower.models.still import (
+    StillCompactor,
+    StillCompactorOT,
+    StillCompactorSpectral,
+    _apply_rope,
+    _inverse_rope,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -309,3 +315,59 @@ class TestConfigIntegration:
         )
         model = build_model(cfg)
         assert model is not None
+
+
+class TestSpectralInitRNGStream:
+    """Pin the seeded RNG stream of StillCompactorSpectral._init_spectral.
+
+    The `nn.init.orthogonal_(key_reconstruct.weight)` call in _init_spectral
+    is value-dead (the weight is fully overwritten on the next lines) but it
+    CONSUMES global RNG, so every draw after it — the two kaiming_normal_
+    calls and anything initialized later under the same seed — depends on it
+    being there. The cleanup branch deleted it as dead code, silently
+    shifting the stream for every seeded spectral-compactor init versus the
+    published (pre-cleanup) runs; these tests fail if that ever happens
+    again.
+    """
+
+    SPECTRAL_KWARGS = dict(
+        num_kv_heads=2,
+        head_dim=64,
+        compact_len=8,
+        num_blocks=1,
+        spectral_key_rank=4,
+        spectral_val_rank=16,
+    )
+
+    def _build_seeded(self):
+        torch.manual_seed(1234)
+        return StillCompactorSpectral(**self.SPECTRAL_KWARGS)
+
+    def test_seeded_construction_is_bit_reproducible(self):
+        a = self._build_seeded()
+        b = self._build_seeded()
+        for (na, pa), (nb, pb) in zip(a.named_parameters(), b.named_parameters()):
+            assert na == nb
+            assert torch.equal(pa, pb), f"seeded init not bit-reproducible: {na}"
+
+    def test_init_matches_pre_cleanup_rng_stream(self):
+        # Golden values captured from the pre-cleanup branch (main @ 5f11515):
+        # the first rows of the two kaiming draws made in _init_spectral.
+        # key_signal is drawn immediately after the orthogonal_ call, so it is
+        # the first thing to change if that RNG-consuming call disappears.
+        c = self._build_seeded()
+        # Exact equality: these are round-trip float reprs of the golden
+        # draws, so any shift in the seeded stream changes them.
+        assert c.key_signal.weight[0, :4].tolist() == [
+            -0.03484155237674713, -0.0021602031774818897, 0.053742606192827225, -0.032153017818927765
+        ]
+        assert c.val_signal.weight[0, :4].tolist() == [
+            0.0238554198294878, 0.011659996584057808, -0.0040173823945224285, -0.012448701076209545
+        ]
+
+    def test_orthogonal_init_is_value_dead(self):
+        # Documents why the restored orthogonal_ call exists ONLY for the RNG
+        # stream: its result is fully overwritten. key_reconstruct ends up as
+        # the (scaled) transpose of key_signal, whatever orthogonal_ drew.
+        c = self._build_seeded()
+        assert torch.allclose(c.key_reconstruct.weight, (c.key_signal.weight / 0.1).T)
