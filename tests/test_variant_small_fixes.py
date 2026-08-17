@@ -12,12 +12,18 @@ One test group per fix; see the PR body for the per-finding context:
    identical to the old two-evaluation path.
 5. Frequency-decay write_mag accumulation/saturation documented and pinned;
    per-block write-magnitude diagnostic emitted.
+6. (pullfrog follow-up) The variant forwards route the final projection and
+   loss through CausalLM._compute_logits/_cross_entropy plus the fused-CE and
+   activation-checkpoint paths, so fp8_lm_head / bf16_cross_entropy /
+   fused_linear_ce / activation_checkpoint are live instead of silent no-ops —
+   while flag-off numerics stay bit-identical to the old inline ops.
 """
 
 import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
@@ -42,7 +48,7 @@ _COMMON = dict(
 
 
 def _cfg(variant: str, **overrides) -> ModelConfig:
-    return ModelConfig(variant=variant, **_COMMON, **overrides)
+    return ModelConfig(variant=variant, **{**_COMMON, **overrides})
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +110,9 @@ def test_causalm_init_flags_exist_on_variant_lms(variant):
     """The base CausalLM flags must at least EXIST on the variant LMs. Before
     the refactor a sweep setting any of them silently did nothing here (the
     variants skipped CausalLM.__init__, so the attributes were never created).
-    Attribute presence only — the variant forwards don't consume the flags."""
+    Attribute presence here; the follow-up fix (pullfrog review) routes the
+    forward through the base helpers so the head/CE/checkpoint flags are
+    actually CONSUMED — pinned by the tests below."""
     cfg = _cfg(
         variant,
         activation_checkpoint="ffn",
@@ -122,7 +130,9 @@ def test_causalm_init_flags_exist_on_variant_lms(variant):
     assert isinstance(model.mtp_heads, nn.ModuleList) and len(model.mtp_heads) == 1
     assert model.attn_res_sites == [] and model.depth_router is None
     assert model._static_diagnostics is None  # cache attribute owned by the parent
-    # The forward still runs with the flags set (it just doesn't use them).
+    # The forward runs with every flag set: checkpointed blocks ("ffn" falls
+    # back to full), eager head on CPU (fp8 is CUDA+eval-only; fused CE falls
+    # back off-CUDA with a warning), bf16 loss.
     tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
     out = model(tokens, labels=tokens)
     assert torch.isfinite(out["loss"])
@@ -349,3 +359,289 @@ def test_write_mag_saturation_zeroes_retention():
     assert (base < 1).all()
     assert not torch.allclose(new_mem_fresh, candidate, atol=1e-6)
     assert torch.allclose(new_mem_fresh, (1 - base).unsqueeze(-1) * memory + candidate, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 (pullfrog review of PR #11): the variant forwards now route the final
+# projection + CE through the CausalLM helpers (and mirror base's fused-CE /
+# activation-checkpoint paths), so the base flags are no longer silent no-ops.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_flag_off_forward_is_bit_identical_to_inline_path(variant):
+    """Helper routing must not change default numerics: with every flag off,
+    _compute_logits reduces to self.head(self.ln(x)) and _cross_entropy to the
+    inline shifted F.cross_entropy, so logits and loss are BIT-identical to
+    the pre-change inline path recomputed by hand with the same weights."""
+    torch.manual_seed(0)
+    model = build_model(_cfg(variant)).eval()
+    tokens = torch.randint(0, model.config.vocab_size, (2, model.config.max_seq_len))
+    with torch.no_grad():
+        out = model(tokens, labels=tokens)
+        # --- the old inline path, recomputed with the model's own weights ---
+        x = model.token(tokens)
+        if variant == "engram_lite":
+            for block in model.blocks:
+                x = block(x, tokens)
+        else:
+            state = None
+            for block in model.blocks:
+                x, state = block(x, state)
+        old_logits = model.head(model.ln(x))
+        old_loss = F.cross_entropy(
+            old_logits[:, :-1].reshape(-1, old_logits.size(-1)),
+            tokens[:, 1:].reshape(-1),
+        )
+    assert torch.equal(old_logits, out["logits"])
+    assert torch.equal(old_loss, out["loss"])
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_bf16_cross_entropy_casts_loss_path(variant):
+    """bf16_cross_entropy=True must change the variant's loss path exactly like
+    base's: the shifted logits are cast to bf16 before CE (loss comes back
+    bf16), instead of silently keeping the fp32 inline CE."""
+    tokens = torch.randint(0, 128, (2, 16))
+    torch.manual_seed(0)
+    model_off = build_model(_cfg(variant)).eval()
+    torch.manual_seed(0)
+    model_on = build_model(_cfg(variant, bf16_cross_entropy=True)).eval()
+    with torch.no_grad():
+        out_off = model_off(tokens, labels=tokens)
+        out_on = model_on(tokens, labels=tokens)
+    # The cast happened: fp32 loss off, bf16 loss on.
+    assert out_off["loss"].dtype == torch.float32
+    assert out_on["loss"].dtype == torch.bfloat16
+    # The flag touches only the loss, not the logits (same seed -> same weights).
+    assert torch.equal(out_off["logits"], out_on["logits"])
+    # The bf16 loss is EXACTLY the manual inline bf16 CE over the flag-off
+    # logits (mirrors base's _cross_entropy when the flag is on).
+    manual = F.cross_entropy(
+        out_off["logits"][:, :-1].to(torch.bfloat16).reshape(-1, out_off["logits"].size(-1)),
+        tokens[:, 1:].reshape(-1),
+    )
+    assert float(out_on["loss"]) == pytest.approx(float(manual), abs=1e-6)
+    # Consistent with base's tolerance for bf16 CE (lossy but close).
+    assert torch.allclose(out_on["loss"].float(), out_off["loss"].float(), rtol=0.05, atol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 head path needs CUDA")
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_fp8_lm_head_routes_through_fp8_head_in_eval(variant):
+    """fp8_lm_head=True + eval + bf16 + CUDA routes the tied-head matmul
+    through CausalLM._fp8_head (via _compute_logits); training falls back to
+    the BF16 head (no _scaled_mm backward kernel). Only the ROUTING and
+    finiteness are pinned here — the head's numerics are pinned by the S3
+    tests in test_training_speedups.py."""
+    torch.manual_seed(0)
+    cfg = _cfg(variant, fp8_lm_head=True)
+    model = build_model(cfg).to("cuda").to(torch.bfloat16)
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device="cuda")
+    calls = {"n": 0}
+    original = model._fp8_head
+
+    def spy(t, _orig=original, _calls=calls):
+        _calls["n"] += 1
+        return _orig(t)
+
+    model._fp8_head = spy
+    model.eval()
+    with torch.no_grad():
+        out = model(tokens, labels=tokens)
+    assert calls["n"] == 1  # routed through the FP8 head exactly once
+    assert out["logits"].shape == (2, cfg.max_seq_len, cfg.vocab_size)
+    assert out["logits"].dtype == torch.bfloat16
+    assert torch.isfinite(out["logits"]).all()
+    assert torch.isfinite(out["loss"])
+
+    # Train mode: BF16 head (backward must work); no further FP8-head calls.
+    model.train()
+    out_train = model(tokens, labels=tokens)
+    assert calls["n"] == 1
+    out_train["loss"].backward()
+    assert torch.isfinite(out_train["loss"])
+
+
+def _run_variant_training_step(
+    variant: str, activation_checkpoint, ids: torch.Tensor, backward: bool
+) -> float:
+    torch.manual_seed(0)
+    cfg = _cfg(variant, dropout=0.1, activation_checkpoint=activation_checkpoint)
+    model = build_model(cfg)
+    model.train()
+    out = model(ids, labels=ids)
+    if backward:
+        out["loss"].backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+    return float(out["loss"])
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+@pytest.mark.parametrize("mode", [True, "selective"])
+def test_activation_checkpoint_loss_identical_dropout_rng(variant, mode):
+    """Core checkpointing gate, mirroring the base tests (which are also
+    forward-only): with dropout > 0 the loss must be bit-identical with and
+    without checkpointing at the same seed — use_reentrant=False saves/restores
+    RNG state so the forward matches, and the same contract holds for the
+    custom block signatures (input_ids arg for engram, (memory, write_mag)
+    tuple state for freq-decay).
+
+    NOTE on "selective": backward through selective checkpointing crashes with
+    torch 2.13's "Tensor cached during selective activation checkpoint has
+    been mutated" on the SDPA path — for the VANILLA base model identically
+    (pre-existing, not introduced here; base's own selective identity test is
+    forward-only for this reason, and its only selective+backward test runs
+    under flex+autocast). The variant backward-under-selective path is pinned
+    on CUDA+flex below, mirroring that test."""
+    torch.manual_seed(123)
+    ids = torch.randint(0, 128, (2, 16))
+    loss_no = _run_variant_training_step(variant, False, ids, backward=False)
+    loss_ckpt = _run_variant_training_step(variant, mode, ids, backward=False)
+    assert loss_no == loss_ckpt, (
+        f"{variant} {mode!r} checkpointing changed the loss with dropout>0: "
+        f"{loss_no} vs {loss_ckpt} (delta {abs(loss_no - loss_ckpt):.2e}); "
+        f"RNG state not preserved"
+    )
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_activation_checkpoint_full_backward_produces_grads(variant):
+    """Full checkpointing must carry gradients through the checkpointed custom
+    block calls (input_ids arg / tuple state) and backprop finitely."""
+    torch.manual_seed(123)
+    ids = torch.randint(0, 128, (2, 16))
+    loss = _run_variant_training_step(variant, True, ids, backward=True)
+    assert math.isfinite(loss)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="selective backward is exercised under flex on CUDA")
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_activation_checkpoint_selective_backward_under_flex(variant):
+    """Selective checkpointing + backward through the variant blocks, under the
+    flex+autocast configuration base's own selective-backward test uses (the
+    plain-SDPA selective backward crashes in torch 2.13 for vanilla and these
+    variants alike — see the identity test's NOTE). Pins that the recompute
+    handles the custom block signatures: gradients flow and stay finite."""
+    from flower.models.base import prebuild_attention_masks
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    # d_model/num_heads -> head_dim 16: Triton's flex kernel requires >= 16.
+    cfg = _cfg(
+        variant,
+        d_model=64,
+        num_heads=4,
+        ffn_dim=128,
+        num_layers=2,
+        dropout=0.1,
+        activation_checkpoint="selective",
+        flex_attention=True,
+    )
+    model = build_model(cfg).to(dev).to(torch.bfloat16)
+    prebuild_attention_masks(model, cfg.max_seq_len, dev)
+    model.train()
+    torch.manual_seed(123)
+    ids = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=dev)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = model(ids, labels=ids)["loss"]
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g.float()).all() for g in grads)
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_activation_checkpoint_ffn_falls_back_to_full(variant, capsys):
+    """"ffn" has no clean FFN-only boundary in these custom blocks (the n-gram
+    residual / memory update interleave with attention+FFN), so it falls back
+    to FULL checkpointing with a one-time printed notice — the documented
+    base.py contract for non-vanilla blocks. The fallback is real
+    checkpointing, not a silent no-op: bit-identical loss to full mode, and
+    the notice prints exactly once."""
+    torch.manual_seed(123)
+    ids = torch.randint(0, 128, (2, 16))
+    loss_full = _run_variant_training_step(variant, True, ids, backward=False)
+    loss_ffn = _run_variant_training_step(variant, "ffn", ids, backward=False)
+    assert loss_ffn == loss_full
+
+    model = build_model(_cfg(variant, activation_checkpoint="ffn"))
+    model.train()
+    capsys.readouterr()  # drain
+    model(ids, labels=ids)
+    first = capsys.readouterr().out
+    assert "activation_checkpoint='ffn'" in first
+    assert "falling back to full checkpointing" in first
+    model(ids, labels=ids)
+    assert "falling back to full checkpointing" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_activation_checkpoint_is_noop_in_eval(variant):
+    """Eval mode must run uncheckpointed (no backward -> a recompute would be
+    pure waste): same seed, flag on vs off -> bit-identical logits."""
+    torch.manual_seed(123)
+    ids = torch.randint(0, 128, (2, 16))
+    torch.manual_seed(0)
+    model_off = build_model(_cfg(variant)).eval()
+    torch.manual_seed(0)
+    model_on = build_model(_cfg(variant, activation_checkpoint=True)).eval()
+    with torch.no_grad():
+        logits_off = model_off(ids)["logits"]
+        logits_on = model_on(ids)["logits"]
+    assert torch.equal(logits_off, logits_on)
+
+
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_fused_linear_ce_cpu_fallback_warns_once(variant):
+    """Mirrors base's CPU-fallback test: fused_linear_ce=True off CUDA must
+    fall back to eager WITH a one-time warning — not a silent no-op."""
+    import warnings
+
+    cfg = _cfg(variant, fused_linear_ce=True)
+    model = build_model(cfg)  # CPU model — the fused kernel cannot run here
+    model.train()
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model(tokens, labels=tokens)  # first call: should warn
+        model(tokens, labels=tokens)  # second call: must NOT warn again
+    fallback_warnings = [w for w in caught if "fused_linear_ce" in str(w.message)]
+    assert len(fallback_warnings) == 1, (
+        f"expected exactly one fallback warning, got {len(fallback_warnings)}"
+    )
+    assert "falling back to the eager" in str(fallback_warnings[0].message)
+    assert getattr(model, "_warned_fused_ce_fallback", False) is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Liger fused CE kernel is CUDA/Triton-only")
+@pytest.mark.parametrize("variant", ["engram_lite", "frequency_decay_memory"])
+def test_fused_linear_ce_matches_eager_and_keeps_tied_grad(variant):
+    """On CUDA the variants run the real Liger fused kernel through the same
+    _fused_cross_entropy helper as base: the (B*T, vocab) logits tensor is
+    never materialized, the loss matches eager to bf16 precision, and the
+    tied embedding gradient flows through the by-reference weight."""
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    eager = build_model(_cfg(variant)).to(dev).to(torch.bfloat16)
+    torch.manual_seed(0)
+    fused = build_model(_cfg(variant, fused_linear_ce=True)).to(dev).to(torch.bfloat16)
+    fused.load_state_dict(eager.state_dict())
+    eager.train()
+    fused.train()
+    assert fused._ensure_liger_fce() is True  # the real kernel path is live
+    tokens = torch.randint(0, eager.config.vocab_size, (2, eager.config.max_seq_len), device=dev)
+    out_e = eager(tokens, labels=tokens)
+    out_f = fused(tokens, labels=tokens)
+    assert out_f["logits"] is None  # fused path never materializes logits
+    assert torch.isfinite(out_f["loss"])
+    # Same loss to bf16 precision (kernel-selection noise, as in base's test).
+    assert torch.allclose(out_f["loss"].float(), out_e["loss"].float(), rtol=5e-2)
+    out_f["loss"].backward()
+    out_e["loss"].backward()
+    # The tie stays load-bearing: the embedding table receives the head's
+    # gradient through the fused kernel's by-reference weight.
+    assert fused.token.weight.grad is not None
+    assert torch.allclose(
+        fused.token.weight.grad.float(), eager.token.weight.grad.float(), rtol=0.05, atol=0.05
+    )
