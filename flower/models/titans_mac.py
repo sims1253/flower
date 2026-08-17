@@ -115,8 +115,10 @@ class TitansMACBlock(nn.Module):
         value:  (B, D)
 
         Attention weights are softmax over slots; the predicted value is the weighted
-        average of slot contents. The loss is mean-squared error per element so the
-        gradient magnitudes are stable across batch/dim.
+        average of slot contents. The legacy reduction is mean-squared error
+        per element over B*D (stable gradient magnitudes across batch/dim but
+        batch-size-dependent dynamics); with titans_per_sample_loss it is a
+        sum over batch and mean over D (batch-invariant dynamics).
 
         Reduction (``ModelConfig.titans_per_sample_loss``):
           False (legacy) -> mean over B and D (F.mse_loss default, factor
@@ -264,7 +266,9 @@ class TitansMACBlock(nn.Module):
         only needed to cancel the legacy mean's 1/rows factor. With
         ``titans_per_sample_loss=True`` both surprise paths already reduce
         per row (factor 2/D each), so the rescale is skipped and the flag is
-        exactly a no-op on this path — the causal write is per-row either way.
+        an identity on this path (equal in exact arithmetic, ulp-different in
+        floating point; the tests allow 1e-5) — the causal write is per-row
+        either way.
         """
         bsz, seq_len, _, dim = memory.shape
         rows = bsz * seq_len

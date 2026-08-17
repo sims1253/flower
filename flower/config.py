@@ -362,9 +362,18 @@ class ModelConfig:
     # Interaction with causal_memory: the causal write path is per-position
     # and already per-row (each (batch, position) row's surprise is the
     # gradient of its OWN MSE with factor 2/D — the per-position fix from the
-    # causal-memory branch), so titans_per_sample_loss is a NO-OP when
-    # causal_memory=True; it only affects the non-causal window-aggregated
-    # write. Runs with this flag on are not comparable to runs with it off.
+    # causal-memory branch), so titans_per_sample_loss is a bitwise identity
+    # when causal_memory=True (factor 2/D == 2/(1*D) at B=1... more precisely
+    # the flag's rescale-by-rows cancels exactly in real arithmetic and is
+    # ulp-different in fp); it only affects the non-causal window-aggregated
+    # write.
+    #
+    # Note the flag is also a bitwise identity at B=1 on the non-causal path
+    # (2/D == 2/(1*D)), so it changes nothing about the B=1 doc-level eval
+    # paths themselves — the consistency it delivers comes from TRAINING with
+    # it on (B=N dynamics then match B=1 eval). Enabling it mid-run makes the
+    # run incomparable to its own prefix; runs with it on are not comparable
+    # to runs with it off.
     titans_per_sample_loss: bool = False
     # ------------------------------------------------------------------
     # Causal memory writes (correctness fix).
