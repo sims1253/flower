@@ -276,6 +276,37 @@ def _get_or_build_block_mask(module: nn.Module, seq_len: int, device: torch.devi
     )
 
 
+def _get_or_build_causal_bool_mask(module: nn.Module, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Cached (T, T) bool causal/local mask for an attention module (True = attend).
+
+    Single source of truth for the dense-path mask cache that the per-attention-
+    module ``_get_causal_bool_mask`` methods (FlowAttention, HamiltonianAttention)
+    delegate to — the bool-mask twin of ``_get_or_build_block_mask``. The cache
+    lives on the module, keyed on ``(seq_len, local_window, device)``, so the
+    dense path does not rebuild the mask every forward.
+
+    Eager mode: build+cache on miss. Under ``torch.compile`` (``is_compiling()``
+    is True): read-only — never mutate module state inside the graph, because an
+    in-graph ``self._cached_attn_mask = ...`` assignment is captured by Dynamo
+    and aliases the tensor across the per-layer reads, which cudagraph mode
+    rejects. A cold cache under compile rebuilds without storing — the
+    pre-caching per-forward behaviour, so no regression, just no win.
+    """
+    hit = (
+        module._cached_attn_mask is not None
+        and seq_len == module._cached_mask_seq_len
+        and module.local_window == module._cached_mask_window
+        and module._cached_attn_mask.device == device
+    )
+    if torch.compiler.is_compiling():
+        return module._cached_attn_mask if hit else causal_mask(seq_len, device, module.local_window)
+    if not hit:
+        module._cached_attn_mask = causal_mask(seq_len, device, module.local_window)
+        module._cached_mask_seq_len = seq_len
+        module._cached_mask_window = module.local_window
+    return module._cached_attn_mask
+
+
 def prebuild_attention_masks(model: nn.Module, seq_len: int, device: torch.device) -> None:
     """Eagerly populate every flex-attention module's cached BlockMask.
 

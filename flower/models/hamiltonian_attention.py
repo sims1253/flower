@@ -8,9 +8,15 @@ exactly and conserves a shadow Hamiltonian, giving a flow whose long-range
 behaviour is bounded by construction.
 
 What carries over from `flow_attention`:
-  - QKV projection, RoPE-free local attention (RoPE happens elsewhere), local
-    window mask, output projection.
+  - QKV projection, dense causal/local attention, output projection.
   - The same flow-step count config knob.
+
+Positional encoding: none. Unlike CausalSelfAttention, this variant (like
+`flow_attention`, which it inherits the pipeline from) applies no RoPE, and
+the Hamiltonian flow on Q/K is position-wise, so it is not a stand-in
+either. Attention here is permutation-equivariant within the causal/local
+window — a known gap inherited from `flow_attention`. Adding RoPE would be
+a behaviour change, not a cleanup, so it is left as a documented gap.
 
 What is different:
   - Q and K are passed through HamiltonianFlow / WalnutsHamiltonianFlow
@@ -22,6 +28,7 @@ What is different:
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
@@ -30,10 +37,8 @@ from flower.models.base import (
     CausalLM,
     TransformerBlock,
     _get_or_build_block_mask,
+    _get_or_build_causal_bool_mask,
     _load_flex_attention,
-    causal_mask,
-    make_causal_local_block_mask,
-    scaled_dot_attention,
 )
 
 
@@ -73,6 +78,10 @@ class HamiltonianSelfAttention(nn.Module):
         self._cached_block_mask = None
         self._cached_seq_len = 0
         self._cached_window = None
+        # Dense-path bool mask cache (see _get_causal_bool_mask).
+        self._cached_attn_mask = None
+        self._cached_mask_seq_len = 0
+        self._cached_mask_window = None
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -81,6 +90,10 @@ class HamiltonianSelfAttention(nn.Module):
     def _get_block_mask(self, seq_len: int, device: torch.device):
         # Delegates to the shared, compile-safe cache logic (base.py).
         return _get_or_build_block_mask(self, seq_len, device)
+
+    def _get_causal_bool_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        # Delegates to the shared, compile-safe cache logic (base.py).
+        return _get_or_build_causal_bool_mask(self, seq_len, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -95,8 +108,12 @@ class HamiltonianSelfAttention(nn.Module):
             block_mask = self._get_block_mask(x.shape[1], x.device)
             out = flex_attention(q, k, v, block_mask=block_mask)
         else:
-            mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
-            out = scaled_dot_attention(q, k, v, mask)
+            # Fused SDPA with the cached bool mask instead of the legacy dense
+            # path, which materialized (B, H, T, T) scores — the OOM/spill-prone
+            # path CausalSelfAttention._forward_sdpa documents abandoning.
+            # Numerically equivalent; pinned by tests/test_sdpa_attention_parity.py.
+            mask = self._get_causal_bool_mask(x.shape[1], x.device).view(1, 1, x.shape[1], x.shape[1])
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
