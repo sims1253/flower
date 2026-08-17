@@ -66,7 +66,13 @@ def induction_copy_probe(
         filler = torch.randint(lo, hi, (batch_size, pattern_len), generator=gen, dtype=torch.long)
         seq = torch.cat([pattern, filler, pattern], dim=1).to(device)
         logits = model(seq)["logits"]
-        start = pattern_len * 2 - 1
+        # Score from the FIRST REPEATED token onward (logit at 2p predicts the
+        # token at 2p+1). The previous `start = 2p - 1` also scored the
+        # prediction of the repeated block's FIRST token — which induction
+        # cannot know: its only evidence is one earlier copy of a random
+        # pattern, so that position sits at the chance floor and pinned even a
+        # perfect inductive model's accuracy to (p-1)/p.
+        start = pattern_len * 2
         pred_logits = logits[:, start:-1, :].reshape(-1, logits.shape[-1])
         labels = seq[:, start + 1 :].reshape(-1)
         loss = F.cross_entropy(pred_logits, labels, reduction="sum")
@@ -78,6 +84,31 @@ def induction_copy_probe(
         "accuracy": total_correct / max(total, 1),
         "tokens": total,
     }
+
+
+def _unique_token_rows(
+    lo: int,
+    hi: int,
+    batch_size: int,
+    count: int,
+    gen: torch.Generator,
+) -> torch.Tensor:
+    """(batch_size, count) token ids sampled WITHOUT replacement per row.
+
+    Each row's `count` ids are distinct (a per-row `randperm` slice, the same
+    path mqar_probe has always used). WITH-replacement sampling lets the same
+    key appear twice in an associative-recall row, which makes the queried
+    pair ambiguous — at the byte vocab (256) and 8 pairs, ~11% of rows had a
+    duplicated key and were unanswerable even for a perfect model. Falls back
+    to WITH-replacement randint when the vocabulary is smaller than `count`
+    (uniqueness is impossible there).
+    """
+    vocab = hi - lo
+    if vocab >= count:
+        return torch.stack(
+            [torch.randperm(vocab, generator=gen, dtype=torch.long)[:count] + lo for _ in range(batch_size)]
+        )
+    return torch.randint(lo, hi, (batch_size, count), generator=gen, dtype=torch.long)
 
 
 @torch.no_grad()
@@ -98,8 +129,11 @@ def associative_recall_probe(
     total_correct = 0
     total = 0
     for _ in range(batches):
-        keys = torch.randint(lo, hi, (batch_size, pairs), generator=gen, dtype=torch.long)
-        vals = torch.randint(lo, hi, (batch_size, pairs), generator=gen, dtype=torch.long)
+        # Unique keys: a duplicated key would make the queried pair ambiguous
+        # (two candidate answers for one query). Unique values keep parity with
+        # mqar_probe's sampling.
+        keys = _unique_token_rows(lo, hi, batch_size, pairs, gen)
+        vals = _unique_token_rows(lo, hi, batch_size, pairs, gen)
         query_idx = torch.randint(0, pairs, (batch_size,), generator=gen)
         kv = torch.stack([keys, vals], dim=-1).reshape(batch_size, pairs * 2)
         query_key = keys[torch.arange(batch_size), query_idx].unsqueeze(1)
@@ -120,6 +154,31 @@ def associative_recall_probe(
     }
 
 
+def _monotone_breaking_point(curve: dict[str, float], *, threshold: float = 0.5) -> int:
+    """Largest level N such that every level <= N is MEASURED and reached `threshold`.
+
+    The previous rule ("largest passing level") reported 64 for a non-monotonic
+    curve that passed 16, failed 32, and passed 64 — overstating capacity on
+    exactly the dip the curve exists to locate. A capacity breaking point is a
+    prefix property: a model supports N pairs only if it supports every load up
+    to N. A NaN level (unmeasurable at that length) caps the prefix at the last
+    confirmed level: extending past an unconfirmed gap would claim capacity
+    that was never measured. (Today the unmeasurable condition — the sequence
+    no longer fits `eval_seq_len` — is monotone in the level, so nothing
+    follows a gap; this stays conservative if that ever changes.)
+    """
+    breaking_point = 0
+    for level in sorted(curve, key=int):
+        acc = curve[level]
+        if isinstance(acc, float) and math.isnan(acc):
+            break
+        if acc >= threshold:
+            breaking_point = int(level)
+        else:
+            break
+    return breaking_point
+
+
 @torch.no_grad()
 def mqar_probe(
     model: torch.nn.Module,
@@ -136,7 +195,8 @@ def mqar_probe(
 
     Plants N key→value pairs then queries a fraction of them at the end.
     Returns accuracy at each num_pairs level and a breaking_point scalar
-    (largest num_pairs with accuracy >= 0.5).
+    (largest num_pairs such that every level <= it reached accuracy >= 0.5 —
+    see `_monotone_breaking_point`).
     """
     lo, hi = _probe_vocab(cfg)
     seq_cap = _eval_seq_len(cfg)
@@ -160,7 +220,6 @@ def mqar_probe(
     for mode in delay_modes:
         mode_curve: dict[str, float] = {}
         mode_full_vocab_curve: dict[str, float] = {}
-        breaking_point = 0
         for num_pairs in num_pairs_list:
             num_queries = max(1, int(num_pairs * query_fraction))
             # Sequence: [k1,v1,...,kN,vN] + [delay] + [q1,a1,q2,a2,...]
@@ -176,17 +235,8 @@ def mqar_probe(
             total_full_vocab_correct = 0
             total = 0
             for _ in range(batches):
-                vocab = hi - lo
-                if vocab >= num_pairs:
-                    keys = torch.stack(
-                        [torch.randperm(vocab, generator=gen, dtype=torch.long)[:num_pairs] + lo for _ in range(batch_size)]
-                    )
-                    vals = torch.stack(
-                        [torch.randperm(vocab, generator=gen, dtype=torch.long)[:num_pairs] + lo for _ in range(batch_size)]
-                    )
-                else:
-                    keys = torch.randint(lo, hi, (batch_size, num_pairs), generator=gen, dtype=torch.long)
-                    vals = torch.randint(lo, hi, (batch_size, num_pairs), generator=gen, dtype=torch.long)
+                keys = _unique_token_rows(lo, hi, batch_size, num_pairs, gen)
+                vals = _unique_token_rows(lo, hi, batch_size, num_pairs, gen)
                 kv = torch.stack([keys, vals], dim=-1).reshape(batch_size, kv_len)
 
                 query_indices = torch.stack(
@@ -223,11 +273,9 @@ def mqar_probe(
             full_vocab_acc = total_full_vocab_correct / max(total, 1)
             mode_curve[str(num_pairs)] = acc
             mode_full_vocab_curve[str(num_pairs)] = full_vocab_acc
-            if acc >= 0.5:
-                breaking_point = num_pairs
         capacity_curve[mode] = mode_curve
         full_vocab_curve[mode] = mode_full_vocab_curve
-        breaking_points[mode] = breaking_point
+        breaking_points[mode] = _monotone_breaking_point(mode_curve)
 
     return {
         "capacity_curve": capacity_curve,
@@ -304,7 +352,6 @@ def text_recall_probe(
 
     for mode in delay_modes:
         mode_curve: dict[str, float] = {}
-        breaking_point = 0
         for num_pairs in num_pairs_list:
             num_queries = max(1, int(num_pairs * query_fraction))
             kv_len = num_pairs * 2
@@ -351,10 +398,8 @@ def text_recall_probe(
 
             acc = total_correct / max(total, 1)
             mode_curve[str(num_pairs)] = acc
-            if acc >= 0.5:
-                breaking_point = num_pairs
         capacity_curve[mode] = mode_curve
-        breaking_points[mode] = breaking_point
+        breaking_points[mode] = _monotone_breaking_point(mode_curve)
 
     return {
         "capacity_curve": capacity_curve,
@@ -453,7 +498,6 @@ def needle_in_text_probe(
 
     for mode in depth_modes:
         mode_curve: dict[str, float] = {}
-        breaking_point = 0
         for num_pairs in num_pairs_list:
             if num_pairs > n_keys:
                 mode_curve[str(num_pairs)] = float("nan")
@@ -484,10 +528,25 @@ def needle_in_text_probe(
 
                 prompt = f" The secret word for {keys[q]} is"
                 prefix_ids = encoder.encode(context + prompt)
-                # Honour the eval budget: keep the most recent context if too long,
-                # but never drop the queried fact for "early" mode.
-                if len(prefix_ids) > seq_cap - 8:
-                    prefix_ids = prefix_ids[-(seq_cap - 8) :]
+                # Honour the eval budget, but NEVER drop the queried fact. The
+                # old code unconditionally kept the LAST seq_cap-8 tokens,
+                # which for "early" mode deleted exactly the head-planted fact
+                # being queried — the trial became unanswerable by construction.
+                # "early": keep the head around the fact (the fact is planted
+                # first), then re-append the query prompt. "late": keep the
+                # tail as before (the queried fact sits just before the query).
+                budget = seq_cap - 8
+                if len(prefix_ids) > budget:
+                    prompt_ids = encoder.encode(prompt)
+                    if mode == "early":
+                        context_ids = encoder.encode(context)
+                        fact_ids = encoder.encode(fact(keys[q], vals[q]))
+                        # +2 absorbs BPE boundary merges between the fact and
+                        # the filler that follows it.
+                        keep = max(len(fact_ids) + 2, budget - len(prompt_ids))
+                        prefix_ids = context_ids[:keep] + prompt_ids
+                    else:
+                        prefix_ids = prefix_ids[-budget:]
 
                 nlls = [_continuation_nll(model, prefix_ids, encoder.encode(" " + v), device) for v in vals]
                 if int(torch.tensor(nlls).argmin()) == q:
@@ -496,11 +555,9 @@ def needle_in_text_probe(
 
             acc = correct / max(total, 1)
             mode_curve[str(num_pairs)] = acc
-            # Chance is 1/num_pairs; require clearing 0.5 as the breaking-point bar.
-            if acc >= 0.5:
-                breaking_point = num_pairs
         capacity_curve[mode] = mode_curve
-        breaking_points[mode] = breaking_point
+        # Chance is 1/num_pairs; require clearing 0.5 as the breaking-point bar.
+        breaking_points[mode] = _monotone_breaking_point(mode_curve)
 
     return {
         "capacity_curve": capacity_curve,
@@ -662,13 +719,23 @@ def blimp_mini_probe(
 # to the hidden state. Adding a new memory architecture? Add its read-side module
 # name here so the ablation actually zeroes its contribution.
 _ABLATABLE_MODULE_NAMES: tuple[str, ...] = (
-    "mem_read",  # summary_memory, flow_memory, flow_meanflow, flow_pma, titans_mac
+    "mem_read",  # summary_memory, flow_memory, flow_meanflow, flow_pma, titans_mac, ...
     "engram",  # engram_lite
 )
 
 
+class _AblationState:
+    """What `_memory_read_ablation` actually patched while active."""
+
+    def __init__(self) -> None:
+        self.patched: list[str] = []
+
+    def __bool__(self) -> bool:
+        return bool(self.patched)
+
+
 @contextlib.contextmanager
-def _memory_read_ablation(model: torch.nn.Module) -> Iterator[None]:
+def _memory_read_ablation(model: torch.nn.Module) -> Iterator[_AblationState]:
     """Zero out memory-derived residuals during the wrapped block.
 
     Different memory architectures take different first-argument shapes/dtypes
@@ -676,7 +743,15 @@ def _memory_read_ablation(model: torch.nn.Module) -> Iterator[None]:
     takes a long token-id tensor). We can't construct the right zero tensor from
     the inputs alone, so we run the original forward and then zero the output —
     this is a probe, so the extra compute is fine.
+
+    Yields an `_AblationState` recording every patched read path. Some memory
+    variants read memory through paths this probe does NOT know how to patch
+    (e.g. phase_memory's bound `PhaseMemoryBlock._read` method, or any
+    non-module read): for those nothing matches, the "ablated" forward is
+    bit-identical to the normal one, and the caller must treat delta_bpb as
+    unmeasured rather than reporting the fabricated 0.0 it would produce.
     """
+    state = _AblationState()
     originals: list[tuple[Any, Any]] = []
     try:
         for module in model.modules():
@@ -686,6 +761,7 @@ def _memory_read_ablation(model: torch.nn.Module) -> Iterator[None]:
                     continue
                 original = target.forward
                 originals.append((target, original))
+                state.patched.append(f"{type(module).__name__}.{attr_name}")
 
                 def make_zero_forward(orig):
                     def zero_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -694,7 +770,7 @@ def _memory_read_ablation(model: torch.nn.Module) -> Iterator[None]:
                     return zero_forward
 
                 target.forward = make_zero_forward(original)
-        yield
+        yield state
     finally:
         for target, original in originals:
             target.forward = original
@@ -709,14 +785,62 @@ def memory_ablation_probe(
     doc_limit: int | None = 32,
 ) -> dict[str, float | int]:
     normal = evaluate_documents(model, cfg, device, doc_limit=doc_limit, bootstrap=False)
-    with _memory_read_ablation(model):
-        ablated = evaluate_documents(model, cfg, device, doc_limit=doc_limit, bootstrap=False)
-    return {
+    with _memory_read_ablation(model) as ablation:
+        if ablation:
+            ablated = evaluate_documents(model, cfg, device, doc_limit=doc_limit, bootstrap=False)
+        else:
+            # Nothing was patched (unpatchable read path, or a variant with no
+            # memory at all). The ablated pass would be a bit-identical rerun of
+            # the normal pass and delta_bpb a fabricated 0.0 — skip the compute
+            # and mark the metric unmeasured (`ablated: false`, NaN deltas) so
+            # downstream ranking excludes it instead of tying every such
+            # variant at a fake zero.
+            ablated = None
+    result: dict[str, float | int] = {
         "normal_bpb": float(normal["bpb"]),
-        "ablated_bpb": float(ablated["bpb"]),
-        "delta_bpb": float(ablated["bpb"]) - float(normal["bpb"]),
         "validation_docs": int(normal["validation_docs"]),
+        "ablated": ablated is not None,
     }
+    if ablated is not None:
+        result["ablated_bpb"] = float(ablated["bpb"])
+        result["delta_bpb"] = float(ablated["bpb"]) - float(normal["bpb"])
+    else:
+        result["ablated_bpb"] = float("nan")
+        result["delta_bpb"] = float("nan")
+    return result
+
+
+def attach_average_ranks(rows: list[dict[str, Any]], *, prefix: str = "rank_") -> None:
+    """Attach a `composite_avg_rank` headline to each row (lower = better).
+
+    For every metric column named `prefix*`, rank the rows carrying a numeric
+    value for it (1 = best, ascending); each row's headline is the mean of its
+    ranks. This is the same average-rank composite
+    scripts/aggregate_sweep_results.py `_attach_average_ranks` applies to sweep
+    tables, kept here as the canonical per-metric-scale-free headline so
+    probe-side tests and consumers share one definition.
+
+    Why not a geomean of the rank inputs: the old `geomean_loss_like` took
+    `exp(mean(log(max(v, 1e-9))))` over rank_inputs that include NEGATED
+    breaking points (values <= 0). Every one clamped to log(1e-9) = -20.72, so
+    the three capacity metrics carried zero signal while a strictly-positive
+    metric near zero dominated — a perfect blimp score (error 0.0, clamped)
+    versus 0.0125 swung the headline ~7.7x. Ranks are scale-free and signed
+    only through the value ordering, so negated breaking points rank correctly
+    and no metric can swamp the composite.
+    """
+    rank_cols = sorted({k for row in rows for k in row if k.startswith(prefix)})
+    if not rank_cols:
+        return
+    ranks_by_row: dict[int, list[int]] = {i: [] for i in range(len(rows))}
+    for col in rank_cols:
+        indexed = [(i, row[col]) for i, row in enumerate(rows) if isinstance(row.get(col), (int, float))]
+        indexed.sort(key=lambda item: item[1])
+        for rank, (i, _) in enumerate(indexed, start=1):
+            ranks_by_row[i].append(rank)
+    for i, ranks in ranks_by_row.items():
+        if ranks:
+            rows[i]["composite_avg_rank"] = sum(ranks) / len(ranks)
 
 
 @torch.no_grad()
@@ -768,10 +892,15 @@ def run_composite_eval(
         "text_recall_neg_breaking_point": -float(text_recall["breaking_point"]),
         # Needle-in-real-text: recall where the TASK (not just tokens) is on-manifold.
         "needle_neg_breaking_point": -float(needle["breaking_point"]),
-        # Bigger positive delta means memory helped more, so negate for lower-is-better ranking.
-        "memory_ablation_neg_delta_bpb": -float(memory_ablation["delta_bpb"]),
         "blimp_mini_error": 1.0 - float(blimp["accuracy"]),
     }
+    if memory_ablation.get("ablated", False):
+        # Bigger positive delta means memory helped more, so negate for
+        # lower-is-better ranking. ONLY when the ablation actually patched a
+        # read path: an unpatched run (unpatchable read path, or a variant
+        # with no memory) has a fabricated delta of 0.0 — ranking it would tie
+        # every such variant at a fake zero.
+        rank_inputs["memory_ablation_neg_delta_bpb"] = -float(memory_ablation["delta_bpb"])
     return {
         "variant": cfg.model.variant,
         "seed": int(cfg.training.seed),
@@ -788,5 +917,15 @@ def run_composite_eval(
         },
         "rank_inputs": rank_inputs,
         "lower_is_better": list(rank_inputs),
-        "geomean_loss_like": math.exp(sum(math.log(max(v, 1e-9)) for v in rank_inputs.values()) / len(rank_inputs)),
+        # Headline history: this dict used to end with
+        #   "geomean_loss_like": exp(mean(log(max(v, 1e-9)) for v in rank_inputs))
+        # which was broken by construction — rank_inputs contain NEGATED
+        # breaking points (<= 0), all clamping to log(1e-9) = -20.72, so the
+        # capacity metrics contributed a constant and any near-zero positive
+        # metric dominated (perfect blimp error 0.0 vs 0.0125 = a ~7.7x swing).
+        # The headline is now the average-rank composite computed across runs
+        # by `attach_average_ranks` above / aggregate_sweep_results.py
+        # (`composite_avg_rank`), which is rank-based and scale-free; a
+        # single-run scalar headline is not recoverable from one row, so no
+        # per-run replacement is emitted here.
     }

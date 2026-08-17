@@ -803,10 +803,22 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             if cfg.training.composite_eval_json
             else Path(cfg.training.output_dir) / "composite_ranker.json"
         )
-        composite = run_composite_eval(eager_model, cfg, device=device)
+        # Run the composite on the SAME weights the final val metrics above used.
+        # Previously this always passed `eager_model` (raw weights) even when
+        # ema_decay > 0, so the val metrics that sort sweep decisions described
+        # the EMA model while the composite ranked the raw one — two different
+        # models in the same decision. The EMA copy is an eager deepcopy that is
+        # never compiled, so run_composite_eval's model.eval()/train() handling
+        # applies to it unchanged (it stays in eval() throughout, like any
+        # eval-only model).
+        composite_model = ema_model if ema_model is not None else eager_model
+        composite_weights = "ema" if ema_model is not None else "raw"
+        composite = run_composite_eval(composite_model, cfg, device=device)
+        composite["eval_weights"] = composite_weights
         composite_path.parent.mkdir(parents=True, exist_ok=True)
         composite_path.write_text(json.dumps(composite, indent=2, sort_keys=True))
         metrics["composite_ranker_json"] = str(composite_path)
+        metrics["composite_eval_weights"] = composite_weights
     if cfg.training.metrics_json:
         metrics_path = Path(cfg.training.metrics_json)
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
