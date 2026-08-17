@@ -355,6 +355,63 @@ def test_fp8_head_eval_path_runs_on_cuda():
     assert torch.isfinite(out["loss"])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 needs CUDA")
+def test_fp8_head_matches_bf16_head():
+    """The FP8 head must approximate the BF16 head, not just produce finite
+    output. The original implementation cast the UNSCALED tensors to e4m3 and
+    passed amax/448 as the `_scaled_mm` scales, so the logits came out scaled
+    by ~(amax_x/448)*(amax_w/448) ≈ 3e-5 — the softmax collapsed to uniform and
+    eval loss was exactly ln(vocab). It also used amax instead of abs().amax(),
+    breaking rows whose largest magnitude is negative. Pinned here against the
+    bf16 head so neither regression can recur silently."""
+    torch.manual_seed(0)
+    cfg = tiny(num_layers=2, fp8_lm_head=True)
+    model = build_model(cfg).to("cuda").to(torch.bfloat16).eval()
+    ids = torch.randint(0, cfg.vocab_size, (2, 16), device="cuda")
+    with torch.no_grad():
+        x_normed = model.ln(model.token(ids))
+        fp8_logits = model._fp8_head(x_normed).float()
+        ref = model.head(x_normed).float()
+
+    # Magnitude must be preserved: relative Frobenius error in the e4m3 band,
+    # not the ~1.0 of an unscaled output.
+    rel_err = (fp8_logits - ref).norm() / ref.norm()
+    assert rel_err < 0.05, f"fp8 head deviates from bf16 head: {rel_err:.4f}"
+
+    # Next-token CE must track the bf16 head (init CE is legitimately far from
+    # ln(vocab) here — the tied head is overconfident at init — so closeness to
+    # the bf16 reference is the invariant, not an absolute band).
+    labels = ids[:, 1:].reshape(-1)
+    ce_fp8 = torch.nn.functional.cross_entropy(fp8_logits[:, :-1].reshape(-1, cfg.vocab_size), labels)
+    ce_ref = torch.nn.functional.cross_entropy(ref[:, :-1].reshape(-1, cfg.vocab_size), labels)
+    assert abs(ce_fp8.item() - ce_ref.item()) < 0.1
+
+    # Magnitude preserved: the original bug shrank ||logits|| by ~3e-5.
+    assert 0.9 < (fp8_logits.norm() / ref.norm()).item() < 1.1
+
+    # eval-mode forward routes through the FP8 head and stays consistent.
+    with torch.no_grad():
+        out = model(ids, labels=ids)
+    assert out["logits"].shape == (2, 16, cfg.vocab_size)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 needs CUDA")
+def test_fp8_head_negative_shifted_activations():
+    """abs-amax regression: a row whose largest magnitude is negative must get a
+    positive scale derived from |x|, not from max(x)."""
+    torch.manual_seed(1)
+    cfg = tiny(num_layers=2, fp8_lm_head=True)
+    model = build_model(cfg).to("cuda").to(torch.bfloat16).eval()
+    ids = torch.randint(0, cfg.vocab_size, (2, 16), device="cuda")
+    with torch.no_grad():
+        x_normed = model.ln(model.token(ids)) - 2.5  # skew all-negative
+        fp8_logits = model._fp8_head(x_normed).float()
+        ref = model.head(x_normed).float()
+    rel_err = (fp8_logits - ref).norm() / ref.norm()
+    assert rel_err < 0.05, f"negative-skewed rows mishandled: {rel_err:.4f}"
+    assert torch.isfinite(fp8_logits).all()
+
+
 # ===========================================================================
 # S4 — BF16 Cross-Entropy
 # ===========================================================================

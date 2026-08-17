@@ -846,21 +846,35 @@ class CausalLM(nn.Module):
     def _fp8_head(self, x_normed: torch.Tensor) -> torch.Tensor:
         """FP8 matmul for the lm_head projection via torch._scaled_mm (S3).
 
-        Requires BF16 activations + CUDA (Blackwell/Hopper). Computes per-row
-        amax scales, casts to float8_e4m3fn, runs `_scaled_mm`, casts logits
-        back to BF16. The cast is on a view of the tied embedding weight -
-        master weights stay BF16.
+        Requires BF16 activations + CUDA (Blackwell/Hopper). Row-wise scales
+        from abs-amax, the tensors are DIVIDED BY THEIR SCALE before the e4m3
+        cast (so each row fills the ±448 range), `_scaled_mm` multiplies the
+        scales back, and the logits return as BF16. The weight cast is on a
+        view of the tied embedding — master weights stay BF16.
+
+        The original implementation cast the UNSCALED tensors and passed
+        `amax/448` as the scales, so `_scaled_mm` shrank the logits by
+        ~(amax_x/448)*(amax_w/448) ≈ 3e-5: the softmax collapsed to uniform and
+        any eval with `fp8_lm_head: true` reported exactly ln(vocab) loss. It
+        also used `amax` rather than `abs().amax()`, giving wrong (possibly
+        negative) scales for rows whose largest magnitude is negative. Both
+        fixed here; pinned by a numerical-agreement test against the bf16 head
+        (tests/test_training_speedups.py, test_fp8_head_matches_bf16_head).
         """
         B, T, D = x_normed.shape
         x2d = x_normed.reshape(-1, D)  # (B*T, D)
         w = self.head.weight  # (vocab, D), tied to the embedding
-        x_fp8 = x2d.to(torch.float8_e4m3fn)
-        w_fp8 = w.to(torch.float8_e4m3fn)
-        # Row-wise per-tensor scaling (amax / FP8_E4M3 max = 448.0). _scaled_mm
-        # requires float32 scales; for row-wise scaling scale_a is (M, 1) and
-        # scale_b is (1, N) matching the output (M, N) = (B*T, vocab) shape.
-        scale_a = (x2d.amax(dim=-1, keepdim=True).float() / 448.0)  # (B*T, 1)
-        scale_b = (w.amax(dim=-1, keepdim=True).t().contiguous().float() / 448.0)  # (1, vocab)
+        # Row-wise abs-amax scales (FP8_E4M3 max = 448.0). `_scaled_mm` requires
+        # float32 scales; row-wise scaling wants scale_a (M, 1) and scale_b
+        # (1, N) against the output (M, N) = (B*T, vocab). The eps floor keeps
+        # an all-zero row from producing a zero scale.
+        scale_a = x2d.abs().amax(dim=-1, keepdim=True).float().div(448.0).clamp_min(1e-12)
+        scale_b = w.abs().amax(dim=-1, keepdim=True).t().contiguous().float().div(448.0).clamp_min(1e-12)
+        # Divide FIRST (in fp32 so the division is exact), then cast: after this
+        # every row's max magnitude is ~448, i.e. the e4m3 mantissa is actually
+        # used. `_scaled_mm` re-multiplies by the scales, restoring magnitude.
+        x_fp8 = (x2d.float() / scale_a).to(torch.float8_e4m3fn)
+        w_fp8 = (w.float() / scale_b.t()).to(torch.float8_e4m3fn)
         logits2d = torch._scaled_mm(
             x_fp8, w_fp8.t(),
             scale_a=scale_a, scale_b=scale_b,

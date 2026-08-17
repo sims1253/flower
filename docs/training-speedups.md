@@ -283,15 +283,16 @@ loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:
 x_normed = self.ln(x)
 if self.config.fp8_lm_head and x_normed.dtype == torch.bfloat16:
     # FP8 matmul for the head projection
-    w_fp8 = self.head.weight.to(torch.float8_e4m3fn)
-    x_fp8 = x_normed.to(torch.float8_e4m3fn)
-    # Use torch._scaled_mm for FP8 matmul (requires scale tensors)
-    # On Blackwell (sm_120+), this uses the FP8 Transformer Engine
-    scale_a = x_normed.amax(dim=-1, keepdim=True) / 448.0  # FP8 E4M3 max
-    scale_b = self.head.weight.amax(dim=-1, keepdim=True) / 448.0
+    # abs-amax row scales; DIVIDE by the scale before the e4m3 cast so each
+    # row fills the +-448 range -- _scaled_mm multiplies the scales back.
+    scale_a = x_normed.abs().amax(dim=-1, keepdim=True).float() / 448.0
+    scale_b = self.head.weight.abs().amax(dim=-1, keepdim=True).float() / 448.0
+    x_fp8 = (x_normed.float() / scale_a).to(torch.float8_e4m3fn)
+    w_fp8 = (self.head.weight.float() / scale_b).to(torch.float8_e4m3fn)
     logits = torch._scaled_mm(
         x_fp8, w_fp8.t(),
-        scale_a=scale_a, scale_b=scale_b,
+        scale_a=scale_a.t().contiguous() if scale_a.shape[0] == 1 else scale_a,
+        scale_b=scale_b.view(1, -1).contiguous(),
         out_dtype=torch.bfloat16,
     )
 else:
@@ -301,8 +302,10 @@ else:
 **Step 2**: Add config flag to `ModelConfig` in `flower/config.py`:
 
 ```python
-# Use FP8 matmul for the lm_head projection. Requires BF16 training precision
-# and Blackwell/Hopper GPU (sm_90+). Negligible quality impact.
+# Use FP8 matmul for the lm_head projection (EVAL ONLY -- _scaled_mm has no
+# backward). Requires BF16 activations + CUDA (sm_89+). Quality impact: ~3-4%
+# norm-relative logit error vs the bf16 head (e4m3 quantization), pinned by
+# tests/test_training_speedups.py::test_fp8_head_matches_bf16_head.
 fp8_lm_head: bool = False
 ```
 
@@ -320,8 +323,12 @@ fp8_lm_head: bool = False
 # Run the precision benchmark script to compare
 uv run python scripts/bench_precision.py
 
-# Train 100 steps with fp8_lm_head=True and compare val loss
-# to the same run with fp8_lm_head=False. Loss difference should be <0.01.
+# The flag is eval-only, so train loss is identical with it on or off;
+# compare EVAL loss instead. NOTE: the original implementation of this flag
+# was broken (unscaled cast -> logits ~3e-5x too small -> eval loss exactly
+# ln(vocab)); any eval result recorded with fp8_lm_head=True before the fix
+# is invalid. The corrected path is pinned against the bf16 head by
+# tests/test_training_speedups.py::test_fp8_head_matches_bf16_head.
 ```
 
 ---
