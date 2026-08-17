@@ -276,27 +276,23 @@ loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:
 **Step 1**: Add FP8 support to the head computation. Use `torch.float8_e4m3fn` for the matmul, then cast logits back to bf16/fp32 for the loss.
 
 ```python
-# In CausalLM.forward, replace:
-#   logits = self.head(self.ln(x))
-# with:
+# Sketch of CausalLM._fp8_head (see flower/models/base.py for the real code,
+# which this must stay in sync with). _scaled_mm needs 2D inputs and float32
+# scales: scale_a is (rows, 1), scale_b is (1, vocab).
 
-x_normed = self.ln(x)
-if self.config.fp8_lm_head and x_normed.dtype == torch.bfloat16:
-    # FP8 matmul for the head projection
-    # abs-amax row scales; DIVIDE by the scale before the e4m3 cast so each
-    # row fills the +-448 range -- _scaled_mm multiplies the scales back.
-    scale_a = x_normed.abs().amax(dim=-1, keepdim=True).float() / 448.0
-    scale_b = self.head.weight.abs().amax(dim=-1, keepdim=True).float() / 448.0
-    x_fp8 = (x_normed.float() / scale_a).to(torch.float8_e4m3fn)
-    w_fp8 = (self.head.weight.float() / scale_b).to(torch.float8_e4m3fn)
-    logits = torch._scaled_mm(
-        x_fp8, w_fp8.t(),
-        scale_a=scale_a.t().contiguous() if scale_a.shape[0] == 1 else scale_a,
-        scale_b=scale_b.view(1, -1).contiguous(),
-        out_dtype=torch.bfloat16,
-    )
-else:
-    logits = self.head(x_normed)
+x2d = self.ln(x).reshape(-1, D)               # (B*T, D)
+w = self.head.weight                          # (vocab, D), tied to the embedding
+# abs-amax row scales; DIVIDE by the scale before the e4m3 cast so each row
+# fills the +-448 range -- _scaled_mm multiplies the scales back.
+scale_a = x2d.abs().amax(dim=-1, keepdim=True).float().div(448.0).clamp_min(1e-12)
+scale_b = w.abs().amax(dim=-1, keepdim=True).t().contiguous().float().div(448.0).clamp_min(1e-12)
+x_fp8 = (x2d.float() / scale_a).to(torch.float8_e4m3fn)
+w_fp8 = (w.float() / scale_b.t()).to(torch.float8_e4m3fn)
+logits2d = torch._scaled_mm(
+    x_fp8, w_fp8.t(),
+    scale_a=scale_a, scale_b=scale_b,
+    out_dtype=torch.bfloat16,
+)
 ```
 
 **Step 2**: Add config flag to `ModelConfig` in `flower/config.py`:
