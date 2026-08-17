@@ -510,7 +510,14 @@ class StillCompactorSpectral(StillCompactor):
             d = self.head_dim
             # Key: random orthogonal-ish projection (rows of the weight are random unit vectors).
             kw = self.key_signal.weight  # (r_k, d)
-            nn.init.orthogonal_(self.key_reconstruct.weight)  # (d, r_k) -- but we need (d, r_k)
+            # Value-dead by intent: the weight is fully overwritten a few
+            # lines below. The call exists ONLY because it consumes global
+            # RNG draws, and every draw after it (the kaiming_normal_ below
+            # and all subsequent inits) is part of the seeded stream — this
+            # repo pins bit-repro of published runs, so removing the call
+            # silently shifted every seeded spectral-compactor init
+            # downstream.
+            nn.init.orthogonal_(self.key_reconstruct.weight)  # (d, r_k)
             # Actually init key_reconstruct as the pseudo-inverse of key_signal.
             nn.init.kaiming_normal_(kw, a=0.0)
             # key_reconstruct should be the transpose-ish of key_signal for identity-like behavior.
@@ -703,32 +710,6 @@ class StillCompactorFlow(StillCompactor):
             nn.init.zeros_(self.context_proj_v.bias)
             nn.init.zeros_(self.context_proj_v.weight)
             nn.init.zeros_(self.context_proj_k.bias)
-
-    def _compute_context(self, keys_free: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pool full KV cache into conditioning vectors for latents.
-
-        Returns per-latent context (mean + max pooling weighted by latent similarity).
-        """
-        B, H, T, d = keys_free.shape
-        x = torch.cat([keys_free, values], dim=-1)  # (B, H, T, 2d)
-
-        z = self.latents.unsqueeze(0).expand(B, -1, -1, -1)  # (B, H, t, d_latent)
-        t = self.compact_len
-
-        # Lightweight attention: each latent attends to cache to get context.
-        # Use the first block's cross-attention for context extraction.
-        block0 = self.blocks[0]
-        z_norm = block0.norm1(z)
-        context = block0.cross_attn(z_norm, x, key_positions=None)  # (B, H, t, d_latent)
-
-        # Project to conditioning dimension.
-        # context is d_latent dim; we need d_cond dim.
-        # Use context from cross-attention directly as conditioning.
-        # Pad or project to d_cond.
-        cond_k = self.context_proj_k(x.mean(dim=2, keepdim=True).expand(B, H, t, 2 * d))
-        cond_v = self.context_proj_v(x.max(dim=2).values.unsqueeze(2).expand(B, H, t, 2 * d))
-        cond = cond_k + cond_v + context[:, :, :, :4 * d] if context.shape[-1] >= 4 * d else cond_k + cond_v
-        return cond, context
 
     def forward(
         self,

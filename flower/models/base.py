@@ -276,6 +276,37 @@ def _get_or_build_block_mask(module: nn.Module, seq_len: int, device: torch.devi
     )
 
 
+def _get_or_build_causal_bool_mask(module: nn.Module, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Cached (T, T) bool causal/local mask for an attention module (True = attend).
+
+    Single source of truth for the dense-path mask cache that the per-attention-
+    module ``_get_causal_bool_mask`` methods (FlowAttention, HamiltonianAttention)
+    delegate to — the bool-mask twin of ``_get_or_build_block_mask``. The cache
+    lives on the module, keyed on ``(seq_len, local_window, device)``, so the
+    dense path does not rebuild the mask every forward.
+
+    Eager mode: build+cache on miss. Under ``torch.compile`` (``is_compiling()``
+    is True): read-only — never mutate module state inside the graph, because an
+    in-graph ``self._cached_attn_mask = ...`` assignment is captured by Dynamo
+    and aliases the tensor across the per-layer reads, which cudagraph mode
+    rejects. A cold cache under compile rebuilds without storing — the
+    pre-caching per-forward behaviour, so no regression, just no win.
+    """
+    hit = (
+        module._cached_attn_mask is not None
+        and seq_len == module._cached_mask_seq_len
+        and module.local_window == module._cached_mask_window
+        and module._cached_attn_mask.device == device
+    )
+    if torch.compiler.is_compiling():
+        return module._cached_attn_mask if hit else causal_mask(seq_len, device, module.local_window)
+    if not hit:
+        module._cached_attn_mask = causal_mask(seq_len, device, module.local_window)
+        module._cached_mask_seq_len = seq_len
+        module._cached_mask_window = module.local_window
+    return module._cached_attn_mask
+
+
 def prebuild_attention_masks(model: nn.Module, seq_len: int, device: torch.device) -> None:
     """Eagerly populate every flex-attention module's cached BlockMask.
 
@@ -713,6 +744,16 @@ class CausalLM(nn.Module):
         # defer to first use and fall back to eager if it is unavailable or the
         # device is not CUDA. See `_fused_cross_entropy`.
         self.fused_linear_ce = bool(getattr(config, "fused_linear_ce", False))
+        # S14-5b eval extension: with this on, the fused path above also serves
+        # LOSS-ONLY eval forwards (validation), where the eager head's
+        # (B*T, vocab) logits tensor is the eval-time memory spike. Requires
+        # `fused_linear_ce` (it extends that flag, not replaces it) and a
+        # labels-carrying forward; logits come back None, so logits consumers
+        # (probes, Still teacher pass) must keep it off — run_composite_eval
+        # save/restores it to False around its own forwards. Inherits the
+        # training flag's off-CUDA eager fallback (one-time warning). See the
+        # config field docstring in flower/config.py for the full contract.
+        self.fused_linear_ce_eval = bool(getattr(config, "fused_linear_ce_eval", False))
         self._liger_fce: Any = None
         # S14-checkpoint: activation checkpointing on the transformer blocks.
         # Stored verbatim (False | True | "selective") so forward can branch on
@@ -846,21 +887,35 @@ class CausalLM(nn.Module):
     def _fp8_head(self, x_normed: torch.Tensor) -> torch.Tensor:
         """FP8 matmul for the lm_head projection via torch._scaled_mm (S3).
 
-        Requires BF16 activations + CUDA (Blackwell/Hopper). Computes per-row
-        amax scales, casts to float8_e4m3fn, runs `_scaled_mm`, casts logits
-        back to BF16. The cast is on a view of the tied embedding weight -
-        master weights stay BF16.
+        Requires BF16 activations + CUDA (Blackwell/Hopper). Row-wise scales
+        from abs-amax, the tensors are DIVIDED BY THEIR SCALE before the e4m3
+        cast (so each row fills the ±448 range), `_scaled_mm` multiplies the
+        scales back, and the logits return as BF16. The weight cast is on a
+        view of the tied embedding — master weights stay BF16.
+
+        The original implementation cast the UNSCALED tensors and passed
+        `amax/448` as the scales, so `_scaled_mm` shrank the logits by
+        ~(amax_x/448)*(amax_w/448) ≈ 3e-5: the softmax collapsed to uniform and
+        any eval with `fp8_lm_head: true` reported exactly ln(vocab) loss. It
+        also used `amax` rather than `abs().amax()`, giving wrong (possibly
+        negative) scales for rows whose largest magnitude is negative. Both
+        fixed here; pinned by a numerical-agreement test against the bf16 head
+        (tests/test_training_speedups.py, test_fp8_head_matches_bf16_head).
         """
         B, T, D = x_normed.shape
         x2d = x_normed.reshape(-1, D)  # (B*T, D)
         w = self.head.weight  # (vocab, D), tied to the embedding
-        x_fp8 = x2d.to(torch.float8_e4m3fn)
-        w_fp8 = w.to(torch.float8_e4m3fn)
-        # Row-wise per-tensor scaling (amax / FP8_E4M3 max = 448.0). _scaled_mm
-        # requires float32 scales; for row-wise scaling scale_a is (M, 1) and
-        # scale_b is (1, N) matching the output (M, N) = (B*T, vocab) shape.
-        scale_a = (x2d.amax(dim=-1, keepdim=True).float() / 448.0)  # (B*T, 1)
-        scale_b = (w.amax(dim=-1, keepdim=True).t().contiguous().float() / 448.0)  # (1, vocab)
+        # Row-wise abs-amax scales (FP8_E4M3 max = 448.0). `_scaled_mm` requires
+        # float32 scales; row-wise scaling wants scale_a (M, 1) and scale_b
+        # (1, N) against the output (M, N) = (B*T, vocab). The eps floor keeps
+        # an all-zero row from producing a zero scale.
+        scale_a = x2d.abs().amax(dim=-1, keepdim=True).float().div(448.0).clamp_min(1e-12)
+        scale_b = w.abs().amax(dim=-1, keepdim=True).t().contiguous().float().div(448.0).clamp_min(1e-12)
+        # Divide FIRST (in fp32 so the division is exact), then cast: after this
+        # every row's max magnitude is ~448, i.e. the e4m3 mantissa is actually
+        # used. `_scaled_mm` re-multiplies by the scales, restoring magnitude.
+        x_fp8 = (x2d.float() / scale_a).to(torch.float8_e4m3fn)
+        w_fp8 = (w.float() / scale_b.t()).to(torch.float8_e4m3fn)
         logits2d = torch._scaled_mm(
             x_fp8, w_fp8.t(),
             scale_a=scale_a, scale_b=scale_b,
@@ -1106,11 +1161,24 @@ class CausalLM(nn.Module):
                     site += 1
         x_normed = self.ln(x)
         loss = None
-        # S14-5b: fused lm_head + CE path. Training-time only, CUDA/Triton only.
-        # When active the (B*T, vocab) logits tensor is never materialized, so
-        # `logits` stays None and every eval/logprob consumer (which runs in
-        # eval mode or without labels) keeps the eager path below. Falls back to
-        # eager automatically if Liger is unavailable or the device is not CUDA.
+        # S14-5b: fused lm_head + CE path. CUDA/Triton only. Active during
+        # training (fused_linear_ce) and, with `fused_linear_ce_eval`, for
+        # LOSS-ONLY eval forwards carrying labels — the eval-time (B*T, vocab)
+        # logits spike (see config). When active the logits tensor is never
+        # materialized, so `logits` stays None: every consumer that runs without
+        # labels (logprob/probe scoring) keeps the eager path below regardless
+        # of the flag, and label-carrying loss-only consumers (train.py
+        # evaluate()) get the memory saving. Falls back to eager automatically
+        # if Liger is unavailable or the device is not CUDA.
+        #
+        # fp8_lm_head INTERACTION: at eval the eager path below routes the head
+        # matmul through the FP8 `_fp8_head` when fp8_lm_head is set, while the
+        # fused path here runs the plain (bf16 matmul, fp32-accumulated) Liger
+        # kernel — no FP8. So with fp8_lm_head on, fused_linear_ce_eval changes
+        # eval numbers through BOTH the Liger/bf16 reduction gap AND the loss
+        # of the FP8 quantization. Val metrics are not comparable across the
+        # flag switch in that configuration (or any other — see the config
+        # comment); pick one state per sweep.
         # S9 TST: bagged labels are (B, T/s, s) and need the multi-hot objective,
         # which neither the eager nor the Liger CE path implements. Handled first
         # so the flags below cannot route a bagged batch into a 2-D loss.
@@ -1121,7 +1189,7 @@ class CausalLM(nn.Module):
 
         use_fused_ce = (
             self.fused_linear_ce
-            and self.training
+            and (self.training or self.fused_linear_ce_eval)
             and labels is not None
             and self._ensure_liger_fce()
         )
@@ -1131,7 +1199,15 @@ class CausalLM(nn.Module):
             loss = self._fused_cross_entropy(x_normed, labels, self.token.weight, offset=1)
             # S8 MTP heads: each untied head predicts t+2, t+3, ... The fused
             # path applies the per-head shift inside `_fused_cross_entropy`.
-            if self.mtp_heads is not None:
+            #
+            # `self.training` GUARD IS LOAD-BEARING and mirrors the eager
+            # branch below (see its comment): MTP is a TRAINING-ONLY auxiliary
+            # objective, and eval — including the fused-eval path this branch
+            # now serves — must report the t+1 loss alone (guarded by
+            # tests/test_fused_eval_ce.py). Without it, enabling
+            # fused_linear_ce_eval would reintroduce exactly the eval-loss leak
+            # tests/test_mtp_eval_loss.py pinned, through this branch.
+            if self.mtp_heads is not None and self.training:
                 for i, mtp_head in enumerate(self.mtp_heads):
                     mtp_loss = self._fused_cross_entropy(
                         x_normed, labels, mtp_head.weight, offset=i + 2

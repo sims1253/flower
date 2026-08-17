@@ -265,6 +265,40 @@ class ModelConfig:
     # kernel); the forward falls back to the eager path automatically when the
     # flag is on but CUDA is unavailable. False reproduces old runs exactly.
     fused_linear_ce: bool = False
+    # S14-5b (eval extension): use the Liger fused lm_head+CE path for
+    # LOSS-ONLY eval forwards (validation / final evaluate()), where the eager
+    # head otherwise materializes the full (B*T, vocab) logits tensor plus the
+    # CE's fp32 log-softmax — at the 450M config (seq 8192, vocab 16384, bf16)
+    # ~0.5 GB for logits alone per forward, transiently ~1.5 GB with the CE
+    # reductions. That spike is what forces `eval_batch_size: 1` and
+    # `vram_fraction: 0.95` in the production configs.
+    #
+    # HONEST CONTRACT:
+    #   - Requires `fused_linear_ce: true` — this flag EXTENDS that fused path
+    #     from training to eval; alone it does nothing.
+    #   - With it on, a labels-carrying eval forward returns loss with
+    #     logits=None. Any consumer that needs logits (composite probes, the
+    #     Still teacher pass, logprob scoring) must run with it off. Probes
+    #     force it off internally (run_composite_eval save/restores it).
+    #   - CUDA/Triton-only, inheriting the training flag's fallback: off-CUDA
+    #     the eval forward silently runs the eager path (one-time warning).
+    #   - MTP aux losses stay training-only (eval still reports the t+1 loss).
+    #   - VAL METRICS ARE NOT COMPARABLE ACROSS FLAG STATES at sweep
+    #     resolution: the fused and eager eval losses differ by the Liger/bf16
+    #     reduction gap (~1.1e-3 RELATIVE at loss ~9.8, i.e. 0.011 nats ≈
+    #     0.016 bpb at bytes_per_token≈1) — ~40x the 0.0004 bpb seed band this
+    #     repo decides sweeps at (docs/profiling/speedup_results.md). Pick ONE
+    #     flag state for a whole sweep and stay in it; never compare arms
+    #     across the switch.
+    #   - With `fp8_lm_head` set, the flag changes eval numbers through TWO
+    #     mechanisms at once: flag-OFF eval measures the loss through the
+    #     FP8-quantized head (`_compute_logits` -> `_fp8_head`, eval-only),
+    #     while flag-ON eval goes through the fused Liger path (bf16 matmul,
+    #     fp32 CE accumulation — no FP8). Flipping the flag there conflates
+    #     the reduction gap with the FP8 quantization error; the sign of the
+    #     difference is not attributable to either alone.
+    #   - Default False reproduces every existing run exactly.
+    fused_linear_ce_eval: bool = False
     # S8: Multi-Token Prediction (final-runs only; changes the loss surface).
     # Predicts N extra future tokens with untied heads; aux losses weighted by
     # mtp_weight. 0 disables (standard next-token loss).
@@ -352,6 +386,74 @@ class ModelConfig:
     # preserved. False reproduces the legacy autograd path bit-for-bit (old
     # runs and checkpoints reproduce).
     titans_analytical_surprise: bool = False
+    # Titans inner-loss reduction (train/eval consistency fix).
+    #
+    # THE BUG: the inner associative-retrieval MSE is reduced with a mean over
+    # the batch AND feature dims (factor 2/(B*D) in the analytical surprise
+    # path; the legacy autograd path's F.mse_loss default is the same B*D
+    # mean). Titans memory writes are alpha * write_scale * surprise, so every
+    # write scales with 1/B: measured at init, mean |memory| after block 0 is
+    # ~7.8e-4 at B=1 vs ~4.7e-5 at B=16 — memory writes at batch 1 are ~16x
+    # larger than anything a batch-16 training run ever produced. Training
+    # runs at training.batch_size, but flower/eval.py's document-level paths
+    # (evaluate_documents, sliding_window_document_loss) score one document at
+    # a time (B=1), so titans doc-level bpb is computed with batch_size-x
+    # larger memory writes than training, and the two eval paths disagree with
+    # each other.
+    #
+    # False (default) keeps the legacy B-dependent reduction and reproduces
+    # every published run bit-for-bit.
+    #
+    # True switches BOTH surprise paths (analytical and autograd) to a
+    # per-sample reduction: sum over batch, mean over D only (factor 2/D).
+    # Memory dynamics become batch-size-invariant and the B=1 document eval
+    # sees the same write magnitudes as B=N training.
+    #
+    # Interaction with causal_memory: the causal write path is per-position
+    # and already per-row (each (batch, position) row's surprise is the
+    # gradient of its OWN MSE with factor 2/D — the per-position fix from the
+    # causal-memory branch), so titans_per_sample_loss is a bitwise identity
+    # when causal_memory=True (factor 2/D == 2/(1*D) at B=1... more precisely
+    # the flag's rescale-by-rows cancels exactly in real arithmetic and is
+    # ulp-different in fp); it only affects the non-causal window-aggregated
+    # write.
+    #
+    # Note the flag is also a bitwise identity at B=1 on the non-causal path
+    # (2/D == 2/(1*D)), so it changes nothing about the B=1 doc-level eval
+    # paths themselves — the consistency it delivers comes from TRAINING with
+    # it on (B=N dynamics then match B=1 eval). Enabling it mid-run makes the
+    # run incomparable to its own prefix; runs with it on are not comparable
+    # to runs with it off.
+    titans_per_sample_loss: bool = False
+    # ------------------------------------------------------------------
+    # Causal memory writes (correctness fix).
+    #
+    # THE BUG: every memory variant's write path aggregates the ENTIRE window
+    # — including tokens AFTER position t — into the memory bank (perceiver /
+    # max / mean / softmax summaries over all of x), and the next layer's
+    # mem_read broadcasts that bank to EVERY position. So logits[t] can depend
+    # on input tokens > t: empirically, perturbing only the LAST input token
+    # changes logits at positions 0..T-2 by up to 0.29 (linear_memory), 0.03
+    # (frequency_decay), 0.015 (bloom), 0.005 (summary), ... while vanilla_local
+    # is exactly 0. Because logits[t] predicts labels[t+1], a memory model can
+    # read its own answer out of memory, which taints every memory-vs-vanilla
+    # sweep comparison.
+    #
+    # False (default) keeps the legacy leaky write and reproduces every
+    # existing run bit-for-bit — bake-off results published so far were
+    # obtained with this behavior.
+    #
+    # True makes the memory visible at position t a function of tokens <= t
+    # only (token t itself is allowed): each block computes a per-position
+    # write from the layer input and accumulates it causally (running
+    # mean/sum via cumsum, running max via cummax, routed/softmax writes via
+    # masked cumulative sums), and the read at t consumes the per-position
+    # memory state at t. No new parameters — checkpoints stay loadable and
+    # param counts are unchanged. Runs trained with the flag off are NOT
+    # comparable to runs with it on; rerun the bake-off with
+    # causal_memory: true before drawing memory-mechanism conclusions.
+    # ------------------------------------------------------------------
+    causal_memory: bool = False
 
     def __post_init__(self) -> None:
         # S13: validate the precision-routing fields. Keep the actual FP4/FP8

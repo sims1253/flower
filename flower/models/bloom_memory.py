@@ -102,6 +102,10 @@ class BloomMemoryBlock(nn.Module):
     def _initial_memory(self, x: torch.Tensor) -> torch.Tensor:
         return x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S, D) per-position memory state for causal_memory=True."""
+        return x.new_zeros(x.shape[0], x.shape[1], self.config.memory_slots, self.config.d_model)
+
     def _bloom_route(self, items: torch.Tensor) -> torch.Tensor:
         """Average of K soft hash routings -> (B, P, N_slots) write plan."""
         temp = max(float(self.config.bloom_temperature), 1e-3)
@@ -138,7 +142,28 @@ class BloomMemoryBlock(nn.Module):
                 self.last_diag_bloom_hash_divergence = float(kl.cpu())
         return plan
 
+    def _bloom_route_causal(self, items: torch.Tensor) -> torch.Tensor:
+        """Causal per-position analogue of ``_bloom_route``: items are (B, T, P, D)
+        per-position summary points, so the plan is (B, T, P, S). Same hashes,
+        temperature and K-averaging as the legacy route."""
+        temp = max(float(self.config.bloom_temperature), 1e-3)
+        logits = torch.einsum("btpd,kds->kbtps", items, self.hash_weights) / temp
+        stacked = logits.softmax(dim=-1)
+        plan = stacked.mean(dim=0)  # (B, T, P, S)
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                plan_safe = plan.clamp_min(1e-9)
+                stacked_safe = stacked.clamp_min(1e-9)
+                entropy = -(plan_safe * plan_safe.log()).sum(dim=-1).mean()
+                log_plan = plan_safe.log().unsqueeze(0)  # (1,B,T,P,S) broadcast
+                kl = (stacked_safe * (stacked_safe.log() - log_plan)).sum(dim=-1).mean()
+                self.last_diag_bloom_routing_entropy = float(entropy.cpu())
+                self.last_diag_bloom_hash_divergence = float(kl.cpu())
+        return plan
+
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if self.config.causal_memory:
+            return self._update_memory_causal(memory, x)
         bsz = x.shape[0]
         queries = self.summary_queries.expand(bsz, -1, -1)
         items = self.summary_attn(queries, x)  # (B, P, D)
@@ -147,9 +172,25 @@ class BloomMemoryBlock(nn.Module):
         per_slot_write = plan.transpose(1, 2) @ values  # (B, S, D)
         return memory + per_slot_write / float(max(1, self.config.num_layers))
 
+    def _update_memory_causal(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """causal_memory=True write: memory is a per-position state (B, T, S, D).
+
+        Same perceiver -> hash-route -> additive sparse write as the legacy
+        path (identical parameters), but the summary points at t are built
+        from tokens <= t only and the routed writes land in the slot state
+        at t.
+        """
+        bsz = x.shape[0]
+        queries = self.summary_queries.expand(bsz, -1, -1)
+        items = self.summary_attn.causal_forward(queries, x)  # (B, T, P, D)
+        plan = self._bloom_route_causal(items)  # (B, T, P, S)
+        values = self.write_value(items)  # (B, T, P, D)
+        per_slot_write = torch.einsum("btps,btpd->btsd", plan, values)  # (B, T, S, D)
+        return memory + per_slot_write / float(max(1, self.config.num_layers))
+
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if self.config.causal_memory else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))

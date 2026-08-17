@@ -12,6 +12,8 @@ wheels/
 # Run outputs and artifacts
 runs/
 runs_*.log
+# Training-loop stdout redirect (tensorboard logger), regenerated every run.
+tensorboard.log
 reports/
 data_cache/
 .pytest_cache/

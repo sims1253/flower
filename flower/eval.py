@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from flower.config import ExperimentConfig, load_config
-from flower.data import build_tokenizer, fineweb_validation_documents, token_batches
+from flower.data import build_tokenizer, fineweb_validation_documents, validation_token_batches
 from flower.models import build_model
 from flower.models.base import count_parameters
 from flower.train import resolve_device, set_global_seed
@@ -105,7 +105,12 @@ def evaluate_batches(
     *,
     batches_count: int,
 ) -> dict[str, float | int]:
-    batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
+    # Validation split, NOT the training stream. This used to call
+    # `token_batches(..., seed=cfg.training.seed)`, which maps to the TRAIN
+    # role (flower/data.py `token_batches`): on synthetic/mqar the seed equals
+    # the training seed, so every "eval" batch was bit-identical to the first
+    # training batches — the eval was scoring memorised data.
+    batches = validation_token_batches(cfg.data, cfg.training.batch_size, device)
     total_loss = 0.0
     total_tokens = 0
     start = time.perf_counter()
@@ -116,9 +121,14 @@ def evaluate_batches(
         else:
             input_ids, labels = batch, batch
         out = model(input_ids, labels=labels)
-        total_loss += float(out["loss"].cpu())
-        total_tokens += int((labels[:, 1:] != -100).sum().cpu())
-    loss = total_loss / max(batches_count, 1)
+        # Weight each batch's mean loss by its supervised-token count (same as
+        # train.py's `evaluate`). A plain mean-of-means is wrong whenever
+        # batches carry different numbers of supervised tokens, which the MQAR
+        # stream does by construction (variable num_pairs/num_queries per row).
+        token_count = int((labels[:, 1:] != -100).sum().cpu())
+        total_loss += float(out["loss"].cpu()) * max(token_count, 1)
+        total_tokens += token_count
+    loss = total_loss / max(total_tokens, 1)
     return {
         "loss": loss,
         "perplexity": math.exp(min(loss, 20.0)),
@@ -221,6 +231,41 @@ def evaluate_documents(
     return metrics
 
 
+def default_window_stride(window_size: int) -> int:
+    """Default sliding-window stride: a quarter of the window, capped at 64.
+
+    The code previously hardcoded 64 while the --stride help text promised a
+    `window_size//4` fallback that never ran — and a fixed 64 exceeds small
+    windows entirely (stride > window_size), leaving unscored gaps. This makes
+    code and help agree and keeps the stride proportional for small windows.
+    """
+    return min(64, max(1, window_size // 4))
+
+
+def sliding_window_starts(total_len: int, window_size: int, stride: int) -> list[int]:
+    """Window start offsets for sliding-window evaluation.
+
+    A stride ladder over the sequence PLUS a final clamped-to-the-end window.
+    Previously the ladder stopped at the last full stride start, so the tokens
+    of the final partial stride were never scored — while
+    `sliding_window_document_loss` still multiplied the window mean by
+    ``(len - 1)`` as if every token had been scored, silently attributing the
+    unscored tail the average of the scored prefix. The clamped final window
+    guarantees every token is inside at least one window whenever
+    ``stride <= window_size`` (strides larger than the window sample sparsely
+    by design; the tail is still always covered).
+    """
+    if total_len <= window_size:
+        # A single window covers (and CE-scores total_len - 1 predictions of)
+        # the whole sequence.
+        return [0]
+    starts = list(range(0, total_len - window_size + 1, stride))
+    last_start = total_len - window_size
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    return starts
+
+
 @torch.no_grad()
 def sliding_window_loss(
     model: torch.nn.Module,
@@ -244,7 +289,7 @@ def sliding_window_loss(
     # If the sequence is shorter than a full window, score it as a single
     # window of size T (CE then predicts T-1 tokens).
     effective_window = min(window_size, T)
-    for start in range(0, max(1, T - window_size + 1), stride):
+    for start in sliding_window_starts(T, window_size, stride):
         window = token_ids[start : start + effective_window].view(1, effective_window)
         out = model(window, labels=window)
         loss = out["loss"]
@@ -269,8 +314,11 @@ def sliding_window_document_loss(
     """Sliding-window evaluation mirroring `evaluate_documents`'s shape.
 
     Uses overlapping windows (stride < window_size) so every token is scored
-    with near-full backward context. Returns a point estimate only (no
-    bootstrap CI), keeping it cheaper to reason about than the chunk path.
+    with near-full backward context. `sliding_window_loss` includes a final
+    clamped-to-the-end window, so scaling its mean by (len - 1) here is
+    consistent: every predicted token really is inside a scored window.
+    Returns a point estimate only (no bootstrap CI), keeping it cheaper to
+    reason about than the chunk path.
     """
     if cfg.data.dataset in {"synthetic", "mqar"}:
         batch_metrics = evaluate_batches(model, cfg, device, batches_count=max(1, doc_limit or 10))
@@ -347,7 +395,9 @@ def evaluate(argv: list[str] | None = None) -> dict[str, Any]:
         "--stride",
         type=int,
         default=None,
-        help="Window stride for --eval-mode sliding. Defaults to 64 (or window_size//4).",
+        help="Window stride for --eval-mode sliding. Defaults to min(64, window_size//4), "
+        "so small windows get a proportionally finer stride instead of a fixed 64 "
+        "that would exceed the window itself.",
     )
     args = parser.parse_args(argv)
 
@@ -397,7 +447,7 @@ def evaluate(argv: list[str] | None = None) -> dict[str, Any]:
     if args.eval_mode == "sliding":
         eval_seq_len = getattr(cfg.data, "eval_seq_len", None)
         window_size = eval_seq_len or cfg.data.sequence_length or cfg.model.max_seq_len
-        stride = args.stride or 64
+        stride = args.stride or default_window_stride(window_size)
         metrics = sliding_window_document_loss(
             model,
             cfg,

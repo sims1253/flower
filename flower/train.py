@@ -147,6 +147,12 @@ def evaluate(
         for _ in range(steps):
             input_ids, labels = unpack_batch(next(batches))
             with autocast_ctx(device, amp_dtype):
+                # Labels-carrying loss-only forward: when the model has
+                # fused_linear_ce_eval set (wired in train() right after the
+                # EMA deepcopy), this runs the Liger fused lm_head+CE and
+                # returns loss with logits=None — evaluate() reads only the
+                # loss, so the eval logits memory spike disappears. Off
+                # (default) or off-CUDA, the eager logits path runs unchanged.
                 out = model(input_ids, labels=labels)
             loss = out["loss"]
             if loss is None:
@@ -458,6 +464,20 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         for module in ema_model.modules():
             if isinstance(module, CausalSelfAttention) and getattr(module, "use_flex", False):
                 module._flex_needs_compile = True
+    # S14-5b eval extension: fused CE at validation. CausalLM.__init__ already
+    # reads the config flag so `eager_model` carries it, but pin it EXPLICITLY
+    # on BOTH models here: the EMA copy above is a deepcopy taken at this point
+    # (before any later flag toggling), and both validate through
+    # evaluate() — the in-loop validation and the final-metrics evaluate()
+    # below both pass `ema_model if ema_model is not None else model`, so the
+    # attr must be True on whichever one runs. With the flag on, those
+    # labels-carrying eval forwards use the Liger fused lm_head+CE and never
+    # materialize the (B*T, vocab) logits tensor (see ModelConfig.
+    # fused_linear_ce_eval). No-op for non-CausalLM models and when off.
+    if getattr(cfg.model, "fused_linear_ce_eval", False):
+        for target in filter(None, (eager_model, ema_model)):
+            if hasattr(target, "fused_linear_ce_eval"):
+                target.fused_linear_ce_eval = True
     initialize_lr_schedule(optims)
     batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
     eval_bs = cfg.training.eval_batch_size or cfg.training.batch_size
@@ -477,6 +497,7 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     # displacement: the disk persists when a vast bid instance is stopped (not
     # destroyed), so re-launching the same trial picks up where it left off.
     resume_step = 0
+    skip_batches = 0
     if cfg.training.save_checkpoints and not args.smoke and output_dir.exists():
         ckpts = sorted(
             output_dir.glob(f"{cfg.model.variant}_step*.pt"),
@@ -503,9 +524,29 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             # No-op for new-format state_dicts.
             state = remap_legacy_mha_state_dict(state, bias=getattr(cfg.model, "use_bias", True))
             eager_model.load_state_dict(state)
-            for opt, opt_state in zip(optims, payload.get("optimizers", []), strict=False):
+            # Optimizer state must load 1:1. zip(strict=False) silently
+            # truncated on a count mismatch, leaving some optimizers on fresh
+            # state mid-run — momentum/exp_avg suddenly zero — with nothing in
+            # the logs to show for it. That happens exactly when the optimizer
+            # CONFIG changed between the original run and the resume (e.g.
+            # adamw -> muon builds a different number of optimizers), so fail
+            # loudly instead and make the operator resolve it.
+            opt_states = payload.get("optimizers", [])
+            if len(opt_states) != len(optims):
+                raise RuntimeError(
+                    f"checkpoint {latest} holds {len(opt_states)} optimizer state dicts "
+                    f"but this run built {len(optims)} optimizers — did training.optimizer "
+                    f"change between runs? Refusing to partially load optimizer state: a "
+                    f"half-restored optimizer silently corrupts the resumed trajectory."
+                )
+            for opt, opt_state in zip(optims, opt_states, strict=True):
                 opt.load_state_dict(opt_state)
             resume_step = int(payload.get("step", 0))
+            # Exact data-stream cursor for the fast-forward below (see the
+            # replay comment there). Legacy checkpoints predate the field and
+            # fall back to the old step*accum arithmetic of the CURRENT config.
+            accum_steps = max(1, int(cfg.training.gradient_accumulation_steps))
+            skip_batches = int(payload.get("data_batches_consumed", resume_step * accum_steps))
             if "rng_state" in payload:
                 torch.set_rng_state(payload["rng_state"].cpu())
             if "cuda_rng_state" in payload and device.type == "cuda":
@@ -514,13 +555,56 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
     # Fast-forward the data stream past batches already consumed before resume.
     # Synthetic/MQAR generators use their own RNG seeded at construction time,
     # so without this a resumed run replays identical data from step 0.
-    if resume_step > 0:
-        accum_steps = max(1, int(cfg.training.gradient_accumulation_steps))
-        for _ in range(resume_step * accum_steps):
+    #
+    # WHY THIS IS A REPLAY, NOT A SKIP (investigated against
+    # _FineWebChunkStream, not assumed): chunks are fixed-length cuts of a
+    # token buffer that runs across document boundaries, so which document
+    # lands at batch k is a function of the TOKEN COUNTS of every earlier
+    # document in the worker's shard — recoverable only by tokenizing them.
+    # A document-level cursor therefore cannot jump to a batch boundary
+    # without doing the very work it is trying to skip. A per-worker chunk
+    # cursor is equally unrecoverable: batches interleave chunks from multiple
+    # DataLoader workers in arrival order, and the checkpoint writer (this
+    # main process) has no visibility into where each worker stood when the
+    # checkpoint was taken. Every sound skip collapses back to "tokenize the
+    # prefix", which is exactly what the replay does. Wrong data order would
+    # be worse than slow, so the replay stays — but it now reports progress
+    # (every ~10%) so an operator watching a resumed fineweb run sit at step
+    # N+1 for an hour knows it is re-tokenizing, not hung. The exact number of
+    # batches to replay comes from the checkpoint's data_batches_consumed
+    # cursor (see the save below), so it stays correct even if
+    # gradient_accumulation_steps changed between runs.
+    if skip_batches > 0:
+        # This fast-forward is the FIRST consumer of the DataLoader on a
+        # resumed run, so its workers — the processes pinning the /dev/shm the
+        # watchdog guards — fork HERE, before start_shm_watchdog() below.
+        # Claim the process group before they do, so the watchdog's abort can
+        # killpg them. Idempotent (the watchdog claims again at start).
+        from flower.shm_guard import claim_process_group
+
+        claim_process_group()
+        print(
+            f"[resume] replaying {skip_batches} already-consumed batches through a fresh "
+            f"DataLoader (re-read + re-tokenize cost; see the replay comment in train.py)",
+            flush=True,
+        )
+        ff_start = time.perf_counter()
+        ff_mark = max(1, skip_batches // 10)
+        for consumed in range(1, skip_batches + 1):
             try:
                 next(batches)
             except StopIteration:
                 break
+            if consumed % ff_mark == 0 or consumed == skip_batches:
+                elapsed = max(time.perf_counter() - ff_start, 1e-9)
+                rate = consumed / elapsed
+                remaining_min = ((skip_batches - consumed) / rate / 60) if rate > 0 else 0.0
+                print(
+                    f"[resume] data replay {consumed}/{skip_batches} "
+                    f"({consumed / skip_batches:.0%}, {rate:.1f} batches/s, "
+                    f"~{remaining_min:.1f} min remaining)",
+                    flush=True,
+                )
     initialize_lr_schedule(optims)
 
     start = time.perf_counter()
@@ -745,6 +829,16 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
                     "model": eager_model.state_dict(),
                     "optimizers": [opt.state_dict() for opt in optims],
                     "rng_state": torch.get_rng_state(),
+                    # Exact data-stream cursor for the resume fast-forward:
+                    # batches pulled from the train stream since its (fresh)
+                    # creation in this process — the replayed prefix inherited
+                    # from the previous resume (skip_batches) plus accum per
+                    # step completed here. Derived arithmetically rather than
+                    # counted in the hot loop because the accumulation loop
+                    # above pulls exactly accum_steps batches per step,
+                    # structurally. Legacy checkpoints lack the field; the
+                    # fast-forward then falls back to step*accum.
+                    "data_batches_consumed": skip_batches + (step - resume_step) * accum_steps,
                 }
                 if device.type == "cuda":
                     payload["cuda_rng_state"] = torch.cuda.get_rng_state()
@@ -803,10 +897,22 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
             if cfg.training.composite_eval_json
             else Path(cfg.training.output_dir) / "composite_ranker.json"
         )
-        composite = run_composite_eval(eager_model, cfg, device=device)
+        # Run the composite on the SAME weights the final val metrics above used.
+        # Previously this always passed `eager_model` (raw weights) even when
+        # ema_decay > 0, so the val metrics that sort sweep decisions described
+        # the EMA model while the composite ranked the raw one — two different
+        # models in the same decision. The EMA copy is an eager deepcopy that is
+        # never compiled, so run_composite_eval's model.eval()/train() handling
+        # applies to it unchanged (it stays in eval() throughout, like any
+        # eval-only model).
+        composite_model = ema_model if ema_model is not None else eager_model
+        composite_weights = "ema" if ema_model is not None else "raw"
+        composite = run_composite_eval(composite_model, cfg, device=device)
+        composite["eval_weights"] = composite_weights
         composite_path.parent.mkdir(parents=True, exist_ok=True)
         composite_path.write_text(json.dumps(composite, indent=2, sort_keys=True))
         metrics["composite_ranker_json"] = str(composite_path)
+        metrics["composite_eval_weights"] = composite_weights
     if cfg.training.metrics_json:
         metrics_path = Path(cfg.training.metrics_json)
         metrics_path.parent.mkdir(parents=True, exist_ok=True)

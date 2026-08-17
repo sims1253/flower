@@ -88,6 +88,11 @@ def run_one(ckpt: Path, device: torch.device, doc_limit: int) -> dict[str, Any] 
         "needle_bp": needle["breaking_point"],
         "needle_curve": needle.get("capacity_curve", {}),
         "ablation_delta_bpb": ablation["delta_bpb"],
+        # False when the variant's memory read could not be ablated
+        # (memory_ablation_probe then reports NaN deltas) — carrying the flag
+        # through lets the aggregation below exclude such rows instead of
+        # letting NaN silently poison the mean and the rank agreement.
+        "ablated": bool(ablation["ablated"]),
     }
 
 
@@ -122,30 +127,48 @@ def main(argv: list[str] | None = None) -> None:
             vals = [float(r[key]) for r in _rows]
             return statistics.mean(vals), (statistics.pstdev(vals) if len(vals) > 1 else 0.0)
 
+        # Ablation rows are only meaningful when the probe actually patched
+        # something (`ablated: true`). For unpatchable variants the probe
+        # reports NaN deltas; a NaN through statistics.mean would propagate,
+        # and through sorted() would silently scramble the rank-agreement
+        # verdict below — so aggregate and rank only over measured rows.
+        ab_rows = [r for r in rows if r.get("ablated")]
         tr = agg("text_recall_bp")
         nd = agg("needle_bp")
-        ab = agg("ablation_delta_bpb")
+        ab = (
+            agg("ablation_delta_bpb", ab_rows)
+            if ab_rows
+            else (float("nan"), 0.0)
+        )
         summary[variant] = {
             "n": len(rows),
+            "n_ablated": len(ab_rows),
             "text_recall_bp": tr,
             "needle_bp": nd,
             "ablation_delta_bpb": ab,
         }
+        ab_str = f"{ab[0]:.4f}±{ab[1]:.4f}" if ab_rows else "unmeasured (read path unpatchable)"
         print(
             f"{variant:>22}  n={len(rows)}  "
             f"text_recall_bp={tr[0]:.1f}±{tr[1]:.1f}  "
             f"needle_bp={nd[0]:.2f}±{nd[1]:.2f}  "
-            f"ablation_delta={ab[0]:.4f}±{ab[1]:.4f}"
+            f"ablation_delta={ab_str}"
         )
 
-    # Rank agreement: text_recall vs ablation (both in-distribution).
-    variants = list(summary)
-    if len(variants) >= 2:
-        nd_rank = sorted(variants, key=lambda v: summary[v]["needle_bp"][0])
-        ab_rank = sorted(variants, key=lambda v: summary[v]["ablation_delta_bpb"][0])
+    # Rank agreement: needle vs ablation, over the variants where ablation was
+    # actually measured. Both rankings are computed on that same subset so the
+    # comparison is apples-to-apples.
+    measurable = [v for v in summary if summary[v]["n_ablated"] > 0]
+    if len(measurable) >= 2:
+        nd_rank = sorted(measurable, key=lambda v: summary[v]["needle_bp"][0])
+        ab_rank = sorted(measurable, key=lambda v: summary[v]["ablation_delta_bpb"][0])
         print("\nneedle_bp ranking (low->high):     ", " < ".join(nd_rank))
         print("ablation_delta ranking (low->high):", " < ".join(ab_rank))
         print("rankings agree:" if nd_rank == ab_rank else "rankings DIFFER:", nd_rank == ab_rank)
+    elif len(summary) >= 2:
+        skipped = [v for v in summary if v not in measurable]
+        print(f"\nrank agreement skipped: fewer than 2 variants have a measured "
+              f"ablation delta (unmeasured: {', '.join(skipped) or 'none'})")
 
     if args.json:
         Path(args.json).write_text(json.dumps({k: str(v) for k, v in summary.items()}, indent=2))

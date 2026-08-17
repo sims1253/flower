@@ -34,7 +34,7 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, causal_prefix_attention, causal_running_mean
 
 
 class SurpriseMemoryBlock(nn.Module):
@@ -79,7 +79,13 @@ class SurpriseMemoryBlock(nn.Module):
     def _initial_memory(self, x: torch.Tensor) -> torch.Tensor:
         return x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S, D) per-position memory state for causal_memory=True."""
+        return x.new_zeros(x.shape[0], x.shape[1], self.config.memory_slots, self.config.d_model)
+
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if self.config.causal_memory:
+            return self._update_memory_causal(memory, x)
         # Per-token surprise score from the judge.
         surprise = self.judge(x).squeeze(-1)  # (B, T)
         # Softmax-weighted summary: peaks at the most "surprising" tokens.
@@ -92,17 +98,47 @@ class SurpriseMemoryBlock(nn.Module):
 
         # Global write gate (one scalar per batch element).
         gate = torch.sigmoid(surprise.mean(dim=-1, keepdim=True) - self.surprise_threshold)
+        self._emit_diagnostics(gate, surprise)
+        return memory + gate.unsqueeze(-1) * candidate
+
+    def _update_memory_causal(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """causal_memory=True write: memory is a per-position state (B, T, S, D).
+
+        Same judge/gate/MLPs as the legacy write (no new parameters), but the
+        surprise-weighted summary at t softmaxes over tokens <= t only and the
+        gate at t is the sigmoid of the PREFIX-mean surprise.
+        """
+        # Per-token surprise score from the judge.
+        surprise = self.judge(x).squeeze(-1)  # (B, T)
+        # Prefix softmax: position t's summary weights tokens <= t only. The
+        # judge scores are the (single-row) attention logits over tokens.
+        scores = (surprise * self.config.surprise_scale).unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T)
+        token_summary = causal_prefix_attention(scores, x.unsqueeze(1))  # (B, 1, T, 1, D)
+        token_summary = token_summary.squeeze(1).squeeze(2).unsqueeze(2)  # (B, T, 1, D)
+        token_summary = token_summary.expand(-1, -1, self.config.memory_slots, -1)
+
+        combined = self.token_mlp(token_summary) + self.mem_mlp(memory)
+        candidate = self.update(combined) / float(max(1, self.config.num_layers))
+
+        # Global write gate, per position: sigmoid of the prefix-mean surprise.
+        gate = torch.sigmoid(causal_running_mean(surprise) - self.surprise_threshold)  # (B, T)
+        self._emit_diagnostics(gate, surprise)
+        return memory + gate.unsqueeze(-1).unsqueeze(-1) * candidate
+
+    def _emit_diagnostics(self, gate: torch.Tensor, surprise: torch.Tensor) -> None:
         # Diagnostics: track gate magnitude (is the judge actually firing?) and
         # surprise score spread (has the judge learned to discriminate, or
         # collapsed to a constant?).
-        with torch.no_grad():
-            self.last_diag_surprise_gate_mean = float(gate.mean().detach().cpu())
-            self.last_diag_surprise_score_std = float(surprise.std().detach().cpu())
-        return memory + gate.unsqueeze(-1) * candidate
+        # Skipped under torch.compile: the host syncs (float(...cpu())) graph-
+        # break the compiled region (same guard/pattern as bloom_memory).
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                self.last_diag_surprise_gate_mean = float(gate.mean().detach().cpu())
+                self.last_diag_surprise_score_std = float(surprise.std().detach().cpu())
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if self.config.causal_memory else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))

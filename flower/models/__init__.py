@@ -24,6 +24,14 @@ from flower.models.titans_mac import build_titans_mac_model
 from flower.models.vanilla import build_vanilla_model
 
 
+# NOTE: the base causal-memory PR (#5) briefly guarded the four flow hybrids
+# (flow_memory, flow_meanflow, flow_pma, fa_fm) behind
+# CAUSAL_MEMORY_UNSUPPORTED_VARIANTS because their writes ignored the flag.
+# This PR implements their causal writes, so every memory variant now honours
+# causal_memory and the guard is removed in full (see CAUSAL_MEMORY_VARIANTS
+# in tests/test_causal.py for the coverage matrix).
+
+
 def build_model(config: ModelConfig) -> CausalLM:
     variant = config.variant
     if variant == "vanilla_local":

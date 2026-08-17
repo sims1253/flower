@@ -67,18 +67,30 @@ class PhaseAssociativeBlock(nn.Module):
     def _initial_memory(self, x: torch.Tensor) -> torch.Tensor:
         return torch.zeros(x.shape[0], self.S, self.P, dtype=torch.complex64, device=x.device)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S, P) per-position complex memory state for causal_memory=True."""
+        return torch.zeros(x.shape[0], x.shape[1], self.S, self.P, dtype=torch.complex64, device=x.device)
+
     def _aggregate_tokens(self, x: torch.Tensor) -> torch.Tensor:
         """Reduce (B, T, D) → (B, D) via max-pool over time. Same signal as the Sweep 1 winner."""
         return x.max(dim=1).values
 
     def _write(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        pooled = self._aggregate_tokens(x)  # (B, D)
+        causal = self.config.causal_memory
+        # Causal form: prefix max at t (torch.cummax), so the pooled token the
+        # binding is built from at t sees tokens <= t only. Same projections.
+        pooled = torch.cummax(x, dim=1).values if causal else self._aggregate_tokens(x)
         bsz = pooled.shape[0]
-        # (B, S, 2P) → S complex unit vectors of dim P per batch element.
-        keys = _to_unit_complex(self.proj_key(pooled).view(bsz, self.S, 2 * self.P))
-        vals = _to_unit_complex(self.proj_val(pooled).view(bsz, self.S, 2 * self.P))
+        if causal:
+            # (B, T, S, 2P) → S complex unit vectors of dim P per position.
+            keys = _to_unit_complex(self.proj_key(pooled).view(bsz, pooled.shape[1], self.S, 2 * self.P))
+            vals = _to_unit_complex(self.proj_val(pooled).view(bsz, pooled.shape[1], self.S, 2 * self.P))
+        else:
+            # (B, S, 2P) → S complex unit vectors of dim P per batch element.
+            keys = _to_unit_complex(self.proj_key(pooled).view(bsz, self.S, 2 * self.P))
+            vals = _to_unit_complex(self.proj_val(pooled).view(bsz, self.S, 2 * self.P))
         # Hadamard binding: each slot accumulates one (key * val) per layer.
-        binding = keys * vals  # (B, S, P) complex
+        binding = keys * vals  # (B, S, P) / (B, T, S, P) complex
         decay = torch.sigmoid(self.decay).float()
         decay_c = torch.complex(decay, torch.zeros_like(decay))
         return decay_c * memory + (1.0 - decay_c) * binding
@@ -87,17 +99,23 @@ class PhaseAssociativeBlock(nn.Module):
         # x: (B, T, D) — produce a complex query per token.
         bsz, T, _ = x.shape
         q = _to_unit_complex(self.proj_query(x))  # (B, T, P) complex
-        # Unbind each slot with the per-token query: m_s * conj(q) → (B, T, S, P).
-        unbinds = memory.unsqueeze(1) * torch.conj(q).unsqueeze(2)
-        # Aggregate over slots (mean): one combined retrieved vector per token.
-        retrieved = unbinds.mean(dim=2)  # (B, T, P) complex
+        if memory.dim() == 4:
+            # causal_memory=True: per-position memory (B, T, S, P). The query
+            # at token t unbinds only the slot state at t.
+            unbinds = memory * torch.conj(q).unsqueeze(2)  # (B, T, S, P)
+            retrieved = unbinds.mean(dim=2)  # (B, T, P) complex
+        else:
+            # Unbind each slot with the per-token query: m_s * conj(q) → (B, T, S, P).
+            unbinds = memory.unsqueeze(1) * torch.conj(q).unsqueeze(2)
+            # Aggregate over slots (mean): one combined retrieved vector per token.
+            retrieved = unbinds.mean(dim=2)  # (B, T, P) complex
         # Back to real d_model space.
         real = _from_complex(retrieved).to(x.dtype)
         return self.proj_back(real)
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if memory is None or not torch.is_complex(memory):
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if self.config.causal_memory else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self._read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))

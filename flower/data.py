@@ -235,12 +235,39 @@ class _FineWebChunkStream(IterableDataset):
             # httpx client closed mid-stream — recreating the dataset object lets the
             # run survive without losing the in-flight checkpoint.
             consecutive_failures = 0
+            # Documents this worker has PULLED from its shard since this __iter__
+            # began (empty texts included — they occupy a shard slot even though
+            # they are never yielded). A restart re-opens the stream from the HEAD
+            # of the region, so without this counter every already-yielded document
+            # below would be yielded — and trained on — a second time, silently.
+            # Skipping the same number of items from the rebuilt shard resumes this
+            # worker's own document sequence exactly where it stopped (the re-opened
+            # stream is assumed to yield the same order, which holds for the sorted
+            # local-parquet path and for HF streaming order).
+            #
+            # Residual caveat, stated honestly: this preserves each worker's
+            # document SEQUENCE, not the global batch interleaving. Batches mix
+            # chunks from all workers in DataLoader arrival order, and after a
+            # mid-run restart the workers' relative progress differs from an
+            # uninterrupted run — the token SET is preserved, the interleaving is
+            # not. That is the same class of difference config.py already documents
+            # for changing num_workers: seed-comparable, not bit-comparable.
+            docs_consumed = 0
             while True:
                 try:
                     if local_parquets:
                         # Always streams (memory: see _local_parquet_doc_iter).
                         docs: Iterator[str] = _local_parquet_doc_iter(local_parquets, text_field)
                     else:
+                        # No `revision=` pin: sample-10BT is an append-only
+                        # snapshot config, and pinning would change the data a
+                        # resumed run sees vs its first attempt. Residual risk
+                        # (accepted): if the Hub re-resolves to a revision with
+                        # a DIFFERENT shard list between a failed open and this
+                        # re-open, the docs_consumed skip below is counted
+                        # against a shifted document sequence — same class of
+                        # order perturbation as a num_workers change (see
+                        # DataConfig.num_workers), not a train/val leak.
                         dataset = load_dataset(
                             "HuggingFaceFW/fineweb-edu",
                             name="sample-10BT",
@@ -253,14 +280,35 @@ class _FineWebChunkStream(IterableDataset):
                     else:  # train
                         sliced = islice(docs, VAL_DOCS, None)
                     sharded = islice(sliced, worker_id, None, num_workers)
+                    if docs_consumed:
+                        # Restart after an error: jump past the prefix of THIS
+                        # worker's shard that was already consumed.
+                        sharded = islice(sharded, docs_consumed, None)
                     for text in sharded:
+                        # A document was successfully pulled, so the stream is
+                        # healthy: count it and reset the failure streak HERE
+                        # rather than after a complete pass (for the train role a
+                        # pass never completes mid-run, so a pass-scoped reset
+                        # made the counter cumulative — the 10th transient error
+                        # of a whole run killed it, not the 10th back-to-back one).
+                        docs_consumed += 1
+                        consecutive_failures = 0
                         if text:
                             yield text
-                    consecutive_failures = 0  # successful pass
+                    # Clean exhaustion (only reachable when the upstream dataset
+                    # ends): the next pass is a fresh epoch over the region, so
+                    # the skip counter must restart with it — otherwise every
+                    # later pass would skip everything and silently yield
+                    # nothing, forever.
+                    docs_consumed = 0
+                    consecutive_failures = 0
                 except Exception as e:
                     consecutive_failures += 1
                     print(
-                        f"[data] worker={worker_id} stream error (attempt {consecutive_failures}): {type(e).__name__}: {e}",
+                        f"[data] worker={worker_id} stream error (consecutive failures: "
+                        f"{consecutive_failures}): {type(e).__name__}: {e}; restarting stream "
+                        f"from the head and skipping the {docs_consumed} documents this "
+                        f"worker already consumed",
                         flush=True,
                     )
                     if consecutive_failures >= 10:
