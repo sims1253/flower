@@ -1,6 +1,6 @@
 """Tests for the analytical Titans surprise gradient — S14 Opportunity 3.
 
-Four properties under test (mirroring the spec's VALIDATION section):
+Five properties under test (mirroring the spec's VALIDATION section):
 
 1. Gradient equivalence (THE GATE): ``_surprise_analytical`` matches
    ``torch.autograd.grad(_inner_loss(...))`` at fp32 ~1e-4 (measured ~1e-9)
@@ -21,6 +21,15 @@ Four properties under test (mirroring the spec's VALIDATION section):
    analytical vs autograd, at (B=8, S=16, D=768). Reports the speedup; does
    not assert a threshold (hardware-dependent) but fails if analytical is
    slower, which would indicate a bug.
+
+5. Per-sample inner-loss reduction (``titans_per_sample_loss``): the legacy
+   reduction is a mean over B*D, so Titans memory writes scale with 1/B and
+   the B=1 document-level eval (flower/eval.py::evaluate_documents /
+   sliding_window_document_loss) ran memory ~batch_size-x hotter than batch
+   training ever did. With the flag on, writes must be batch-size-invariant
+   across B in {1,4,16} in BOTH surprise paths; with it off, the legacy
+   1/B magnitudes are pinned; and under ``causal_memory=True`` (already
+   per-row) the flag must be a no-op.
 """
 
 from __future__ import annotations
@@ -289,3 +298,176 @@ def test_surprise_analytical_is_faster_than_autograd():
     assert speedup > 1.0, (
         f"analytical path is SLOWER ({speedup:.2f}x) — check the implementation"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Per-sample inner-loss reduction (titans_per_sample_loss) — batch-size
+#    invariance of the memory dynamics.
+#
+# The legacy reduction is a mean over B*D (factor 2/(B*D)), so the surprise —
+# and therefore every Titans memory write alpha*write_scale*surprise — scales
+# with 1/B. flower/eval.py's document-level paths score one document at a time
+# (B=1), so titans doc-level bpb was computed with batch_size-x larger writes
+# than batch training produced. The flag makes both surprise paths reduce per
+# sample (sum over B, mean over D, factor 2/D), which pins the write magnitude
+# to the B=1 value at every batch size.
+# ---------------------------------------------------------------------------
+
+
+def _replicated_block_memory(batch: int, *, analytical: bool, per_sample: bool, seed: int = 7):
+    """One TitansMACBlock forward from a zero-memory init, with every batch
+    element holding the SAME hidden states, so the only difference between
+    batch sizes is the inner-loss reduction. Returns (block, memory)."""
+    torch.manual_seed(seed)
+    block = TitansMACBlock(
+        _cfg(
+            titans_analytical_surprise=analytical,
+            titans_per_sample_loss=per_sample,
+        )
+    ).eval()
+    torch.manual_seed(seed + 1)
+    x = torch.randn(1, 16, 64).repeat(batch, 1, 1)
+    with torch.no_grad():
+        _, mem = block(x, None)
+    return block, mem
+
+
+@pytest.mark.parametrize("analytical", [False, True], ids=["autograd", "analytical"])
+def test_per_sample_memory_invariant_across_batch_sizes(analytical):
+    """Flag ON: mean |memory| after one block must be identical across
+    B in {1,4,16} (within fp tolerance). The block has no cross-batch ops, so
+    with a per-sample reduction every element's write is independent of the
+    batch it travelled in."""
+    _, mem1 = _replicated_block_memory(1, analytical=analytical, per_sample=True)
+    for B in (4, 16):
+        _, memB = _replicated_block_memory(B, analytical=analytical, per_sample=True)
+        assert memB.shape == (B, mem1.shape[1], mem1.shape[2])
+        # Element-wise: batch element i at B>1 must match the B=1 memory.
+        for i in range(B):
+            assert torch.allclose(memB[i], mem1[0], rtol=1e-5, atol=1e-8), (
+                f"analytical={analytical}: memory element {i} differs between B={B} and B=1"
+            )
+        assert memB.abs().mean().item() == pytest.approx(mem1.abs().mean().item(), rel=1e-5)
+
+
+@pytest.mark.parametrize("analytical", [False, True], ids=["autograd", "analytical"])
+def test_legacy_memory_magnitude_scales_with_inverse_batch_size(analytical):
+    """Flag OFF: the legacy B-dependent magnitudes are preserved. From a zero
+    memory the first write is exactly proportional to the surprise factor
+    2/(B*D), so mean |memory| must be ~1/B: ratio 4 between B=1 and B=4, 16
+    between B=1 and B=16. (This is the train(B=N) vs doc-eval(B=1)
+    inconsistency the flag exists to fix — pinned here so it stays opt-in.)"""
+    mags = {B: _replicated_block_memory(B, analytical=analytical, per_sample=False)[1].abs().mean().item()
+            for B in (1, 4, 16)}
+    assert mags[1] > 0
+    assert mags[1] / mags[4] == pytest.approx(4.0, rel=0.05), f"got B1/B4 = {mags[1]/mags[4]:.3f}"
+    assert mags[1] / mags[16] == pytest.approx(16.0, rel=0.05), f"got B1/B16 = {mags[1]/mags[16]:.3f}"
+
+
+def test_per_sample_flag_pins_b1_semantics_at_every_batch():
+    """The per-sample reduction is exactly the legacy reduction evaluated at
+    B=1 (both give factor 2/D per sample): memory at B=16 with the flag on
+    must equal legacy memory at B=1. This is the "doc-eval consistent with
+    training" property in miniature."""
+    _, mem_legacy_b1 = _replicated_block_memory(1, analytical=False, per_sample=False)
+    for analytical in (False, True):
+        _, mem_ps_b16 = _replicated_block_memory(16, analytical=analytical, per_sample=True)
+        assert torch.allclose(mem_ps_b16[0], mem_legacy_b1[0], rtol=1e-5, atol=1e-8), (
+            f"analytical={analytical}: per-sample B=16 memory != legacy B=1 memory"
+        )
+
+
+def test_per_sample_analytical_matches_autograd():
+    """GATE under the flag: both paths rescale by the same factor B, so the
+    analytical-vs-autograd equivalence must survive titans_per_sample_loss."""
+    torch.manual_seed(5)
+    block = TitansMACBlock(_cfg(titans_per_sample_loss=True))
+    block.eval()
+    B, S, D = 4, 8, 64
+    long_mem = torch.randn(B, S, D, dtype=torch.float32)
+    key = torch.randn(B, D, dtype=torch.float32)
+    value = torch.randn(B, D, dtype=torch.float32)
+
+    ana = block._surprise_analytical(long_mem, key, value)
+    auto = _autograd_surprise(block, long_mem, key, value)
+    max_abs = (ana - auto).abs().max().item()
+    assert max_abs < 1e-4, f"fp32 surprise mismatch under per-sample flag: {max_abs:.3e}"
+    # And the flag itself scales the legacy gradient by exactly B.
+    legacy_block = TitansMACBlock(_cfg(titans_per_sample_loss=False))
+    legacy_block.eval()
+    legacy_block.load_state_dict(block.state_dict())
+    ana_legacy = legacy_block._surprise_analytical(long_mem, key, value)
+    assert torch.allclose(ana, ana_legacy * B, rtol=1e-5, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# 5b. 2x2 interaction with causal_memory: the causal write path is per-position
+# and already per-row (factor 2/D), so titans_per_sample_loss must be a no-op
+# there, and every flag combination must smoke-train and stay causal (the
+# perturbation pattern from tests/test_causal.py).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("per_sample", [False, True], ids=["legacy-reduction", "per-sample"])
+@pytest.mark.parametrize("analytical", [False, True], ids=["autograd", "analytical"])
+@pytest.mark.parametrize("causal", [False, True], ids=["window", "causal"])
+def test_flag_interaction_smoke_trains_and_causal_writes_stay_causal(causal, analytical, per_sample):
+    cfg = _cfg(
+        num_layers=3,  # >=3 layers: the leak rides the write->read threading
+        max_seq_len=48,
+        local_window=16,
+        causal_memory=causal,
+        titans_analytical_surprise=analytical,
+        titans_per_sample_loss=per_sample,
+    )
+    torch.manual_seed(0)
+    model = build_titans_mac_model(cfg).eval()
+
+    # Causality perturbation check (tests/test_causal.py pattern): perturbing
+    # only the LAST input token must leave logits[:, :-1] bit-unchanged
+    # whenever causal_memory=True.
+    torch.manual_seed(1)
+    a = torch.randint(0, cfg.vocab_size, (2, 48))
+    b = a.clone()
+    b[:, -1] = (b[:, -1] + 1) % cfg.vocab_size
+    with torch.no_grad():
+        logits_a = model(a)["logits"][:, :-1]
+        logits_b = model(b)["logits"][:, :-1]
+    delta = (logits_a - logits_b).abs().max().item()
+    if causal:
+        assert delta == 0.0, (
+            f"last-token perturbation moved past logits by {delta} "
+            f"(causal={causal}, analytical={analytical}, per_sample={per_sample})"
+        )
+
+    # Smoke-train: finite loss, backward populates gradients.
+    model.train()
+    out = model(a, labels=a)
+    assert out["loss"] is not None and torch.isfinite(out["loss"])
+    out["loss"].backward()
+    with_grad = [n for n, p in model.named_parameters() if p.grad is not None and p.grad.abs().sum() > 0]
+    assert with_grad, "no parameter received gradient"
+
+
+def test_per_sample_flag_is_noop_under_causal_memory():
+    """causal_memory=True already reduces per row (each (batch, position)
+    row's surprise is the gradient of its own MSE, factor 2/D), so flipping
+    titans_per_sample_loss must not change its outputs (fp tolerance only —
+    the legacy path computes rows*(2/(rows*D)) vs the flag's 2/D)."""
+    outs = []
+    for per_sample in (False, True):
+        cfg = _cfg(
+            num_layers=2,
+            max_seq_len=32,
+            local_window=16,
+            causal_memory=True,
+            titans_per_sample_loss=per_sample,
+        )
+        torch.manual_seed(3)
+        model = build_titans_mac_model(cfg).eval()
+        torch.manual_seed(4)
+        tokens = torch.randint(0, cfg.vocab_size, (2, 24))
+        with torch.no_grad():
+            outs.append(model(tokens)["logits"])
+    max_abs = (outs[0] - outs[1]).abs().max().item()
+    assert max_abs < 1e-5, f"titans_per_sample_loss changed the causal path by {max_abs:.3e}"
