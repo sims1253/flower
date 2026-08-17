@@ -317,6 +317,57 @@ def test_average_rank_handles_rows_with_missing_metric_columns() -> None:
     assert rows[2]["composite_avg_rank"] == pytest.approx(3.0)
 
 
+def test_average_rank_script_and_probe_entry_points_agree() -> None:
+    # The script must not carry a second, drifting copy of the rank composite
+    # (a pullfrog-review finding: it once rounded to 3 decimals while the
+    # probe-side copy did not, yet the docstring claimed one shared
+    # definition). Load the script module itself (test_vast_scripts.py style)
+    # and pin that its table values are exactly round(canonical, 3) — the
+    # rounding is presentation, applied at the script's output site only.
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "aggregate_sweep_results", root / "scripts" / "aggregate_sweep_results.py"
+    )
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    def rows() -> list[dict[str, float]]:
+        # Three rows, three rank columns, one column missing on one row — so
+        # both the shared-column and skip-column code paths run — with values
+        # chosen so the rank means are NOT exactly representable in 3 decimals
+        # (5/3 and 4/3), i.e. the script's rounding is load-bearing here.
+        return [
+            {"rank_fineweb_bpb": 0.30, "rank_induction_copy_loss": 2.0, "rank_blimp_mini_error": 0.02},
+            {"rank_fineweb_bpb": 0.35, "rank_induction_copy_loss": 1.0, "rank_blimp_mini_error": 0.01},
+            {"rank_fineweb_bpb": 0.40, "rank_induction_copy_loss": 3.0},  # blimp missing
+        ]
+
+    canonical_rows = rows()
+    attach_average_ranks(canonical_rows)
+    script_rows = rows()
+    script.attach_average_ranks(script_rows)
+    for row in script_rows:
+        if isinstance(row.get("composite_avg_rank"), float):
+            row["composite_avg_rank"] = round(row["composite_avg_rank"], 3)
+
+    # The script imports the canonical function (no private `_attach_average_ranks`).
+    assert not hasattr(script, "_attach_average_ranks")
+    assert script.attach_average_ranks is attach_average_ranks
+    for canonical, script_row in zip(canonical_rows, script_rows, strict=True):
+        assert script_row["composite_avg_rank"] == pytest.approx(
+            round(canonical["composite_avg_rank"], 3)
+        )
+    # And the rounding is load-bearing on this data: the unrounded canonical
+    # means really do carry digits past 3 decimals.
+    assert any(
+        row["composite_avg_rank"] != round(row["composite_avg_rank"], 3) for row in canonical_rows
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fix 3: needle probe truncation must keep the queried fact (early mode).
 # ---------------------------------------------------------------------------

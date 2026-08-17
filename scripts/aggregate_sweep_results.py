@@ -10,8 +10,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+# The average-rank headline is defined ONCE, in flower/probes/composite.py
+# (probe-side tests and consumers import the same function); this script has
+# no private copy. Allow direct execution as `python scripts/...` outside a
+# project env (uv run puts the project on sys.path; a bare interpreter does
+# not — same fallback as eval_validation_correlation.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from flower.probes.composite import attach_average_ranks
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -33,21 +43,6 @@ def _flatten_composite(data: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return out
-
-
-def _attach_average_ranks(rows: list[dict[str, Any]]) -> None:
-    rank_cols = sorted({k for row in rows for k in row if k.startswith("rank_")})
-    if not rank_cols:
-        return
-    ranks_by_row: dict[int, list[int]] = {i: [] for i in range(len(rows))}
-    for col in rank_cols:
-        indexed = [(i, row[col]) for i, row in enumerate(rows) if isinstance(row.get(col), (int, float))]
-        indexed.sort(key=lambda item: item[1])
-        for rank, (i, _) in enumerate(indexed, start=1):
-            ranks_by_row[i].append(rank)
-    for i, ranks in ranks_by_row.items():
-        if ranks:
-            rows[i]["composite_avg_rank"] = round(sum(ranks) / len(ranks), 3)
 
 
 def main() -> None:
@@ -115,7 +110,15 @@ def main() -> None:
         row.update(_flatten_composite(comp))
         rows.append(row)
 
-    _attach_average_ranks(rows)
+    # Canonical average-rank composite (shared with flower/probes/composite.py,
+    # where probe-side tests pin it). The 3-decimal rounding is applied HERE —
+    # at the output-table site only — so the printed/JSON value is
+    # round(canonical, 3) by construction, identical to what this script
+    # emitted when it carried its own copy.
+    attach_average_ranks(rows)
+    for row in rows:
+        if isinstance(row.get("composite_avg_rank"), float):
+            row["composite_avg_rank"] = round(row["composite_avg_rank"], 3)
 
     def sort_key(r: dict) -> float:
         v = r.get(args.sort)
