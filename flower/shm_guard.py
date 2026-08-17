@@ -55,7 +55,11 @@ def claim_process_group() -> bool:
     """
     try:
         os.setpgid(0, 0)
-    except OSError:
+    except (AttributeError, OSError):
+        # AttributeError: platforms without setpgid at all (native Windows) —
+        # the claim is best-effort, never a crash (train.py calls it
+        # unconditionally on resume). OSError: forbidden, e.g. EPERM when the
+        # caller is already a session leader.
         return False
     return True
 

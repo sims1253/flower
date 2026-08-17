@@ -259,6 +259,15 @@ class _FineWebChunkStream(IterableDataset):
                         # Always streams (memory: see _local_parquet_doc_iter).
                         docs: Iterator[str] = _local_parquet_doc_iter(local_parquets, text_field)
                     else:
+                        # No `revision=` pin: sample-10BT is an append-only
+                        # snapshot config, and pinning would change the data a
+                        # resumed run sees vs its first attempt. Residual risk
+                        # (accepted): if the Hub re-resolves to a revision with
+                        # a DIFFERENT shard list between a failed open and this
+                        # re-open, the docs_consumed skip below is counted
+                        # against a shifted document sequence — same class of
+                        # order perturbation as a num_workers change (see
+                        # DataConfig.num_workers), not a train/val leak.
                         dataset = load_dataset(
                             "HuggingFaceFW/fineweb-edu",
                             name="sample-10BT",
