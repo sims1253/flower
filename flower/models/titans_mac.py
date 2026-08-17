@@ -44,7 +44,7 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, causal_last_tokens
 
 
 class TitansMACBlock(nn.Module):
@@ -74,6 +74,11 @@ class TitansMACBlock(nn.Module):
     def _initial_memory(self, x: torch.Tensor) -> torch.Tensor:
         slots = self.config.memory_slots + (self.config.short_memory_slots if self.config.hierarchical_memory else 0)
         return x.new_zeros(x.shape[0], slots, self.config.d_model)
+
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S_total, D) per-position memory state for causal_memory=True."""
+        slots = self.config.memory_slots + (self.config.short_memory_slots if self.config.hierarchical_memory else 0)
+        return x.new_zeros(x.shape[0], x.shape[1], slots, self.config.d_model)
 
     def _inner_loss(self, memory: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Associative retrieval: read memory via key, MSE against target value.
@@ -187,13 +192,65 @@ class TitansMACBlock(nn.Module):
             short = F.pad(short, (0, 0, self.config.short_memory_slots - short.shape[1], 0))
         return torch.cat([new_long, short], dim=1)
 
+    def _surprise_update_causal(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """causal_memory=True write: memory is a per-position state (B, T, S_total, D).
+
+        Same surprise rule and recurrence as ``_surprise_update``, but the
+        summary at t is the PREFIX max (tokens <= t) and the retrieval probe
+        at t reads/writes only the slot state at t. The per-position inner
+        problems are independent, so the legacy (B, S, D) machinery is reused
+        on the flattened (B*T) batch — including the autograd path, whose
+        single torch.autograd.grad call covers all B*T probes at once.
+
+        The inner loss is scaled by the row count so each position's surprise
+        is the gradient of ITS OWN MSE (factor 2/D), not of a batch-wide mean
+        (2/(B*T*D)). The batch-wide mean would make the memory at t depend on
+        the number of positions in the window — a length leak that breaks
+        prefix-truncation invariance.
+        """
+        bsz, seq_len, _, dim = memory.shape
+        rows = bsz * seq_len
+        summary = torch.cummax(x, dim=1).values  # (B, T, D)
+        key = self.key_proj(summary).reshape(rows, dim)
+        value = self.val_proj(summary).reshape(rows, dim)
+
+        long_mem = memory[:, :, : self.config.memory_slots]
+        s = self.config.memory_slots
+        long_flat = long_mem.reshape(rows, s, dim)
+        if self.config.titans_analytical_surprise:
+            surprise = self._surprise_analytical(long_flat, key, value) * rows  # (B*T, S, D)
+        else:
+            with torch.enable_grad():
+                probe = long_flat.detach().requires_grad_(True)
+                if memory.shape[2] > s:
+                    short_part = memory[:, :, s:]  # (B, T, short, D), detached with memory
+                    probe_memory = torch.cat(
+                        [probe.view(bsz, seq_len, s, dim), short_part], dim=2
+                    ).reshape(rows, -1, dim)
+                else:
+                    probe_memory = probe
+                inner = self._inner_loss(probe_memory, key, value) * rows
+                (surprise_grad,) = torch.autograd.grad(
+                    inner, probe, create_graph=self.training, retain_graph=True
+                )
+            surprise = -surprise_grad
+        surprise = surprise.view(bsz, seq_len, s, dim)
+
+        alpha = torch.sigmoid(self.alpha_logit).view(1, 1, -1, 1)  # (1, 1, S, 1)
+        new_long = (1.0 - alpha) * long_mem + alpha * self.write_scale * surprise
+        if not self.config.hierarchical_memory:
+            return new_long
+        short = causal_last_tokens(x, self.config.short_memory_slots)  # (B, T, n, D)
+        return torch.cat([new_long, short], dim=2)
+
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        causal = self.config.causal_memory
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if causal else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))
-        memory = self._surprise_update(memory, x)
+        memory = self._surprise_update_causal(memory, x) if causal else self._surprise_update(memory, x)
         # Eval does not backprop: detach the memory state so it does not carry a
         # graph out of a no_grad context. (The analytical path has no inner
         # graph, so no enable_grad context is needed either way.)

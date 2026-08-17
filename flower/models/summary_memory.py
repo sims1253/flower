@@ -5,7 +5,13 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead, SDPCrossAttention
+from flower.models.memory import (
+    MemoryRead,
+    SDPCrossAttention,
+    causal_last_tokens,
+    causal_prefix_attention,
+    causal_running_mean,
+)
 
 
 class SummaryMemoryBlock(nn.Module):
@@ -44,6 +50,11 @@ class SummaryMemoryBlock(nn.Module):
         slots = self.config.memory_slots + (self.config.short_memory_slots if self.config.hierarchical_memory else 0)
         return x.new_zeros(x.shape[0], slots, self.config.d_model)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S_total, D) per-position memory state for causal_memory=True."""
+        slots = self.config.memory_slots + (self.config.short_memory_slots if self.config.hierarchical_memory else 0)
+        return x.new_zeros(x.shape[0], x.shape[1], slots, self.config.d_model)
+
     def _aggregate(self, x: torch.Tensor) -> torch.Tensor:
         mode = self.config.memory_aggregation
         if mode == "sum":
@@ -58,6 +69,29 @@ class SummaryMemoryBlock(nn.Module):
             weights = torch.softmax(q @ x.transpose(1, 2) / (x.shape[-1] ** 0.5), dim=-1)
             return weights @ x
         return x.mean(dim=1, keepdim=True)
+
+    def _aggregate_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-position prefix aggregate — causal analogue of ``_aggregate``.
+
+        Returns (B, T, D): out[:, t] aggregates x[:, :t+1] only, so the write
+        at t is a function of tokens <= t. `orthogonal` shares the max-pool
+        aggregation with `max`, as in ``_aggregate``.
+        """
+        mode = self.config.memory_aggregation
+        if mode == "sum":
+            return torch.cumsum(x, dim=1)
+        if mode == "max" or mode == "orthogonal":
+            return torch.cummax(x, dim=1).values
+        if mode == "attention":
+            # Same q @ x^T / sqrt(D) scoring as the legacy attention
+            # aggregation; causal_prefix_attention restricts the softmax to
+            # tokens <= t (the learned global query is the single "latent").
+            q = self.agg_query.expand(x.shape[0], -1, -1)  # (B, 1, D)
+            scores = q @ x.transpose(1, 2) / (x.shape[-1] ** 0.5)  # (B, 1, T)
+            scores = scores.unsqueeze(1)  # (B, H=1, P=1, T)
+            out = causal_prefix_attention(scores, x.unsqueeze(1))  # (B, 1, T, 1, D)
+            return out.squeeze(1).squeeze(2)  # (B, T, D)
+        return causal_running_mean(x)
 
     @staticmethod
     def _orthogonal_residual(update: torch.Tensor, memory: torch.Tensor, eps: float) -> torch.Tensor:
@@ -96,14 +130,43 @@ class SummaryMemoryBlock(nn.Module):
             short = torch.nn.functional.pad(short, (0, 0, self.config.short_memory_slots - short.shape[1], 0))
         return torch.cat([long_mem, short], dim=1)
 
+    def _update_memory_causal(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """causal_memory=True write: memory is a per-position state (B, T, S_total, D).
+
+        Identical recurrence to ``_update_memory`` (same MLPs, same scaling,
+        no new parameters) but every quantity is per-position: the token
+        summary at t aggregates tokens <= t, and the slot state read/written
+        at t is memory[:, t]. The per-layer update is pointwise in t, so
+        causality of the threaded memory follows by induction over layers.
+        """
+        if self.config.summary_style == "perceiver":
+            latents = self.perceiver_latents.expand(x.shape[0], -1, -1)
+            token_summary = self.perceiver.causal_forward(latents, x)  # (B, T, S, D)
+        else:
+            token_summary = self._aggregate_causal(x).unsqueeze(2)  # (B, T, 1, D)
+            token_summary = token_summary.expand(-1, -1, self.config.memory_slots, -1)
+        long_mem = memory[:, :, : self.config.memory_slots]
+        combined = self.token_mlp(token_summary) + self.mem_mlp(long_mem)
+        candidate_update = self.update(combined) / max(1, self.config.num_layers)
+        if self.config.memory_aggregation == "orthogonal":
+            # _orthogonal_residual is pointwise over the last dim — works
+            # unchanged on the extra position axis.
+            candidate_update = self._orthogonal_residual(candidate_update, long_mem, self.config.orthogonal_eps)
+        long_mem = long_mem + candidate_update
+        if not self.config.hierarchical_memory:
+            return long_mem
+        short = self.short_project(causal_last_tokens(x, self.config.short_memory_slots))  # (B, T, n, D)
+        return torch.cat([long_mem, short], dim=2)
+
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        causal = self.config.causal_memory
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if causal else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
-        x = x + self.mem_read(self.ln_mem(x), memory)
+        x = x + self.mem_read(self.ln_mem(x), memory)  # MemoryRead dispatches on memory.dim()
         x = x + self.ff(self.ln2(x))
         if self.config.memory_update_frequency <= 1 or x.shape[1] % self.config.memory_update_frequency == 0:
-            memory = self._update_memory(memory, x)
+            memory = self._update_memory_causal(memory, x) if causal else self._update_memory(memory, x)
         return x, memory
 
 

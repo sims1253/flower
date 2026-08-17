@@ -336,6 +336,35 @@ class ModelConfig:
     # preserved. False reproduces the legacy autograd path bit-for-bit (old
     # runs and checkpoints reproduce).
     titans_analytical_surprise: bool = False
+    # ------------------------------------------------------------------
+    # Causal memory writes (correctness fix).
+    #
+    # THE BUG: every memory variant's write path aggregates the ENTIRE window
+    # — including tokens AFTER position t — into the memory bank (perceiver /
+    # max / mean / softmax summaries over all of x), and the next layer's
+    # mem_read broadcasts that bank to EVERY position. So logits[t] can depend
+    # on input tokens > t: empirically, perturbing only the LAST input token
+    # changes logits at positions 0..T-2 by up to 0.29 (linear_memory), 0.03
+    # (frequency_decay), 0.015 (bloom), 0.005 (summary), ... while vanilla_local
+    # is exactly 0. Because logits[t] predicts labels[t+1], a memory model can
+    # read its own answer out of memory, which taints every memory-vs-vanilla
+    # sweep comparison.
+    #
+    # False (default) keeps the legacy leaky write and reproduces every
+    # existing run bit-for-bit — bake-off results published so far were
+    # obtained with this behavior.
+    #
+    # True makes the memory visible at position t a function of tokens <= t
+    # only (token t itself is allowed): each block computes a per-position
+    # write from the layer input and accumulates it causally (running
+    # mean/sum via cumsum, running max via cummax, routed/softmax writes via
+    # masked cumulative sums), and the read at t consumes the per-position
+    # memory state at t. No new parameters — checkpoints stay loadable and
+    # param counts are unchanged. Runs trained with the flag off are NOT
+    # comparable to runs with it on; rerun the bake-off with
+    # causal_memory: true before drawing memory-mechanism conclusions.
+    # ------------------------------------------------------------------
+    causal_memory: bool = False
 
     def __post_init__(self) -> None:
         # S13: validate the precision-routing fields. Keep the actual FP4/FP8

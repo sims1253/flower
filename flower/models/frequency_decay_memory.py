@@ -88,19 +88,28 @@ class FrequencyDecayBlock(nn.Module):
         write_mag: torch.Tensor,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_summary = self._aggregate(x).expand(-1, self.config.memory_slots, -1)
+        causal = self.config.causal_memory
+        # Causal form: prefix max at t, so the pooled token the candidate is
+        # built from at t sees tokens <= t only.
+        token_summary = torch.cummax(x, dim=1).values if causal else self._aggregate(x)
+        if causal:
+            token_summary = token_summary.unsqueeze(2).expand(-1, -1, self.config.memory_slots, -1)  # (B, T, S, D)
+        else:
+            token_summary = token_summary.expand(-1, self.config.memory_slots, -1)  # (B, S, D)
         combined = self.token_mlp(token_summary) + self.mem_mlp(memory)
         candidate = self.update(combined) / float(max(1, self.config.num_layers))
 
         base = torch.sigmoid(self.decay_logit).view(1, -1)  # (1, S)
         # Heavier traffic -> stronger decay. Clamp so the multiplier stays in
         # [base, 1] (cap at full decay) and we don't overshoot into negatives.
+        # write_mag: (B, S) legacy / (B, T, S) causal — the per-slot traffic
+        # accumulated over layers at this position's own state.
         effective = base * (1.0 + self.config.freq_penalty * write_mag)
-        effective = torch.clamp(effective, max=1.0)  # (B, S)
+        effective = torch.clamp(effective, max=1.0)  # (B, S) / (B, T, S)
 
         new_memory = (1.0 - effective).unsqueeze(-1) * memory + candidate
         # Detach: write_mag is a heuristic accumulator, not a learnable signal.
-        slot_mag = candidate.detach().norm(dim=-1)  # (B, S)
+        slot_mag = candidate.detach().norm(dim=-1)  # (B, S) / (B, T, S)
         return new_memory, write_mag + slot_mag
 
     def forward(
@@ -108,9 +117,14 @@ class FrequencyDecayBlock(nn.Module):
         x: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        causal = self.config.causal_memory
         if state is None:
-            memory = x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
-            write_mag = x.new_zeros(x.shape[0], self.config.memory_slots)
+            if causal:
+                memory = x.new_zeros(x.shape[0], x.shape[1], self.config.memory_slots, self.config.d_model)
+                write_mag = x.new_zeros(x.shape[0], x.shape[1], self.config.memory_slots)
+            else:
+                memory = x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
+                write_mag = x.new_zeros(x.shape[0], self.config.memory_slots)
         else:
             memory, write_mag = state
         x = x + self.local(self.ln1(x))
@@ -131,6 +145,11 @@ class FrequencyDecayLM(nn.Module):
         self.ln = nn.LayerNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.head.weight = self.token.weight
+        # Static diagnostics (parameter_count / config asdict) computed once and
+        # reused across forwards, mirroring CausalLM._static_diagnostics
+        # (base.py): count_parameters + asdict are per-forward host work that
+        # adds nothing after the first call.
+        self._static_diagnostics: dict[str, Any] | None = None
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> dict[str, Any]:
         if input_ids.shape[1] > self.config.max_seq_len:
@@ -148,13 +167,17 @@ class FrequencyDecayLM(nn.Module):
                 logits[:, :-1].reshape(-1, logits.size(-1)),
                 labels[:, 1:].reshape(-1),
             )
-        diagnostics: dict[str, Any] = {
-            "parameter_count": count_parameters(self),
-            "config": asdict(self.config),
-        }
+        if self._static_diagnostics is None:
+            self._static_diagnostics = {
+                "parameter_count": count_parameters(self),
+                "config": asdict(self.config),
+            }
+        diagnostics: dict[str, Any] = dict(self._static_diagnostics)
         # Surface the final write-magnitude distribution as a diagnostic so the
         # composite eval can correlate freq-decay activity with downstream metrics.
-        if state is not None:
+        # Skipped under torch.compile: the host syncs (float(...cpu())) graph-
+        # break the compiled region (same guard/pattern as bloom_memory).
+        if state is not None and not torch.compiler.is_compiling():
             _, write_mag = state
             diagnostics["frequency_decay_mean_mag"] = float(write_mag.mean().detach().cpu())
             diagnostics["frequency_decay_max_mag"] = float(write_mag.max().detach().cpu())
