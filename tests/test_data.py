@@ -162,3 +162,127 @@ def test_chunk_stream_cache_path_deterministic(monkeypatch):
     assert len(a) == 3
     assert all(c.shape == (512,) and c.dtype == torch.long for c in a)
     assert all(torch.equal(x, y) for x, y in zip(a, b, strict=True))
+
+
+# ---------------------------------------------------------------------------
+# Stream-retry semantics (doc_iter inside _FineWebChunkStream.__iter__).
+#
+# The retry loop re-opens the dataset when a transient HF/httpx error fires
+# mid-iteration. These tests pin the two properties an error recovery must not
+# break: no document is trained on twice, and the failure counter is a
+# CONSECUTIVE-failure counter (a scattered error every few thousand docs must
+# never abort a weeks-long run).
+# ---------------------------------------------------------------------------
+
+
+class _TransientStreamError(Exception):
+    """Stands in for the httpx/HF mid-stream errors the retry loop survives."""
+
+
+class _FlakyDataset:
+    """Deterministic fake for `datasets.load_dataset(...)` streaming results.
+
+    Every open yields rows 0..total-1 in the same order (as the real local
+    parquet / HF streaming paths do), but the `fail_after`-th row RAISES
+    mid-iteration — after some documents were already yielded — which is the
+    real failure shape: the exception comes from inside the iterator, not from
+    the initial open. `empty_every` inserts empty-text rows so the skip counter
+    is exercised against rows that occupy a shard slot but yield nothing.
+    """
+
+    def __init__(self, fail_after: int | None, total: int, empty_every: int = 0) -> None:
+        self.fail_after = fail_after
+        self.total = total
+        self.empty_every = empty_every
+
+    def __iter__(self):
+        for i in range(self.total):
+            if self.fail_after is not None and i == self.fail_after:
+                raise _TransientStreamError("simulated httpx client closed mid-stream")
+            text = "" if self.empty_every and i % self.empty_every == 3 else f"{i:05d}" + "z" * 59
+            yield {"text": text}
+
+
+def _flaky_chunk_stream(monkeypatch, fail_schedule: list[int], total_docs: int, empty_every: int = 0):
+    """Train-role chunk stream over _FlakyDataset with tiny knobs.
+
+    VAL_DOCS is shrunk to 2 so the test dataset needs only a handful of rows.
+    Documents are exactly 64 bytes ("byte" tokenizer) and sequence_length is
+    64, so one chunk == one document and chunk order == document order.
+    """
+    from flower.data import _FineWebChunkStream
+
+    schedule = list(fail_schedule)
+
+    def fake_load_dataset(*args, **kwargs):
+        # Each open pops the next failure point; opens after the schedule runs
+        # dry never fail (the transient error is gone).
+        return _FlakyDataset(schedule.pop(0) if schedule else None, total_docs, empty_every)
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    monkeypatch.setattr("flower.data.VAL_DOCS", 2)
+    monkeypatch.delenv("FLOWER_DATA_CACHE", raising=False)  # force the load_dataset path
+    monkeypatch.setattr("time.sleep", lambda s: None)  # no backoff sleeps in tests
+    cfg = DataConfig(dataset="fineweb_edu", tokenizer="byte", sequence_length=64)
+    return iter(_FineWebChunkStream(cfg, "train"))
+
+
+def _chunk_doc_ids(chunks: list[torch.Tensor]) -> list[int]:
+    return [int(bytes(c.tolist()).decode()[:5]) for c in chunks]
+
+
+def test_stream_retry_never_duplicates_documents(monkeypatch):
+    """One transient failure mid-stream: the reopened stream must resume after
+    the docs already yielded, not replay them from the head. Empty-text rows
+    occupy a shard slot without yielding a chunk, so they exercise the skip
+    counter against rows that were pulled but never yielded."""
+    import itertools
+
+    stream = _flaky_chunk_stream(monkeypatch, fail_schedule=[10], total_docs=50, empty_every=7)
+
+    # Chunks of the first pass = non-empty docs in the train region 2..49.
+    expected = [i for i in range(2, 50) if i % 7 != 3]
+    chunks = list(itertools.islice(stream, len(expected)))
+
+    ids = _chunk_doc_ids(chunks)
+    assert ids == expected, "expected each train doc exactly once, in order"
+
+
+def test_stream_survives_scattered_failures_past_ten_total(monkeypatch):
+    """The failure counter must mean 10 *back-to-back* failures, not 10 total:
+    12 isolated single errors across the run must not abort it."""
+    import itertools
+
+    stream = _flaky_chunk_stream(
+        monkeypatch,
+        fail_schedule=[5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38],  # 12 > 10 total
+        total_docs=50,
+    )
+
+    chunks = list(itertools.islice(stream, 48))
+
+    assert _chunk_doc_ids(chunks) == list(range(2, 50))
+
+
+def test_stream_ten_consecutive_failures_still_aborts(monkeypatch):
+    """Ten failures with no document yielded in between must still kill the
+    stream — that is the structural-break case the limit exists for."""
+    import itertools
+
+    stream = _flaky_chunk_stream(monkeypatch, fail_schedule=[5] * 10, total_docs=50)
+
+    with pytest.raises(_TransientStreamError):
+        list(itertools.islice(stream, 5))
+
+
+def test_stream_clean_exhaustion_loops_as_a_fresh_epoch(monkeypatch):
+    """When the dataset ends WITHOUT an error, the next pass is a fresh epoch:
+    the skip counter resets (a stale counter would skip everything forever)."""
+    import itertools
+
+    stream = _flaky_chunk_stream(monkeypatch, fail_schedule=[], total_docs=6)
+
+    # Two full epochs of the 4-doc train region (docs 2..5).
+    ids = _chunk_doc_ids(list(itertools.islice(stream, 8)))
+
+    assert ids == [2, 3, 4, 5, 2, 3, 4, 5]
