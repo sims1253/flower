@@ -500,3 +500,45 @@ recoverable from its own artifacts.
 `flower/precision.py::maybe_convert_fp8` is the single FP8 entry point, used by
 both `flower/train.py` and `scripts/profile_step.py`, so a benchmark cannot
 silently measure a different precision layout than a real run.
+
+## The 10k confirmation run: MISSED its pre-registered band — decision open
+
+`configs/sweep13_450m_longctx_fp8.yaml` pre-registered the success criterion
+before launching: **val_bpb within 0.0004 of the finished bf16 seeds**
+(0.90234 / 0.90270). The run completed 2026-08-16
+(`runs/sweep13_450m_longctx_fp8/`, `runs_450m_fp8_confirm.log`):
+
+| quantity | value |
+|---|---:|
+| val_bpb (FP8 stack, seed 0, 10k steps, EMA) | **0.90428** |
+| offset vs seed 0 / seed 1 | +0.00194 / +0.00158 |
+| pre-registered band | 0.0004 |
+| throughput (whole-run) | 58,102 tok/s (1.30x vs 44,810) |
+| peak VRAM | 21.0 GB |
+
+**By its own criterion the run FAILED**: the converged offset is 4–5x the
+band. The 600-step screen's conclusion ("offset an order of magnitude under
+reseed noise, no divergence") remains true — this is an offset, not
+divergence — but the converged quality cost is real and larger than the band
+the config committed to.
+
+Caveats on the band itself: it is measured from **n=2 seeds** of the bf16
+config; the true 10k-step seed distribution is unknown, and 0.0016 vs 0.0004
+could partly be band noise. A second FP8 seed (or a third bf16 seed) would
+bound that — the existing seed-1 screen infrastructure
+(`runs/speedup_screen_450m_seed1/`) shows how.
+
+**No decision has been recorded.** The honest options:
+
+1. **Accept**: +0.0016 converged bpb for 1.30x throughput and −5 GB VRAM is a
+   good trade for *exploration* runs (more steps per euro), and final-quality
+   runs can always afford bf16. Write it down and mark the FP8 configs
+   accordingly (e.g. `exploration-only`).
+2. **Reject**: the pre-registered criterion is the criterion; FP8 stays off
+   research comparisons until a re-measurement says otherwise.
+3. **Re-measure**: one more seed per arm before deciding (cheapest way to
+   resolve the n=2 band question).
+
+Until one of these is written down here, this table is the record: the speedup
+is real and reproducible; the converged quality cost was measured, exceeded
+the pre-registered threshold, and has not been adjudicated.
