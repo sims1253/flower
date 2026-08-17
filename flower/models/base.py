@@ -1125,6 +1125,15 @@ class CausalLM(nn.Module):
         # of the flag, and label-carrying loss-only consumers (train.py
         # evaluate()) get the memory saving. Falls back to eager automatically
         # if Liger is unavailable or the device is not CUDA.
+        #
+        # fp8_lm_head INTERACTION: at eval the eager path below routes the head
+        # matmul through the FP8 `_fp8_head` when fp8_lm_head is set, while the
+        # fused path here runs the plain (bf16 matmul, fp32-accumulated) Liger
+        # kernel — no FP8. So with fp8_lm_head on, fused_linear_ce_eval changes
+        # eval numbers through BOTH the Liger/bf16 reduction gap AND the loss
+        # of the FP8 quantization. Val metrics are not comparable across the
+        # flag switch in that configuration (or any other — see the config
+        # comment); pick one state per sweep.
         # S9 TST: bagged labels are (B, T/s, s) and need the multi-hot objective,
         # which neither the eager nor the Liger CE path implements. Handled first
         # so the flags below cannot route a bagged batch into a 2-D loss.

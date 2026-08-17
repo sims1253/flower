@@ -815,10 +815,12 @@ def attach_average_ranks(rows: list[dict[str, Any]], *, prefix: str = "rank_") -
 
     For every metric column named `prefix*`, rank the rows carrying a numeric
     value for it (1 = best, ascending); each row's headline is the mean of its
-    ranks. This is the same average-rank composite
-    scripts/aggregate_sweep_results.py `_attach_average_ranks` applies to sweep
-    tables, kept here as the canonical per-metric-scale-free headline so
-    probe-side tests and consumers share one definition.
+    ranks. This is the CANONICAL average-rank composite: probe-side tests and
+    consumers import it from here, and scripts/aggregate_sweep_results.py
+    imports this same function for its sweep tables — it has no private copy,
+    and merely rounds the headline to 3 decimals where its output table is
+    produced (a presentation-only step, so the value it prints is
+    `round(canonical, 3)` by construction).
 
     Why not a geomean of the rank inputs: the old `geomean_loss_like` took
     `exp(mean(log(max(v, 1e-9))))` over rank_inputs that include NEGATED

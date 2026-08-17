@@ -20,7 +20,11 @@ contracts pinned here:
      within bf16 kernel-selection noise under autocast (measured ~1.5e-3
      relative on the 5090 — Liger accumulates the CE in fp32 over chunked
      matmuls while the eager path runs one big bf16 cuBLAS GEMM then a bf16
-     CE; the honest threshold below is ~3x the measured noise).
+     CE; the honest threshold below is ~3x the measured noise). Parity is
+     pinned on the production paths too, not just synthetic all-labels data:
+     MQAR validation batches (labels -100 except at answer positions — both
+     CEs default ignore_index=-100) and the mixed-precision regime train.py
+     actually runs (fp32 master weights + bf16 autocast forward).
   5. MTP auxiliary losses stay OUT of the fused eval loss (they are a
      training-only objective; eval reports the t+1 loss alone — the same leak
      tests/test_mtp_eval_loss.py pinned on the eager path would reintroduce
@@ -186,6 +190,56 @@ class TestFusedEvalCUDA:
             model.fused_linear_ce_eval = True
             fused = model(ids, labels=ids)["loss"]
         torch.testing.assert_close(fused.float(), eager.float(), rtol=5e-3, atol=5e-3)
+
+    def test_fused_eval_loss_matches_eager_on_mqar_ignore_labels(self):
+        # Contract 4 on the ACTUAL in-loop evaluate() data for mqar configs:
+        # validation_token_batches over dataset="mqar" yields (ids, labels)
+        # pairs whose labels are -100 everywhere except at answer positions
+        # (87.5% of this batch is ignored). Both CEs default
+        # ignore_index=-100 — F.cross_entropy on the eager path, Liger's
+        # LigerFusedLinearCrossEntropyLoss on the fused path — so the fused
+        # eval must skip the ignored positions and average the same surviving
+        # tokens. Measured bit-identical on the 5090 in fp32 at this size, so
+        # the 1e-6 floor matches the fp32 parity test above.
+        cfg = tiny()
+        model = self._model()
+        data = DataConfig(
+            dataset="mqar",
+            tokenizer="byte",
+            sequence_length=32,
+            synthetic_vocab_size=cfg.vocab_size,
+            eval_seq_len=32,
+        )
+        ids, labels = next(iter(validation_token_batches(data, 2, self.dev)))
+        assert (labels == -100).any(), "batch must actually exercise the ignore index"
+        with torch.no_grad():
+            model.fused_linear_ce_eval = False
+            eager = model(ids, labels=labels)["loss"]
+            model.fused_linear_ce_eval = True
+            fused = model(ids, labels=labels)["loss"]
+        assert torch.isfinite(eager) and torch.isfinite(fused)
+        torch.testing.assert_close(fused.float(), eager.float(), rtol=0.0, atol=1e-6)
+
+    def test_fused_eval_loss_matches_eager_mixed_precision_autocast(self):
+        # Contract 4 at the precision train.py actually runs: with
+        # training.precision=bf16 the model keeps fp32 master weights and
+        # evaluate() wraps the forward in autocast_ctx(bf16) — NOT the
+        # .to(bfloat16) whole-model regime of the bf16 test above. Under
+        # autocast both paths run the head matmul in bf16 and the eager CE
+        # upcasts to fp32, so the fused/eager gap is smaller than all-bf16:
+        # measured ~2e-4 relative at loss ~9.7 (vocab 16384) on the 5090.
+        # 1e-3 gives ~5x headroom while still catching a real regression
+        # (a wrong label shift or offset moves the loss by O(1)).
+        cfg = tiny(vocab_size=16384, d_model=256, max_seq_len=128)
+        model = self._model(vocab_size=16384, d_model=256, max_seq_len=128)
+        assert next(model.parameters()).dtype == torch.float32  # master weights stay fp32
+        ids = _ids(cfg, self.dev, batch=2, seq=64)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            model.fused_linear_ce_eval = False
+            eager = model(ids, labels=ids)["loss"]
+            model.fused_linear_ce_eval = True
+            fused = model(ids, labels=ids)["loss"]
+        torch.testing.assert_close(fused.float(), eager.float(), rtol=1e-3, atol=1e-3)
 
     def test_fused_eval_excludes_mtp_aux_losses(self):
         # Contract 5: MTP heads are a training-only auxiliary objective. The
