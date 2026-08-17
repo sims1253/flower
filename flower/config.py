@@ -249,6 +249,26 @@ class ModelConfig:
     # kernel); the forward falls back to the eager path automatically when the
     # flag is on but CUDA is unavailable. False reproduces old runs exactly.
     fused_linear_ce: bool = False
+    # S14-5b (eval extension): use the Liger fused lm_head+CE path for
+    # LOSS-ONLY eval forwards (validation / final evaluate()), where the eager
+    # head otherwise materializes the full (B*T, vocab) logits tensor plus the
+    # CE's fp32 log-softmax — at the 450M config (seq 8192, vocab 16384, bf16)
+    # ~0.5 GB for logits alone per forward, transiently ~1.5 GB with the CE
+    # reductions. That spike is what forces `eval_batch_size: 1` and
+    # `vram_fraction: 0.95` in the production configs.
+    #
+    # HONEST CONTRACT:
+    #   - Requires `fused_linear_ce: true` — this flag EXTENDS that fused path
+    #     from training to eval; alone it does nothing.
+    #   - With it on, a labels-carrying eval forward returns loss with
+    #     logits=None. Any consumer that needs logits (composite probes, the
+    #     Still teacher pass, logprob scoring) must run with it off. Probes
+    #     force it off internally (run_composite_eval save/restores it).
+    #   - CUDA/Triton-only, inheriting the training flag's fallback: off-CUDA
+    #     the eval forward silently runs the eager path (one-time warning).
+    #   - MTP aux losses stay training-only (eval still reports the t+1 loss).
+    #   - Default False reproduces every existing run exactly.
+    fused_linear_ce_eval: bool = False
     # S8: Multi-Token Prediction (final-runs only; changes the loss surface).
     # Predicts N extra future tokens with untied heads; aux losses weighted by
     # mtp_weight. 0 disables (standard next-token loss).

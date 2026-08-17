@@ -147,6 +147,12 @@ def evaluate(
         for _ in range(steps):
             input_ids, labels = unpack_batch(next(batches))
             with autocast_ctx(device, amp_dtype):
+                # Labels-carrying loss-only forward: when the model has
+                # fused_linear_ce_eval set (wired in train() right after the
+                # EMA deepcopy), this runs the Liger fused lm_head+CE and
+                # returns loss with logits=None — evaluate() reads only the
+                # loss, so the eval logits memory spike disappears. Off
+                # (default) or off-CUDA, the eager logits path runs unchanged.
                 out = model(input_ids, labels=labels)
             loss = out["loss"]
             if loss is None:
@@ -458,6 +464,20 @@ def train(argv: list[str] | None = None) -> dict[str, float | int | str]:
         for module in ema_model.modules():
             if isinstance(module, CausalSelfAttention) and getattr(module, "use_flex", False):
                 module._flex_needs_compile = True
+    # S14-5b eval extension: fused CE at validation. CausalLM.__init__ already
+    # reads the config flag so `eager_model` carries it, but pin it EXPLICITLY
+    # on BOTH models here: the EMA copy above is a deepcopy taken at this point
+    # (before any later flag toggling), and both validate through
+    # evaluate() — the in-loop validation and the final-metrics evaluate()
+    # below both pass `ema_model if ema_model is not None else model`, so the
+    # attr must be True on whichever one runs. With the flag on, those
+    # labels-carrying eval forwards use the Liger fused lm_head+CE and never
+    # materialize the (B*T, vocab) logits tensor (see ModelConfig.
+    # fused_linear_ce_eval). No-op for non-CausalLM models and when off.
+    if getattr(cfg.model, "fused_linear_ce_eval", False):
+        for target in filter(None, (eager_model, ema_model)):
+            if hasattr(target, "fused_linear_ce_eval"):
+                target.fused_linear_ce_eval = True
     initialize_lr_schedule(optims)
     batches = token_batches(cfg.data, cfg.training.batch_size, device, seed=int(cfg.training.seed))
     eval_bs = cfg.training.eval_batch_size or cfg.training.batch_size

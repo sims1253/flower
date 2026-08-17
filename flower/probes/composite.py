@@ -852,6 +852,19 @@ def run_composite_eval(
     doc_limit: int | None = 64,
 ) -> dict[str, Any]:
     was_training = model.training
+    # The probes below need LOGITS (`model(seq)["logits"]`). A model with the
+    # fused-eval CE flag on (fused_linear_ce_eval) returns logits=None from
+    # labels-carrying forwards, so force the flag off for the duration and
+    # restore it after — mirroring the train()/eval() state handling around
+    # this block. Today's logits reads all call without labels (so they take
+    # the eager branch regardless) and the label-carrying helpers
+    # (_continuation_nll/_sequence_nll) read only the loss; pinning the flag
+    # off keeps every probe on the exact eager numerics it was validated on
+    # and makes any future labels-carrying logits read correct by
+    # construction instead of by accident.
+    fused_eval_was_on = getattr(model, "fused_linear_ce_eval", False)
+    if fused_eval_was_on:
+        model.fused_linear_ce_eval = False
     model.eval()
     try:
         _empty_cuda_cache(device)
@@ -879,6 +892,8 @@ def run_composite_eval(
         blimp = blimp_mini_probe(model, cfg, device)
     finally:
         _empty_cuda_cache(device)
+        if fused_eval_was_on:
+            model.fused_linear_ce_eval = True
         if was_training:
             model.train()
 

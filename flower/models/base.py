@@ -713,6 +713,16 @@ class CausalLM(nn.Module):
         # defer to first use and fall back to eager if it is unavailable or the
         # device is not CUDA. See `_fused_cross_entropy`.
         self.fused_linear_ce = bool(getattr(config, "fused_linear_ce", False))
+        # S14-5b eval extension: with this on, the fused path above also serves
+        # LOSS-ONLY eval forwards (validation), where the eager head's
+        # (B*T, vocab) logits tensor is the eval-time memory spike. Requires
+        # `fused_linear_ce` (it extends that flag, not replaces it) and a
+        # labels-carrying forward; logits come back None, so logits consumers
+        # (probes, Still teacher pass) must keep it off — run_composite_eval
+        # save/restores it to False around its own forwards. Inherits the
+        # training flag's off-CUDA eager fallback (one-time warning). See the
+        # config field docstring in flower/config.py for the full contract.
+        self.fused_linear_ce_eval = bool(getattr(config, "fused_linear_ce_eval", False))
         self._liger_fce: Any = None
         # S14-checkpoint: activation checkpointing on the transformer blocks.
         # Stored verbatim (False | True | "selective") so forward can branch on
@@ -1106,11 +1116,15 @@ class CausalLM(nn.Module):
                     site += 1
         x_normed = self.ln(x)
         loss = None
-        # S14-5b: fused lm_head + CE path. Training-time only, CUDA/Triton only.
-        # When active the (B*T, vocab) logits tensor is never materialized, so
-        # `logits` stays None and every eval/logprob consumer (which runs in
-        # eval mode or without labels) keeps the eager path below. Falls back to
-        # eager automatically if Liger is unavailable or the device is not CUDA.
+        # S14-5b: fused lm_head + CE path. CUDA/Triton only. Active during
+        # training (fused_linear_ce) and, with `fused_linear_ce_eval`, for
+        # LOSS-ONLY eval forwards carrying labels — the eval-time (B*T, vocab)
+        # logits spike (see config). When active the logits tensor is never
+        # materialized, so `logits` stays None: every consumer that runs without
+        # labels (logprob/probe scoring) keeps the eager path below regardless
+        # of the flag, and label-carrying loss-only consumers (train.py
+        # evaluate()) get the memory saving. Falls back to eager automatically
+        # if Liger is unavailable or the device is not CUDA.
         # S9 TST: bagged labels are (B, T/s, s) and need the multi-hot objective,
         # which neither the eager nor the Liger CE path implements. Handled first
         # so the flags below cannot route a bagged batch into a 2-D loss.
@@ -1121,7 +1135,7 @@ class CausalLM(nn.Module):
 
         use_fused_ce = (
             self.fused_linear_ce
-            and self.training
+            and (self.training or self.fused_linear_ce_eval)
             and labels is not None
             and self._ensure_liger_fce()
         )
@@ -1131,7 +1145,15 @@ class CausalLM(nn.Module):
             loss = self._fused_cross_entropy(x_normed, labels, self.token.weight, offset=1)
             # S8 MTP heads: each untied head predicts t+2, t+3, ... The fused
             # path applies the per-head shift inside `_fused_cross_entropy`.
-            if self.mtp_heads is not None:
+            #
+            # `self.training` GUARD IS LOAD-BEARING and mirrors the eager
+            # branch below (see its comment): MTP is a TRAINING-ONLY auxiliary
+            # objective, and eval — including the fused-eval path this branch
+            # now serves — must report the t+1 loss alone (guarded by
+            # tests/test_fused_eval_ce.py). Without it, enabling
+            # fused_linear_ce_eval would reintroduce exactly the eval-loss leak
+            # tests/test_mtp_eval_loss.py pinned, through this branch.
+            if self.mtp_heads is not None and self.training:
                 for i, mtp_head in enumerate(self.mtp_heads):
                     mtp_loss = self._fused_cross_entropy(
                         x_normed, labels, mtp_head.weight, offset=i + 2
