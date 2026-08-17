@@ -697,6 +697,14 @@ re-test if pursued, gated on TE+`torch.compile`+Muon coexisting. The §13 config
 scaffolding (`ffn_precision`/`attn_precision`) is in place; only the TE-backed
 casting is missing.
 
+**UPDATE (2026-08-16): the torchao FP8 stack's 10k confirmation run missed its
+pre-registered quality band** — val_bpb 0.90428 vs the 0.0004 band around the
+bf16 seeds (0.90234/0.90270), at 1.30x throughput. The decision (accept the
++0.0016 offset for exploration runs / reject / re-measure with another seed)
+has NOT been made; see "The 10k confirmation run" in
+`docs/profiling/speedup_results.md` for the record and the options. Treat
+"FP8 ships" claims as unresolved until that section says otherwise.
+
 ## 12. Liger FusedRMSNorm + FusedSwiGLU: 2× SLOWER under compile — do not adopt
 
 **Source:** §5b (Liger-Kernel), which ranked FusedRMSNorm/SwiGLU/RoPE as P1
