@@ -61,8 +61,13 @@ def causal_prefix_attention(scores: torch.Tensor, v: torch.Tensor) -> torch.Tens
         GLOBAL max, while exact in real arithmetic, does not cancel in
         floating point and leaks future tokens at ~1e-8. Don't reintroduce
         either; the masked form is the reference.
-      * The softmax runs in fp32 (like the Sinkhorn helpers) to keep bf16
-        runs stable.
+      * The scores are floated to fp32 BEFORE the masked softmax, so the
+        softmax and the einsum against ``vf = v.float()`` run in a single
+        dtype (like the Sinkhorn helpers). Without the cast a pure-bf16 model
+        keeps bf16 ``probs`` next to fp32 ``vf`` and the einsum raises
+        ``RuntimeError: expected scalar type Float but found BFloat16``
+        (pinned by the bf16 causal regression test); fp32 also keeps the
+        prefix softmax stable when bf16 scores carry large magnitudes.
 
     Args:
         scores: (B, H, P, T) — ALREADY-scaled query-to-kv scores (P latent
@@ -74,6 +79,10 @@ def causal_prefix_attention(scores: torch.Tensor, v: torch.Tensor) -> torch.Tens
     bsz, heads, points, seq = scores.shape
     head_dim = v.shape[-1]
     vf = v.float()
+    # Float the scores once up front so probs matches vf's dtype (see the
+    # bf16 note above); every chunk's masked_fill/softmax/einsum then runs
+    # uniformly in fp32.
+    scores = scores.float()
     # Output positions are chunked; the key axis is always the full prefix.
     step = max(1, min(seq, (2**26) // max(1, bsz * heads * points * seq)))
     chunks: list[torch.Tensor] = []
@@ -269,6 +278,18 @@ class MemoryRead(nn.Module):
             return None
         if self.kernel_bias == "positional":
             return self.slot_bias[:m_len].to(device=device, dtype=dtype).view(1, 1, 1, 1, m_len)
+        # NOTE (rbf grid is LENGTH-conditional, not token-value leaky): q_pos
+        # normalises each token's position by the CURRENT sequence length
+        # (linspace(0, 1, q_len)), exactly like the legacy read's grid. Token
+        # t's bias therefore depends on T (position t/(T-1)), so running the
+        # model on a truncated window rescales every query position and the
+        # strict prefix-truncation invariance test sits at ~1.5e-5 — just
+        # above the 1e-5 atol the kernel_bias="none" variants hold (the
+        # truncation test covers rbf with an annotated relaxed tolerance).
+        # This is NOT a causality leak: no future token VALUES enter the bias
+        # (the exact-0 last-token perturbation test passes unchanged with
+        # rbf), and the legacy read has the same T-dependence, so flag-on and
+        # flag-off behave consistently.
         q_pos = torch.linspace(0, 1, q_len, device=device, dtype=dtype).view(q_len, 1)
         m_pos = torch.linspace(0, 1, m_len, device=device, dtype=dtype).view(1, m_len)
         scale = self.rbf_scale.abs().to(dtype=dtype) + 1e-6

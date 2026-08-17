@@ -66,12 +66,17 @@ CAUSAL_MEMORY_VARIANTS = [
     "surprise_memory",
     "frequency_decay_memory",
     "bloom_memory",
+    # fa_sm builds SummaryMemoryBlocks (fixed above) plus a last-dim-only
+    # EulerFlow memory read, so it is FULLY causal under the flag — measured
+    # last-token leak exactly 0.0 (pullfrog review of the audit table moved
+    # it here from the unfixed column).
+    "fa_sm",
 ]
 
 MEMORY_ONLY_VARIANTS = [v for v in CAUSAL_MEMORY_VARIANTS if v != "vanilla_local"]
 
 
-def _tiny_cfg(variant: str, causal: bool = True) -> ModelConfig:
+def _tiny_cfg(variant: str, causal: bool = True, **options) -> ModelConfig:
     return ModelConfig(
         variant=variant,
         vocab_size=64,
@@ -83,6 +88,7 @@ def _tiny_cfg(variant: str, causal: bool = True) -> ModelConfig:
         local_window=16,
         memory_slots=8,
         causal_memory=causal,
+        **options,
     )
 
 
@@ -120,6 +126,36 @@ def test_causal_memory_prefix_truncation_invariance(variant):
     assert torch.allclose(full, trunc, atol=1e-5), (
         f"max delta {(full - trunc).abs().max().item()}"
     )
+
+
+def test_causal_memory_prefix_truncation_rbf_kernel_bias_floor():
+    """memory_kernel_bias="rbf" + causal_memory=True: DOCUMENTED ~1.5e-5 floor.
+
+    The rbf grid in MemoryRead._bias_causal normalises each token's query
+    position by the CURRENT sequence length (linspace(0, 1, q_len), same
+    construction as the legacy read), so truncating the window from T to
+    `cut` rescales every query position t/(T-1) -> t/(cut-1) and moves the
+    logits slightly. Measured max delta ~1.5e-5 at this seed — just above the
+    1e-5 atol that the kernel_bias="none" variants hold in the test above,
+    hence this dedicated case with a relaxed, annotated tolerance.
+
+    This is length-CONDITIONAL bias, not token-value leakage: no future token
+    values enter the bias or the write (the last-token perturbation test
+    measures exactly 0.0 with rbf too), and the legacy read has the same
+    T-dependence. Pinned so a future change to the grid (e.g. normalising by
+    max_seq_len to make it length-invariant) flips this expectation
+    deliberately."""
+    torch.manual_seed(0)
+    cfg = _tiny_cfg("summary_memory", causal=True, memory_kernel_bias="rbf")
+    model = build_model(cfg).eval()
+    torch.manual_seed(2)
+    x = torch.randint(0, cfg.vocab_size, (2, 48))
+    cut = 30
+    with torch.no_grad():
+        full = model(x)["logits"][:, :cut]
+        trunc = model(x[:, :cut])["logits"]
+    delta = (full - trunc).abs().max().item()
+    assert delta < 5e-5, f"rbf truncation delta {delta} blew past the documented ~1.5e-5 floor"
 
 
 @pytest.mark.parametrize("variant", CAUSAL_MEMORY_VARIANTS)
@@ -165,30 +201,109 @@ def test_sdpcross_attention_causal_forward_matches_prefix_attention():
 
 
 # ---------------------------------------------------------------------------
-# Flow-hybrid audit (READ-ONLY; these variants are NOT fixed by the causal
-# memory PR — their write paths live in files owned by other changes). The
-# table pins the measured leak status so any future fix flips an expectation
-# here and forces this table (and the PR notes) to be updated.
-# Measured max |logits[:, :-1] delta| from perturbing only the last input
-# token, tiny 3-layer config, seed-controlled (see test): every hybrid leaks.
+# Flow-hybrid audit. Of the five flow hybrids, only fa_sm is fixed by the
+# causal-memory flag (it builds SummaryMemoryBlocks — see CAUSAL_MEMORY_VARIANTS
+# above; measured leak exactly 0.0). The other four (flow_memory,
+# flow_meanflow, flow_pma, fa_fm) contain NO causal_memory handling: their
+# write paths live in files owned by the causal-flow-hybrids follow-up PR
+# (#12). Setting causal_memory=True on them would silently train non-causal,
+# so build_model refuses loudly (see CAUSAL_MEMORY_UNSUPPORTED_VARIANTS in
+# flower/models/__init__.py). This table pins the LEGACY (flag-off) leak that
+# justifies the guard: measured max |logits[:, :-1] delta| from perturbing
+# only the last input token, tiny 3-layer config, seed-controlled (see test).
+# When PR #12 fixes a variant it must remove it here AND drop the guard.
 # ---------------------------------------------------------------------------
 
 FLOW_HYBRID_LEAK_STATUS = {
     "flow_memory": 0.00397,
     "flow_meanflow": 0.01196,
     "flow_pma": 0.00541,
-    "fa_sm": 0.00374,
     "fa_fm": 0.00250,
 }
 
 
 @pytest.mark.parametrize("variant", sorted(FLOW_HYBRID_LEAK_STATUS))
-def test_flow_hybrid_leak_status_is_as_documented(variant):
-    cfg = _tiny_cfg(variant, causal=False)  # current (legacy) code path
+def test_unsupported_flow_hybrid_fails_loudly_and_legacy_leak_is_as_documented(variant):
+    # causal_memory=True must not silently train the legacy write: model
+    # construction raises, naming the variant and the follow-up PR.
+    with pytest.raises(ValueError, match=variant):
+        build_model(_tiny_cfg(variant, causal=True))
+    # The reason for the guard is still true: the legacy (flag-off) write
+    # aggregates the whole window, so the last-token perturbation leaks into
+    # past logits. Seed BEFORE build_model so the pinned table above is
+    # reproducible regardless of which tests ran before this one.
+    torch.manual_seed(3)
+    cfg = _tiny_cfg(variant, causal=False)  # legacy code path
     model = build_model(cfg).eval()
     delta = _last_token_leak(model, cfg.vocab_size)
     leaks = delta > 1e-5
     assert leaks, (
         f"{variant} no longer leaks (delta={delta:.2e}) — it was fixed; update "
-        f"FLOW_HYBRID_LEAK_STATUS and the causal-memory PR notes"
+        f"FLOW_HYBRID_LEAK_STATUS, drop it from CAUSAL_MEMORY_UNSUPPORTED_VARIANTS, "
+        f"and move it to CAUSAL_MEMORY_VARIANTS"
     )
+
+
+def test_fa_sm_is_supported_but_fa_fm_is_not():
+    """fa_sm (SummaryMemoryBlocks) honours the flag; fa_fm must still guard."""
+    build_model(_tiny_cfg("fa_sm", causal=True))  # no ValueError
+    with pytest.raises(ValueError, match="fa_fm"):
+        build_model(_tiny_cfg("fa_fm", causal=True))
+
+
+# ---------------------------------------------------------------------------
+# bf16 regression (pullfrog A1): causal_prefix_attention used to keep the
+# scores' dtype through the softmax while floating v, so any causal path
+# routing through it crashed pure-bf16 models with
+# "expected scalar type Float but found BFloat16". The scores are now floated
+# before the masked softmax; these tests pin both the primitive and every
+# model-level causal path that routes through it (summary perceiver /
+# attention-aggregation, bloom, flow_ot).
+# ---------------------------------------------------------------------------
+
+
+def test_causal_prefix_attention_bf16_mixed_scores_and_values():
+    torch.manual_seed(0)
+    B, H, P, T, hd = 2, 3, 4, 7, 5
+    scores = (torch.randn(B, H, P, T) * 3.0).to(torch.bfloat16)
+    v = torch.randn(B, H, T, hd).to(torch.bfloat16)
+    out = causal_prefix_attention(scores, v)  # used to raise RuntimeError
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+    # fp32-computed reference on the same values: bf16 inputs lose precision,
+    # but the fp32 softmax keeps the agreement tight.
+    ref = causal_prefix_attention(scores.float(), v.float())
+    assert torch.allclose(out.float(), ref, atol=1e-2), (out.float() - ref).abs().max().item()
+
+
+BF16_CAUSAL_CASES = [
+    ("linear_memory", {}),
+    ("summary_memory", {}),
+    # Both causal_prefix_attention users inside SummaryMemoryBlock:
+    ("summary_memory", {"summary_style": "perceiver"}),
+    ("summary_memory", {"memory_aggregation": "attention"}),
+    ("phase_memory", {}),
+    ("partitioned_memory", {}),
+    ("titans_mac", {}),
+    ("flow_ot_memory", {}),  # causal source attention
+    ("surprise_memory", {}),
+    ("frequency_decay_memory", {}),
+    ("bloom_memory", {}),  # causal summary attention
+    ("fa_sm", {}),  # SummaryMemoryBlock write + flow memory read
+]
+
+
+@pytest.mark.parametrize("variant,options", BF16_CAUSAL_CASES)
+def test_causal_memory_bf16_forward_and_backward_do_not_crash(variant, options):
+    """A pure-bf16 causal model must forward (and backward) cleanly.
+
+    Exercises the fp32-floated prefix softmax in causal_prefix_attention
+    (perceiver summary + attention aggregation, bloom, flow_ot), which
+    crashed before the fix; the remaining variants pin that no other causal
+    write/read path mixes dtypes either."""
+    cfg = _tiny_cfg(variant, causal=True, **options)
+    model = build_model(cfg).to(torch.bfloat16)
+    x = torch.randint(0, cfg.vocab_size, (2, 48))
+    out = model(x, labels=x)
+    assert torch.isfinite(out["loss"])
+    out["loss"].backward()

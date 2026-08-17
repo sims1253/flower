@@ -24,8 +24,34 @@ from flower.models.titans_mac import build_titans_mac_model
 from flower.models.vanilla import build_vanilla_model
 
 
+# ---------------------------------------------------------------------------
+# causal_memory support map (see ModelConfig.causal_memory).
+#
+# Variants listed here do NOT implement the causal memory write yet: their
+# blocks ignore config.causal_memory entirely, so a user setting it to True
+# would silently train the legacy (whole-window, future-leaking) write while
+# believing they run causal. Fail loudly at construction instead.
+#
+# fa_sm is deliberately NOT listed: it builds SummaryMemoryBlocks, which are
+# fully causal under the flag (measured last-token leak exactly 0.0).
+#
+# The causal-flow-hybrids follow-up PR (#12, fix/causal-flow-hybrids) fixes
+# the four flow hybrids below and removes them from this set — keep the guard
+# as a set + single check so that update is a one-line edit.
+# ---------------------------------------------------------------------------
+CAUSAL_MEMORY_UNSUPPORTED_VARIANTS = frozenset({"flow_memory", "flow_meanflow", "flow_pma", "fa_fm"})
+
+
 def build_model(config: ModelConfig) -> CausalLM:
     variant = config.variant
+    if config.causal_memory and variant in CAUSAL_MEMORY_UNSUPPORTED_VARIANTS:
+        raise ValueError(
+            f"variant {variant!r} does not support causal_memory=True yet: its memory "
+            f"write still aggregates the whole window (future tokens included), so the "
+            f"flag would be silently ignored. Run it with causal_memory=False (the "
+            f"legacy behaviour), or use a supported variant. {variant!r} is fixed by "
+            f"the causal-flow-hybrids follow-up PR (#12, fix/causal-flow-hybrids)."
+        )
     if variant == "vanilla_local":
         return build_vanilla_model(config, full_context=False)
     if variant == "vanilla_full":
