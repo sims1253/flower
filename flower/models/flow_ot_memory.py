@@ -43,7 +43,7 @@ from torch import nn
 
 from flower.config import ModelConfig
 from flower.models.base import CausalLM, CausalSelfAttention, FeedForward
-from flower.models.memory import MemoryRead
+from flower.models.memory import MemoryRead, causal_prefix_attention
 
 
 def _sinkhorn_rect(cost: torch.Tensor, *, epsilon: float, iters: int) -> torch.Tensor:
@@ -100,7 +100,35 @@ class FlowOTMemoryBlock(nn.Module):
     def _initial_memory(self, x: torch.Tensor) -> torch.Tensor:
         return x.new_zeros(x.shape[0], self.config.memory_slots, self.config.d_model)
 
+    def _initial_memory_causal(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, S, D) per-position memory state for causal_memory=True."""
+        return x.new_zeros(x.shape[0], x.shape[1], self.config.memory_slots, self.config.d_model)
+
+    def _causal_source_attn(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-position prefix source summaries using source_attn's MHA weights.
+
+        Same parameters as the whole-window `self.source_attn(queries, x, x)`
+        call (in_proj / out_proj, no new params) and the same math (per-head
+        scaling 1/sqrt(head_dim)), but every position t's source set attends
+        to x[:, :t+1] only. Returns (B, T, P, D).
+        """
+        bsz, seq_len, d_model = x.shape
+        heads = self.source_attn.num_heads
+        head_dim = d_model // heads
+        w_q, w_k, w_v = self.source_attn.in_proj_weight.chunk(3, dim=0)
+        b_q, b_k, b_v = self.source_attn.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(self.source_queries, w_q, b_q)  # (P, D)
+        q = q.view(1, -1, heads, head_dim).permute(0, 2, 1, 3).expand(bsz, -1, -1, -1)  # (B, H, P, hd)
+        k = F.linear(x, w_k, b_k).view(bsz, seq_len, heads, head_dim).permute(0, 2, 1, 3)  # (B, H, T, hd)
+        v = F.linear(x, w_v, b_v).view(bsz, seq_len, heads, head_dim).permute(0, 2, 1, 3)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(head_dim)  # (B, H, P, T)
+        ctx = causal_prefix_attention(scores, v)  # (B, H, T, P, hd)
+        ctx = ctx.permute(0, 2, 3, 1, 4).reshape(bsz, seq_len, -1, d_model)  # (B, T, P, D)
+        return self.source_attn.out_proj(ctx)
+
     def _update_memory(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if self.config.causal_memory:
+            return self._update_memory_causal(memory, x)
         bsz = x.shape[0]
         queries = self.source_queries.expand(bsz, -1, -1)
         source, _ = self.source_attn(queries, x, x, need_weights=False)  # (B, P, D)
@@ -120,20 +148,58 @@ class FlowOTMemoryBlock(nn.Module):
         # routed to one source point, high = each slot a uniform mix) and slot
         # mass max (how concentrated source points routed onto a single slot
         # before column renorm -- captures slot-collapse).
-        with torch.no_grad():
-            entropy = -(plan_col.clamp_min(1e-9) * plan_col.clamp_min(1e-9).log()).sum(dim=1).mean()
-            slot_mass = plan.sum(dim=1)  # (B, S) mass arriving at each slot
-            self.last_diag_ot_plan_entropy = float(entropy.cpu())
-            self.last_diag_ot_slot_mass_max = float(slot_mass.max().cpu())
+        # Skipped under torch.compile: the host syncs (float(...cpu())) graph-
+        # break the compiled region (same guard/pattern as bloom_memory).
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                entropy = -(plan_col.clamp_min(1e-9) * plan_col.clamp_min(1e-9).log()).sum(dim=1).mean()
+                slot_mass = plan.sum(dim=1)  # (B, S) mass arriving at each slot
+                self.last_diag_ot_plan_entropy = float(entropy.cpu())
+                self.last_diag_ot_slot_mass_max = float(slot_mass.max().cpu())
 
         t = float(self.layer_idx + 1) / float(max(1, self.config.num_layers))
         t_emb = self.time_embed(memory.new_full((bsz, 1, 1), t)).expand(-1, memory.shape[1], -1)
         delta = self.velocity(torch.cat([memory, write_signal, t_emb], dim=-1))
         return memory + delta / float(max(1, self.config.num_layers))
 
+    def _update_memory_causal(self, memory: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """causal_memory=True write: memory is a per-position state (B, T, S, D).
+
+        Same OT pipeline and velocity field as ``_update_memory`` (no new
+        parameters), but every stage is per-position: the source set, cost,
+        Sinkhorn plan and write signal at t are computed from tokens <= t and
+        the slot state at t.
+        """
+        bsz, seq_len, _, _ = memory.shape
+        source = self._causal_source_attn(x)  # (B, T, P, D)
+
+        src_e = F.normalize(self.source_proj(source), dim=-1)  # (B, T, P, D)
+        slot_e = F.normalize(self.slot_proj(memory), dim=-1)  # (B, T, S, D)
+        # Cosine cost in [0, 2]; lower = more similar = preferred transport.
+        cost = 1.0 - torch.einsum("btpd,btsd->btps", src_e, slot_e)  # (B, T, P, S)
+
+        plan = _sinkhorn_rect(cost.reshape(bsz * seq_len, cost.shape[2], cost.shape[3]),
+                              epsilon=self.config.ot_epsilon, iters=self.config.ot_iters).view_as(cost)
+        # Column renorm over source points (dim=2 here vs dim=1 legacy).
+        plan_col = plan / (plan.sum(dim=2, keepdim=True) + 1e-9)  # (B, T, P, S)
+        write_signal = torch.einsum("btps,btpd->btsd", plan_col, source)  # (B, T, S, D)
+        # Diagnostics (guarded, per-position analogue of the legacy scalars).
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                entropy = -(plan_col.clamp_min(1e-9) * plan_col.clamp_min(1e-9).log()).sum(dim=2).mean()
+                slot_mass = plan.sum(dim=2)  # (B, T, S) mass arriving at each slot
+                self.last_diag_ot_plan_entropy = float(entropy.cpu())
+                self.last_diag_ot_slot_mass_max = float(slot_mass.max().cpu())
+
+        t = float(self.layer_idx + 1) / float(max(1, self.config.num_layers))
+        t_emb = self.time_embed(memory.new_full((bsz, seq_len, 1), t))  # (B, T, D)
+        t_emb = t_emb.unsqueeze(2).expand(-1, -1, memory.shape[2], -1)  # (B, T, S, D)
+        delta = self.velocity(torch.cat([memory, write_signal, t_emb], dim=-1))
+        return memory + delta / float(max(1, self.config.num_layers))
+
     def forward(self, x: torch.Tensor, memory: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if memory is None:
-            memory = self._initial_memory(x)
+            memory = self._initial_memory_causal(x) if self.config.causal_memory else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
         x = x + self.mem_read(self.ln_mem(x), memory)
         x = x + self.ff(self.ln2(x))

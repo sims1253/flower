@@ -10,6 +10,104 @@ from torch import nn
 from flower.config import ModelConfig
 
 
+# ---------------------------------------------------------------------------
+# Causal-memory primitives (config.causal_memory=True).
+#
+# The legacy memory write aggregates the WHOLE window into a single (B, S, D)
+# bank, so the bank a layer-i+1 read consumes at position t contains tokens
+# AFTER t (see ModelConfig.causal_memory). These helpers compute the causal
+# counterparts: per-position prefix reductions of (B, T, D) tensors and a
+# prefix-softmax cross-attention. Everything is differentiable, adds no
+# parameters, and is only ever called from the causal branch of a variant's
+# write path — the legacy (flag-off) ops are untouched.
+# ---------------------------------------------------------------------------
+
+
+def causal_running_mean(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    """Prefix mean along ``dim``: out[..., t, ...] = mean(x[..., :t+1], ...).
+
+    Causal counterpart of ``x.mean(dim=dim)`` via cumsum / prefix count.
+    """
+    total = torch.cumsum(x, dim=dim)
+    n = torch.arange(1, x.shape[dim] + 1, device=x.device, dtype=x.dtype)
+    shape = [1] * x.dim()
+    shape[dim] = x.shape[dim]
+    return total / n.view(shape)
+
+
+def causal_prefix_attention(scores: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Prefix-softmax cross-attention: query row p attends kv columns j <= t.
+
+    The causal counterpart of the (unmasked) cross-attention used by the
+    perceiver-style memory summaries. Instead of one summary per window (which
+    reads future tokens), output position ``t`` gets the same latent queries
+    softmaxed over the PREFIX ``j <= t`` only::
+
+        out[t, p] = sum_{j<=t} softmax_{j<=t}(scores[p, j]) @ v[j]
+
+    Implemented as an explicitly masked softmax over the key axis, chunked
+    over output positions so the (B, H, P, Tc, T) probability tensor stays
+    around 2**26 elements (~256 MB fp32) — under the ~1 GB chunking budget
+    even at the research shape (B=8, H=6, P=16, T=2048, Tc~85).
+
+    CAUSALITY / CORRECTNESS NOTES (both learned the hard way):
+      * Masked entries are filled with -inf BEFORE the softmax, so future
+        tokens get weight exactly 0 — every output is a bitwise function of
+        positions <= t (a plain allclose causality check passes at 0.0, not
+        just under a tolerance).
+      * A "cheap" prefix-softmax via cumsum of exp(s - running_max) is WRONG:
+        the online-softmax rescaling does not telescope across a plain cumsum
+        when the running max increases mid-sequence. And normalising by a
+        GLOBAL max, while exact in real arithmetic, does not cancel in
+        floating point and leaks future tokens at ~1e-8. Don't reintroduce
+        either; the masked form is the reference.
+      * The softmax runs in fp32 (like the Sinkhorn helpers) to keep bf16
+        runs stable.
+
+    Args:
+        scores: (B, H, P, T) — ALREADY-scaled query-to-kv scores (P latent
+            queries, T kv positions).
+        v:      (B, H, T, hd) — kv values.
+    Returns:
+        (B, H, T, P, hd).
+    """
+    bsz, heads, points, seq = scores.shape
+    head_dim = v.shape[-1]
+    vf = v.float()
+    # Output positions are chunked; the key axis is always the full prefix.
+    step = max(1, min(seq, (2**26) // max(1, bsz * heads * points * seq)))
+    chunks: list[torch.Tensor] = []
+    device = scores.device
+    cols = torch.arange(seq, device=device)
+    for start in range(0, seq, step):
+        end = min(start + step, seq)
+        rows = torch.arange(start, end, device=device)
+        # mask[i, j] = key j is visible to output row i (j <= i).
+        mask = cols.unsqueeze(0) <= rows.unsqueeze(1)  # (Tc, T)
+        # (B, H, P, Tc, T): broadcast the key scores across output rows, then
+        # mask; softmax over the key axis is the prefix softmax per row.
+        s = scores.unsqueeze(3).expand(bsz, heads, points, end - start, seq)
+        probs = torch.softmax(s.masked_fill(~mask, float("-inf")), dim=-1)
+        probs = probs.transpose(2, 3)  # (B, H, Tc, P, T)
+        chunks.append(torch.einsum("bhtpj,bhjd->bhtpd", probs, vf))
+    out = torch.cat(chunks, dim=2) if len(chunks) > 1 else chunks[0]
+    return out.to(v.dtype)
+
+
+def causal_last_tokens(x: torch.Tensor, n: int) -> torch.Tensor:
+    """(B, T, D) -> (B, T, n, D): the ``n`` tokens ENDING at each position.
+
+    Causal counterpart of the legacy hierarchical short-memory write
+    ``x[:, -n:]`` (the last n tokens of the window): at position t the legacy
+    slice includes tokens after t, so the causal form takes the last n tokens
+    of the PREFIX ending at t (left zero-padded exactly like the legacy path
+    pads a too-short window).
+    """
+    padded = F.pad(x, (0, 0, n - 1, 0))  # (B, T + n - 1, D)
+    # unfold appends the window dim last: (B, T, D, n) -> permute to (B, T, n, D)
+    return padded.unfold(dimension=1, size=n, step=1).permute(0, 1, 3, 2).contiguous()
+
+
 class SDPCrossAttention(nn.Module):
     """Compile-clean cross-attention via ``F.scaled_dot_product_attention``.
 
@@ -64,6 +162,33 @@ class SDPCrossAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(q_input.shape[0], q_input.shape[1], self.num_heads * self.head_dim)
         return self.out_proj(out)
 
+    def causal_forward(self, latents: torch.Tensor, kv_input: torch.Tensor) -> torch.Tensor:
+        """Causal-memory path (config.causal_memory=True). DO NOT use otherwise.
+
+        Same parameters and projections as ``forward`` (no new params), but
+        every output position ``t`` gets the SAME latent queries attending to
+        the PREFIX ``kv_input[:, :t+1]`` only, so the summary written into the
+        memory state at t is a function of tokens <= t. Scaling matches
+        ``forward``'s SDPA (1/sqrt(head_dim)).
+
+        Args:
+            latents:  (B, P, D) or (1, P, D) — learned perceiver queries.
+            kv_input: (B, T, D) — the token window.
+        Returns:
+            (B, T, P, D): the per-position summaries that replace the single
+            (B, P, D) whole-window summary in the causal write path.
+        """
+        bsz, seq_len, _ = kv_input.shape
+        q = self._split(self.q_proj(latents))  # (1|B, H, P, hd)
+        if q.shape[0] != bsz:
+            q = q.expand(bsz, -1, -1, -1)
+        k = self._split(self.k_proj(kv_input))  # (B, H, T, hd)
+        v = self._split(self.v_proj(kv_input))
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)  # (B, H, P, T)
+        ctx = causal_prefix_attention(scores, v)  # (B, H, T, P, hd)
+        ctx = ctx.permute(0, 2, 3, 1, 4).reshape(bsz, seq_len, -1, self.num_heads * self.head_dim)  # (B, T, P, D)
+        return self.out_proj(ctx)
+
 
 class MemoryRead(nn.Module):
     def __init__(self, config: ModelConfig, flow: nn.Module | None = None) -> None:
@@ -101,6 +226,10 @@ class MemoryRead(nn.Module):
         return (-(q_pos - m_pos).pow(2) * scale).view(1, 1, q_len, m_len)
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        if memory.dim() == 4:
+            # causal_memory=True: memory is a per-position state (B, T, S, D);
+            # the read at token t consumes only the state at t.
+            return self._forward_causal(x, memory)
         q = self._split(self.q(x))
         k, v = self.kv(memory).chunk(2, dim=-1)
         k, v = self._split(k), self._split(v)
@@ -124,6 +253,62 @@ class MemoryRead(nn.Module):
         else:
             attn = torch.softmax(scores, dim=-1)
             out = attn @ v
+        out = out.transpose(1, 2).contiguous().view(x.shape)
+        return self.out(out)
+
+    def _bias_causal(
+        self, q_len: int, m_len: int, device: torch.Device, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """Kernel bias for the per-position read, broadcastable to (B, H, T, 1, S).
+
+        Same construction as ``_bias`` but with an extra position axis: each
+        token t is its own query row, so the rbf bias uses t's own normalised
+        position rather than a shared (q_len, m_len) grid.
+        """
+        if self.kernel_bias == "none":
+            return None
+        if self.kernel_bias == "positional":
+            return self.slot_bias[:m_len].to(device=device, dtype=dtype).view(1, 1, 1, 1, m_len)
+        q_pos = torch.linspace(0, 1, q_len, device=device, dtype=dtype).view(q_len, 1)
+        m_pos = torch.linspace(0, 1, m_len, device=device, dtype=dtype).view(1, m_len)
+        scale = self.rbf_scale.abs().to(dtype=dtype) + 1e-6
+        return (-(q_pos - m_pos).pow(2) * scale).view(1, 1, q_len, 1, m_len)
+
+    def _forward_causal(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        """Per-position read for causal_memory=True. Same parameters as the
+        legacy read; the token at position t attends over the memory state at
+        t only (a (T, 1, S) attention per batch-head), so the read cannot see
+        a memory state built from tokens after t."""
+        bsz, seq_len, slots, _ = memory.shape
+        q = self._split(self.q(x))  # (B, H, T, hd)
+        k, v = self.kv(memory).chunk(2, dim=-1)  # (B, T, S, D) each
+        k = k.reshape(bsz, seq_len, slots, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        v = v.reshape(bsz, seq_len, slots, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        # (B, H, T, S, hd); the flow's MLP/time-embedding ops are last-dim ops
+        # and work unchanged on the extra position axis.
+        if self.flow is not None:
+            q = self.flow(q)
+            k = self.flow(k)
+        scores = q.unsqueeze(-2) @ k.transpose(-2, -1) / math.sqrt(self.head_dim)  # (B, H, T, 1, S)
+        bias = self._bias_causal(seq_len, slots, x.device, scores.dtype)
+        if bias is not None:
+            scores = scores + bias
+        if self.energy_read:
+            beta = self.energy_log_beta.exp().clamp_min(1e-6).to(device=scores.device)
+            scores_f = scores.float()
+            v_f = v.float()
+            log_partition = torch.logsumexp(beta.float() * scores_f, dim=-1).unsqueeze(-1)
+            # scores_f.unsqueeze(-1): (B,H,T,1,S,1); v_f.unsqueeze(3): (B,H,T,1,S,hd);
+            # logsumexp over the S axis (dim=-2) -> (B, H, T, 1, 1, hd).
+            out = (
+                torch.logsumexp(beta.float() * (scores_f.unsqueeze(-1) + v_f.unsqueeze(3)), dim=-2)
+                - log_partition
+            ) / beta.float()
+            out = out.to(dtype=v.dtype).squeeze(3).squeeze(-2)  # (B, H, T, hd)
+        else:
+            attn = torch.softmax(scores, dim=-1)  # (B, H, T, 1, S)
+            out = (attn @ v).squeeze(-2)  # (B, H, T, hd)
+        # Merge heads back into the feature dim (same tail as the legacy read).
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
