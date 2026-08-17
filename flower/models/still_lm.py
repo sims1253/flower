@@ -35,7 +35,6 @@ from flower.models.still import (
     StillCompactor,
     StillCompactorFlow,
     StillCompactorOT,
-    StillCompactorOTReg,
     StillCompactorSpectral,
 )
 from flower.models.still_flow2 import StillCompactorFlowOT, StillCompactorMeanFlow
@@ -132,6 +131,7 @@ class StillLM(nn.Module):
         ot_reg_weight: float = 0.0,
         flow_steps: int = 0,
         meanflow_steps: int = 0,
+        meanflow_loss_weight: float = 0.0,
         flow_ot: bool = False,
         flow_kv: bool = False,
         ot_epsilon: float = 0.1,
@@ -155,6 +155,43 @@ class StillLM(nn.Module):
         self.kl_temperature = kl_temperature
         self._base_warmup_steps = base_warmup_steps
         self._current_step = 0
+
+        if ot_reg_weight > 0:
+            # StillCompactorOTReg (still.py) was byte-identical to the plain
+            # compactor: its forward read neither ot_reg_weight nor produced a
+            # penalty, and no training-loss consumer ever existed, so every
+            # run made with this flag was a plain-compactor run regardless.
+            # The dead class is deleted; fail loudly instead of training a
+            # mislabeled arm.
+            raise ValueError(
+                "still_ot_reg_weight > 0 selects the removed 'OT-regularized' "
+                "compactor arm, which never had any effect: its forward was "
+                "identical to the plain StillCompactor and no OT penalty was "
+                "ever computed or consumed. No existing results are affected "
+                "(they were plain-compactor runs). Use still_use_ot_read "
+                "(StillCompactorOT, which does replace the read with a Sinkhorn "
+                "plan) or leave this at 0."
+            )
+
+        # The single-pass warmup phase is keyed on compact_from_step (see
+        # forward), and the docstring promises the base is FROZEN during it.
+        # Base unfreezing keys on base_warmup_steps, so
+        # base_warmup_steps > compact_from_step would leave the base trainable
+        # inside the dual-pass compactor phase (the student pass backprops
+        # straight through the base blocks), contradicting the frozen-teacher
+        # design and every KL comparison made against it. Refuse it up front.
+        if base_warmup_steps > compact_from_step:
+            raise ValueError(
+                f"still_base_warmup_steps ({base_warmup_steps}) exceeds "
+                f"still_compact_from_step ({compact_from_step}): the base would "
+                "still be unfrozen when the dual-pass compactor phase begins "
+                "(the phase boundary keys on compact_from_step, the freeze on "
+                "base_warmup_steps), so the 'frozen base' teacher/student "
+                "comparison would train the base through the student pass. "
+                "Warm the base entirely inside the single-pass phase "
+                "(base_warmup_steps <= compact_from_step)."
+            )
+
         # asdict() over the config was rebuilt on every forward; it is constant.
         self._config_dict: dict[str, Any] | None = None
         self.suffix_len = getattr(config, "still_suffix_len", None)
@@ -165,9 +202,12 @@ class StillLM(nn.Module):
             )
         self.layer_adaptive = layer_adaptive
         self.attn_match_weight = attn_match_weight
-        self.ot_reg_weight = ot_reg_weight
         self.flow_steps = flow_steps
         self.meanflow_steps = meanflow_steps
+        # Weight of the MeanFlow self-consistency loss (0.0 = legacy: the
+        # compactor computes it but StillLM discards it, reproducing every
+        # prior still_meanflow run).
+        self.meanflow_loss_weight = meanflow_loss_weight
         self.flow_ot = flow_ot
         self.flow_kv = flow_kv
 
@@ -206,8 +246,6 @@ class StillLM(nn.Module):
             compactor_cls = StillCompactorFlow
         elif use_ot_read:
             compactor_cls = StillCompactorOT
-        elif ot_reg_weight > 0:
-            compactor_cls = StillCompactorOTReg
         else:
             compactor_cls = StillCompactor
 
@@ -218,6 +256,11 @@ class StillLM(nn.Module):
             layer_compact_lens = [compact_len] * num_layers
 
         self.layer_compact_lens = layer_compact_lens
+        # The compactors un-rotate (and re-rotate) the BASE model's RoPE with
+        # `base_rope_base`; defaulting it to 10000 while a config sweeps
+        # `rope_base` silently corrupted every compact key (wrong inverse
+        # rotation). Thread the base config's actual base through.
+        base_rope_base = float(getattr(config, "rope_base", 10000.0))
         self.compactors = nn.ModuleList()
         for i in range(num_layers):
             kwargs = dict(
@@ -226,7 +269,8 @@ class StillLM(nn.Module):
                 compact_len=layer_compact_lens[i],
                 num_blocks=num_blocks,
                 d_latent=layer_d_latents[i],
-                # Identity init is only valid when d_latent == 2*head_dim (the
+                base_rope_base=base_rope_base,
+                # Identity init is only valid when d_latent == 2 * head_dim (the
                 # eye() slice in StillCompactor._init_identity requires it).
                 identity_init=(layer_d_latents[i] == 2 * head_dim),
                 use_energy_read=use_energy_read,
@@ -254,6 +298,13 @@ class StillLM(nn.Module):
 
         self._kv_cache: list[dict[str, torch.Tensor]] = [{} for _ in range(num_layers)]
         self._compact_mode = False
+        # Parameter counts are constant per build; sum(p.numel()) walked every
+        # parameter on every forward (pattern: CausalLM._static_diagnostics).
+        self._static_diagnostics: dict[str, Any] = {
+            "parameter_count": sum(p.numel() for p in self.parameters()),
+            "base_parameter_count": sum(p.numel() for p in self.base_model.parameters()),
+            "compactor_parameter_count": sum(p.numel() for p in self.compactors.parameters()),
+        }
 
     def set_step(self, step: int) -> None:
         self._current_step = step
@@ -291,14 +342,24 @@ class StillLM(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         use_compact: bool = False,
+        teacher_kv: list[dict[str, torch.Tensor]] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, torch.Tensor]]]:
         """Forward pass through the base model, optionally with compacted KV cache.
 
         For the teacher pass: standard forward, extract per-layer K, V.
         For the student pass: compact K, V, then forward with compact cache.
 
+        teacher_kv: per-layer dicts with detached teacher 'keys'/'values'. When
+        given alongside use_compact=True, the attention-pattern match loss
+        (Fast KV Compaction) is computed inline on this pass's own suffix
+        queries and compact keys, so the arm needs exactly one teacher pass
+        and one student pass (it used to pay a third full base forward that
+        re-derived q/k/v and re-ran every compactor with grad).
+
         Returns (model_output, list_of_kv_dicts) where each kv dict has
-        'keys', 'values', 'positions' per layer.
+        'keys', 'values' per layer. model_output may additionally carry
+        'meanflow_losses' (per-compactor consistency losses, student pass) and
+        'attn_match_loss' (scalar, when teacher_kv is given).
         """
         # We implement a custom forward that intercepts K, V at each layer.
         # This requires modifying the attention computation, which we do
@@ -309,6 +370,11 @@ class StillLM(nn.Module):
 
         # Collect KV from each layer during the forward pass.
         kv_layers: list[dict[str, torch.Tensor]] = []
+        # Per-compactor MeanFlow consistency losses (student pass only).
+        meanflow_losses: list[torch.Tensor] = []
+        # Attention-match accumulation (student pass with teacher_kv given).
+        am_total = torch.zeros((), device=device)
+        am_layers = 0
 
         # We'll replace the attention forward in each block to extract K, V.
         # For the compact (student) pass, we'll inject the compacted cache.
@@ -358,11 +424,51 @@ class StillLM(nn.Module):
                 )
                 compact_k = result["compact_keys"]  # (B, H, t_compact, d)
                 compact_v = result["compact_values"]
+                # The MeanFlow compactor emits a scalar self-consistency loss
+                # during training; StillLM.forward weights and sums it (it used
+                # to be computed and silently discarded).
+                mf = result.get("meanflow_loss")
+                if mf is not None:
+                    meanflow_losses.append(mf)
 
                 # Suffix queries attend to [compact ; suffix_kv] with a causal mask:
                 # all compact entries visible (strictly past), suffix lower-triangular.
                 S = T_inner - ctx_end
                 suffix_q = q_rot[:, :, ctx_end:, :]
+
+                # Attention-pattern match (Fast KV Compaction, arXiv:2602.16284),
+                # computed inline on this pass's own suffix queries / compact
+                # keys: MSE between the student's suffix-vs-compact-prefix
+                # scores and the teacher's suffix-vs-full-prefix scores,
+                # pooled into t_compact bins when the budgets differ. The
+                # teacher keys are detached (captured under no_grad).
+                if (
+                    teacher_kv is not None
+                    and layer_idx < len(teacher_kv)
+                    and teacher_kv[layer_idx]
+                ):
+                    t_keys_prefix = teacher_kv[layer_idx]["keys"][:, :, :ctx_end, :]
+                    t_scores_prefix = (
+                        suffix_q.float() @ t_keys_prefix.float().transpose(-2, -1)
+                    ) / math.sqrt(head_dim)
+                    s_scores = (
+                        suffix_q.float() @ compact_k.float().transpose(-2, -1)
+                    ) / math.sqrt(head_dim)
+                    if t_compact < ctx_end:
+                        bin_size = ctx_end / t_compact
+                        pooled_t = torch.zeros(B_inner, num_heads, S, t_compact, device=device)
+                        for bi in range(t_compact):
+                            start = int(bi * bin_size)
+                            end = int((bi + 1) * bin_size)
+                            if end <= start:
+                                end = start + 1
+                            pooled_t[:, :, :, bi] = t_scores_prefix[:, :, :, start:end].mean(dim=-1)
+                        t_match = pooled_t
+                    else:
+                        t_match = t_scores_prefix
+                    am_total = am_total + F.mse_loss(s_scores, t_match.detach())
+                    am_layers += 1
+
                 all_k = torch.cat([compact_k, k_rot[:, :, ctx_end:, :]], dim=2)
                 all_v = torch.cat([compact_v, v_h[:, :, ctx_end:, :]], dim=2)
                 compact_visible = torch.ones(1, 1, S, t_compact, device=device, dtype=torch.bool)
@@ -411,13 +517,18 @@ class StillLM(nn.Module):
                 shift_labels.reshape(-1),
             )
 
-        diagnostics: dict[str, Any] = {
-            "parameter_count": sum(p.numel() for p in self.parameters()),
-            "base_parameter_count": sum(p.numel() for p in self.base_model.parameters()),
-            "compactor_parameter_count": sum(p.numel() for p in self.compactors.parameters()),
-        }
+        diagnostics: dict[str, Any] = dict(self._static_diagnostics)
 
-        return {"logits": logits, "loss": loss, "diagnostics": diagnostics}, kv_layers
+        out: dict[str, Any] = {"logits": logits, "loss": loss, "diagnostics": diagnostics}
+        # Grad-carrying auxiliary losses ride at the top level (NOT inside
+        # `diagnostics`, whose values train.py logs): forward() pops them and
+        # folds them into the total loss.
+        if use_compact and meanflow_losses:
+            out["meanflow_losses"] = meanflow_losses
+        if use_compact and teacher_kv is not None and am_layers > 0:
+            out["attn_match_loss"] = am_total / am_layers
+
+        return out, kv_layers
 
     def _topk_kl_loss(
         self,
@@ -445,12 +556,19 @@ class StillLM(nn.Module):
         with torch.no_grad():
             # Top-k teacher tokens per position (using temperature-softened distribution for selection).
             topk_vals, topk_indices = (teacher_logits / tau).float().topk(self.kl_topk, dim=-1)
-            # Force gold answer token into the support.  Clamp -100 (ignore) to 0
+            # Force gold answer token into the support ONLY where it is absent.
+            # The old unconditional splice (drop slot k, append gold) duplicated
+            # gold whenever it already sat in the top-(k-1), which double-
+            # counted it in the renormalized support (its teacher probability
+            # was gathered twice, inflating it to ~2p/(1+p)) and dropped the
+            # true rank-k token from the supervision. Clamp -100 (ignore) to 0
             # so negative-index wrapping does not corrupt the gather; those
             # positions are zeroed out by answer_mask below.
             if labels is not None:
                 gold = labels.clamp_min(0).unsqueeze(-1)
-                topk_indices = torch.cat([topk_indices[:, :, :-1], gold], dim=-1)
+                gold_in_support = (topk_indices == gold).any(dim=-1, keepdim=True)
+                spliced = torch.cat([topk_indices[:, :, :-1], gold], dim=-1)
+                topk_indices = torch.where(gold_in_support, topk_indices, spliced)
 
             # Teacher distribution restricted to top-k support, renormalized.
             teacher_probs = torch.gather(
@@ -476,114 +594,6 @@ class StillLM(nn.Module):
 
         return kl.sum() / count
 
-    def _attention_match_loss(
-        self,
-        teacher_kv: list[dict[str, torch.Tensor]],
-        student_input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Attention-pattern matching loss (Fast KV Compaction, arXiv:2602.16284).
-
-        Instead of matching output logits (KL), directly match the attention patterns
-        between teacher (full KV) and student (compact KV) at each layer. This is
-        cheaper and more direct: we preserve the attention structure itself.
-
-        teacher_kv: list of per-layer dicts with 'keys', 'values' from the teacher pass.
-        Returns: MSE between teacher and student attention score matrices.
-        """
-        T = student_input_ids.shape[1]
-        device = student_input_ids.device
-        x = self.base_model.token(student_input_ids)
-        positions = torch.arange(T, device=device, dtype=torch.float32)
-
-        total_loss = torch.tensor(0.0, device=device)
-        n_layers = 0
-
-        for layer_idx, block in enumerate(self.base_model.blocks):
-            attn = getattr(block, "attn", None) or getattr(block, "local", None)
-            if attn is None:
-                x = x + block.ff(block.ln2(x))
-                continue
-
-            ln_out = block.ln1(x)
-            # Same rationale as _extract_kv_and_forward: go through the module's
-            # own projection pipeline rather than re-deriving it here.
-            q_rot, k_rot, v_h = attn.qkv_heads(ln_out)
-            B_inner, num_heads, T_inner, head_dim = q_rot.shape
-            D = num_heads * head_dim
-
-            # Causal prefix/suffix split (same as _extract_kv_and_forward).
-            compactor = self.compactors[layer_idx]
-            t_compact = compactor.compact_len
-            ctx_end = self.suffix_start(T_inner)
-            S = T_inner - ctx_end
-            suffix_q = q_rot[:, :, ctx_end:, :]
-
-            # Teacher attention: suffix queries vs prefix teacher keys (no grad).
-            t_keys_prefix = teacher_kv[layer_idx]["keys"][:, :, :ctx_end, :].detach()
-            t_scores_prefix = (
-                suffix_q.float() @ t_keys_prefix.float().transpose(-2, -1)
-            ) / math.sqrt(head_dim)
-
-            # Student attention pattern with compact prefix KV.
-            if self.compact_active and layer_idx < len(self.compactors):
-                result = compactor(
-                    k_rot[:, :, :ctx_end, :], v_h[:, :, :ctx_end, :],
-                    positions=positions[:ctx_end], return_compact_cache=True,
-                )
-                compact_k = result["compact_keys"]
-                compact_v = result["compact_values"]
-                s_scores = (
-                    suffix_q.float() @ compact_k.float().transpose(-2, -1)
-                ) / math.sqrt(head_dim)
-
-                # Match teacher (ctx_end keys) vs student (t_compact keys) by binning.
-                if t_compact < ctx_end:
-                    bin_size = ctx_end / t_compact
-                    pooled_t = torch.zeros(B_inner, num_heads, S, t_compact, device=device)
-                    for bi in range(t_compact):
-                        start = int(bi * bin_size)
-                        end = int((bi + 1) * bin_size)
-                        if end <= start:
-                            end = start + 1
-                        pooled_t[:, :, :, bi] = t_scores_prefix[:, :, :, start:end].mean(dim=-1)
-                    t_match = pooled_t
-                else:
-                    t_match = t_scores_prefix
-
-                attn_loss = F.mse_loss(s_scores, t_match.detach())
-                total_loss = total_loss + attn_loss
-                n_layers += 1
-
-                # Forward with prefix/suffix split (causal).
-                all_k = torch.cat([compact_k, k_rot[:, :, ctx_end:, :]], dim=2)
-                all_v = torch.cat([compact_v, v_h[:, :, ctx_end:, :]], dim=2)
-                compact_visible = torch.ones(1, 1, S, t_compact, device=device, dtype=torch.bool)
-                suffix_causal = _suffix_causal_mask(S, device, attn.local_window)
-                suffix_mask = torch.cat(
-                    [compact_visible, suffix_causal.unsqueeze(0).unsqueeze(0)], dim=3
-                )
-                suffix_out = F.scaled_dot_product_attention(suffix_q, all_k, all_v, attn_mask=suffix_mask)
-
-                from flower.models.base import causal_mask
-                prefix_keep = causal_mask(ctx_end, device, attn.local_window).view(1, 1, ctx_end, ctx_end)
-                prefix_out = F.scaled_dot_product_attention(
-                    q_rot[:, :, :ctx_end, :], k_rot[:, :, :ctx_end, :], v_h[:, :, :ctx_end, :], attn_mask=prefix_keep
-                )
-
-                out = torch.cat([prefix_out, suffix_out], dim=2)
-                out = out.transpose(1, 2).contiguous().view(B_inner, T_inner, D)
-                attn_output = attn.out(out)
-            else:
-                seq_len = x.shape[1]
-                attn_output = _standard_attention(attn, q_rot, k_rot, v_h, seq_len, device, x.shape)
-
-            x = x + attn_output
-            x = x + block.ff(block.ln2(x))
-
-        if n_layers > 0:
-            return total_loss / n_layers
-        return total_loss
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -592,8 +602,13 @@ class StillLM(nn.Module):
     ) -> dict[str, Any]:
         """Forward pass: teacher (full cache) + student (compact cache) + KL loss.
 
-        During base warmup (step < base_warmup_steps): single forward pass, CE loss only.
-        After warmup: dual teacher/student pass, KL distillation + optional CE.
+        During base warmup (step < compact_from_step): single forward pass, CE
+        loss only, base frozen (validated at construction: base_warmup_steps
+        must not exceed compact_from_step, or the dual-pass phase would start
+        with a still-trainable base).
+        After warmup: dual teacher/student pass, KL distillation + optional CE,
+        + optional attention-match (still_attn_match_weight > 0) and MeanFlow
+        self-consistency (still_meanflow_loss_weight > 0) terms.
         """
         # Phase 1: base model warmup (single pass, CE only).
         if not self.compact_active:
@@ -611,25 +626,53 @@ class StillLM(nn.Module):
             return out
 
         # Phase 2: compactor training (dual pass, KL distillation).
-        # Teacher pass: use the base model's optimized forward (no grad).
+        # Teacher pass (no grad). When the attention-match arm is active, the
+        # teacher pass runs through _extract_kv_and_forward so the per-layer KV
+        # is captured in the SAME pass; before, that cost a second full base
+        # forward purely to extract KV. Otherwise the base model's own
+        # optimized forward is used (cheaper: per-layer KV dies with each layer
+        # instead of being retained for the whole student pass).
+        need_teacher_kv = self.attn_match_weight > 0
         with torch.no_grad():
-            teacher_out = self.base_model(input_ids, labels=labels)
+            if need_teacher_kv:
+                teacher_out, teacher_kv = self._extract_kv_and_forward(
+                    input_ids, labels=labels, use_compact=False
+                )
+            else:
+                teacher_kv = None
+                # fused_linear_ce (S14-5b) is train-gated, and under it the
+                # base forward materializes NO logits (base.py returns
+                # logits=None so the (B*T, vocab) tensor is never built) — but
+                # the teacher's logits are exactly what the KL distillation
+                # below consumes, and _topk_kl_loss crashed on
+                # teacher_logits.shape. Force the eager head for the teacher
+                # call only: this pass is no-grad (the fused path saves nothing
+                # here), the flag is restored immediately after, and the
+                # student loss path never goes through base_model.forward.
+                fused_prev = getattr(self.base_model, "fused_linear_ce", False)
+                self.base_model.fused_linear_ce = False
+                try:
+                    teacher_out = self.base_model(input_ids, labels=labels)
+                finally:
+                    self.base_model.fused_linear_ce = fused_prev
             teacher_logits = teacher_out["logits"]
 
-        # Attention-matching loss (optional). Computed once — the result tensor
-        # retains its grad graph and is added to the loss below.
-        attn_match_val = 0.0
-        am_loss = None
-        if self.attn_match_weight > 0:
-            _, teacher_kv = self._extract_kv_and_forward(input_ids, use_compact=False)
-            am_loss = self._attention_match_loss(teacher_kv, input_ids)
-            attn_match_val = am_loss.detach()
-
-        # Student pass (with compact cache).
+        # Student pass (with compact cache). When teacher KV was captured, the
+        # attention-pattern match loss is computed inline on this pass's own
+        # suffix queries / compact keys (previously a THIRD full base forward
+        # that re-derived q/k/v and re-ran every compactor with grad — ~2x the
+        # arm's intended cost).
         student_out, _ = self._extract_kv_and_forward(
-            input_ids, labels=labels, use_compact=True
+            input_ids, labels=labels, use_compact=True, teacher_kv=teacher_kv
         )
         student_logits = student_out["logits"]
+
+        # Attention-matching loss (optional), computed inside the student pass;
+        # the result tensor retains its grad graph and is added to the loss below.
+        attn_match_val = 0.0
+        am_loss = student_out.pop("attn_match_loss", None)
+        if am_loss is not None:
+            attn_match_val = am_loss.detach()
 
         # Restrict the loss to positions that can actually differ from the
         # teacher. Prefix positions run identical local attention through the
@@ -659,6 +702,19 @@ class StillLM(nn.Module):
         if am_loss is not None:
             loss = loss + self.attn_match_weight * am_loss
 
+        # MeanFlow self-consistency loss (only exists for the still_meanflow
+        # arm). still_meanflow_steps always paid for the extra no-grad Euler
+        # rollout + one grad net call per compactor per layer, but the loss
+        # was previously discarded here; it enters the objective only when
+        # still_meanflow_loss_weight > 0 (0.0 reproduces every prior run).
+        meanflow_losses = student_out.pop("meanflow_losses", None)
+        mf_loss = torch.stack(meanflow_losses).mean() if meanflow_losses else None
+        mf_val = 0.0
+        if mf_loss is not None:
+            if self.meanflow_loss_weight > 0:
+                loss = loss + self.meanflow_loss_weight * mf_loss
+            mf_val = mf_loss.detach()
+
         # Optional CE loss (direct supervision).
         if self.ce_weight > 0 and labels is not None:
             if suffix_mask is None:
@@ -682,6 +738,8 @@ class StillLM(nn.Module):
         if self.training:
             diagnostics["kl_loss"] = kl_val
             diagnostics["attn_match_loss"] = attn_match_val
+            if mf_loss is not None:
+                diagnostics["meanflow_loss"] = mf_val
         diagnostics["student_loss"] = student_out["loss"].detach() if student_out["loss"] is not None else 0.0
         diagnostics["teacher_loss"] = teacher_out["loss"].detach() if teacher_out["loss"] is not None else 0.0
         if self._config_dict is None:
@@ -724,6 +782,11 @@ def build_still_model(config: ModelConfig) -> StillLM:
     - still_ce_weight: CE loss weight (default 0.0)
     - still_compact_from_step: step to start compaction (default 0)
     - still_kl_temperature: temperature for KL distillation (default 1.0)
+    - still_meanflow_loss_weight: weight of the MeanFlow self-consistency loss
+      (default 0.0 = legacy discard; > 0 finally trains the objective that
+      still_meanflow_steps always computed but previously never consumed)
+    - still_ot_reg_weight: BROKEN/REMOVED — > 0 raises (the arm never had any
+      effect; see ModelConfig.still_ot_reg_weight)
     - still_pretrained_base: path to a pretrained base model checkpoint (optional)
     """
     import os
@@ -793,6 +856,7 @@ def build_still_model(config: ModelConfig) -> StillLM:
     ot_reg_weight = getattr(config, "still_ot_reg_weight", 0.0)
     flow_steps = getattr(config, "still_flow_steps", 0)
     meanflow_steps = getattr(config, "still_meanflow_steps", 0)
+    meanflow_loss_weight = getattr(config, "still_meanflow_loss_weight", 0.0)
     flow_ot = config.variant in ("still_flow_ot",)
     flow_kv = config.variant in ("still_flow_kv",)
     ot_epsilon = getattr(config, "still_ot_epsilon", 0.1)
@@ -821,6 +885,7 @@ def build_still_model(config: ModelConfig) -> StillLM:
         ot_reg_weight=ot_reg_weight,
         flow_steps=flow_steps,
         meanflow_steps=meanflow_steps,
+        meanflow_loss_weight=meanflow_loss_weight,
         flow_ot=flow_ot,
         flow_kv=flow_kv,
         ot_epsilon=ot_epsilon,

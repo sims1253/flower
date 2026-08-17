@@ -261,13 +261,20 @@ class StillCompactorMeanFlow(StillCompactor):
             z_target = z_cur  # integrated endpoint (state at t = 1).
 
         # Sample one intermediate time and enforce the MeanFlow identity there.
-        k = int(torch.randint(0, self.meanflow_steps, (), device=z0.device).item())
-        t_k = k * dt
-        denom = max(1.0 - t_k, 1e-6)
-        z_tk = z_path[k]                                    # detached state at t_k
-        t_k_t = torch.full((B, H, t_len), t_k, device=z0.device, dtype=z0.dtype)
+        # The step index is sampled and used ON DEVICE: the previous
+        # `int(torch.randint(...).item())` forced a host sync per compactor
+        # per layer (one per micro-batch per layer) purely to index a Python
+        # list. Tensor-indexing the stacked path keeps the whole consistency
+        # loss host-sync-free (and graph-safe under torch.compile; the old
+        # `max(1.0 - t_k, 1e-6)` on a Python float also relied on eager truth
+        # evaluation of a tensor comparison).
+        k = torch.randint(0, self.meanflow_steps, (), device=z0.device)
+        z_tk = torch.stack(z_path)[k]                      # detached state at t_k
+        t_k = k.to(z0.dtype) * dt
+        denom = torch.clamp(1.0 - t_k, min=1e-6)
+        t_k_t = t_k.expand(B, H, t_len)
         u_pred = self.meanflow_net(z_tk, t_k_t, cond, x, cache_positions=positions)
-        target = (z_target - z_tk) / denom                  # detached average velocity
+        target = (z_target - z_tk) / denom                 # detached average velocity
         return F.mse_loss(u_pred, target)
 
     def forward(

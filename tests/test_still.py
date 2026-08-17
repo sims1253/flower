@@ -6,15 +6,31 @@ Verifies:
 3. StillLM forward pass runs and produces KL loss.
 4. OT variant runs without error.
 5. Compaction eval probes produce expected structures.
+6. MeanFlow consistency loss wiring (still_meanflow_loss_weight).
+7. Removed no-op arms fail loudly (still_ot_reg_weight).
+8. Teacher pass survives fused_linear_ce (logits must exist for KL).
+9. Compactors inherit the base config's rope_base.
+10. _topk_kl_loss gold-splice does not duplicate gold in the support.
+11. Warmup/compaction gating contradiction is rejected at construction.
 """
 
 from __future__ import annotations
+
+import math
 
 import pytest
 import torch
 
 from flower.config import ModelConfig
 from flower.models.still import StillCompactor, StillCompactorOT, _apply_rope, _inverse_rope
+
+
+def _liger_fce_available() -> bool:
+    try:
+        from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss  # noqa: F401
+    except ImportError:
+        return False
+    return torch.cuda.is_available()
 
 
 @pytest.fixture(autouse=True)
@@ -309,3 +325,340 @@ class TestConfigIntegration:
         )
         model = build_model(cfg)
         assert model is not None
+
+class TestMeanFlowWiring:
+    """still_meanflow_loss_weight finally activates the consistency loss."""
+
+    @pytest.fixture
+    def meanflow_config(self):
+        return ModelConfig(
+            variant="still",
+            vocab_size=128,
+            d_model=64,
+            num_heads=4,
+            num_layers=2,
+            ffn_dim=128,
+            max_seq_len=64,
+            local_window=32,
+            still_compact_len=16,
+            still_num_blocks=1,
+            still_d_latent=32,
+            still_kl_topk=50,
+            still_kl_weight=1.0,
+            still_meanflow_steps=2,
+            still_meanflow_loss_weight=0.1,
+        )
+
+    def test_compactor_emits_consistency_loss(self):
+        """StillCompactorMeanFlow emits 'meanflow_loss' (train: >0, eval: 0)."""
+        from flower.models.still_flow2 import StillCompactorMeanFlow
+
+        comp = StillCompactorMeanFlow(
+            num_kv_heads=2, head_dim=16, compact_len=8, d_latent=32,
+            meanflow_steps=2, identity_init=True,
+        )
+        # The zero-init velocity field makes u == 0, so the consistency loss
+        # is exactly 0 at init (the identity flow is already self-consistent).
+        # Un-zero the final layer so the loss is live.
+        torch.nn.init.normal_(comp.meanflow_net.fc3.weight, std=0.05)
+        torch.nn.init.normal_(comp.meanflow_net.fc3.bias, std=0.05)
+        keys = torch.randn(2, 2, 32, 16)
+        values = torch.randn(2, 2, 32, 16)
+
+        comp.train()
+        result = comp(keys, values, return_compact_cache=True)
+        assert "meanflow_loss" in result
+        assert result["meanflow_loss"].dim() == 0
+        assert result["meanflow_loss"].item() > 0.0
+
+        comp.eval()
+        result = comp(keys, values, return_compact_cache=True)
+        assert result["meanflow_loss"].item() == 0.0
+
+    def test_loss_weight_adds_term_to_total(self, meanflow_config):
+        """loss(w>0) == loss(w=0) + w * mean(collected consistency losses).
+
+        With w=0 (the legacy default) the term is discarded and the loss is
+        bit-identical to every prior still_meanflow run; this pins both the
+        default-off contract and the actual activation.
+        """
+        from flower.models import build_model
+
+        model = build_model(meanflow_config)
+        model.train()
+        # Same zero-init consideration as above: make the consistency loss
+        # observable before the first forward.
+        for comp in model.compactors:
+            torch.nn.init.normal_(comp.meanflow_net.fc3.weight, std=0.05)
+            torch.nn.init.normal_(comp.meanflow_net.fc3.bias, std=0.05)
+        input_ids = torch.randint(0, 128, (2, 32), dtype=torch.long)
+        labels = input_ids.clone()
+
+        out_w = model(input_ids, labels=labels)
+        mf = out_w["diagnostics"]["meanflow_loss"]
+        assert mf.item() > 0.0
+
+        model.meanflow_loss_weight = 0.0
+        with torch.no_grad():
+            out_0 = model(input_ids, labels=labels)
+        model.meanflow_loss_weight = 0.1
+
+        expected = out_0["loss"] + 0.1 * mf
+        assert torch.allclose(out_w["loss"], expected, rtol=1e-5, atol=1e-7), (
+            f"weighted {out_w['loss'].item()} vs expected {expected.item()}"
+        )
+
+    def test_consistency_term_reaches_meanflow_net(self, meanflow_config):
+        """backward() through the weighted term grads the MeanFlow velocity net."""
+        from flower.models import build_model
+
+        model = build_model(meanflow_config)
+        model.train()
+        input_ids = torch.randint(0, 128, (2, 32), dtype=torch.long)
+        out = model(input_ids, labels=input_ids.clone())
+        out["loss"].backward()
+        for i, comp in enumerate(model.compactors):
+            g = comp.meanflow_net.fc3.weight.grad
+            assert g is not None and g.abs().sum() > 0, f"layer {i} meanflow_net got no grad"
+
+    def test_default_weight_discards_loss(self):
+        """still_meanflow_loss_weight defaults to 0.0 (legacy no-change)."""
+        cfg = ModelConfig()
+        assert cfg.still_meanflow_loss_weight == 0.0
+
+
+class TestOTRegRemoved:
+    """still_ot_reg_weight was a silent no-op; it must now fail loudly."""
+
+    def test_class_deleted(self):
+        import flower.models.still as still_mod
+
+        assert not hasattr(still_mod, "StillCompactorOTReg")
+
+    def test_build_raises(self):
+        from flower.models import build_model
+
+        cfg = ModelConfig(
+            variant="still",
+            vocab_size=64,
+            d_model=32,
+            num_heads=2,
+            num_layers=1,
+            ffn_dim=64,
+            max_seq_len=16,
+            local_window=8,
+            still_compact_len=8,
+            still_num_blocks=1,
+            still_d_latent=32,
+            still_ot_reg_weight=0.5,
+        )
+        with pytest.raises(ValueError, match="still_ot_reg_weight"):
+            build_model(cfg)
+
+
+class TestFusedCETeacherPass:
+    """Teacher pass must yield real logits even under fused_linear_ce."""
+
+    @pytest.mark.skipif(
+        not _liger_fce_available(),
+        reason="needs CUDA + liger-kernel for the fused CE path",
+    )
+    def test_teacher_logits_survive_fused_ce(self):
+        from flower.models import build_model
+
+        cfg = ModelConfig(
+            variant="still",
+            vocab_size=128,
+            d_model=64,
+            num_heads=4,
+            num_layers=2,
+            ffn_dim=128,
+            max_seq_len=64,
+            local_window=32,
+            still_compact_len=16,
+            still_num_blocks=1,
+            still_d_latent=32,
+            still_kl_topk=50,
+            still_kl_weight=1.0,
+            fused_linear_ce=True,
+        )
+        model = build_model(cfg).cuda()
+        model.train()
+        input_ids = torch.randint(0, 128, (2, 32), dtype=torch.long, device="cuda")
+        labels = input_ids.clone()
+
+        # Before the fix: the teacher call ran the train-gated fused-CE path
+        # (logits=None) and _topk_kl_loss crashed on teacher_logits.shape.
+        out = model(input_ids, labels=labels)
+        assert out["logits"] is not None
+        assert out["logits"].shape == (2, 32, 128)
+        assert torch.isfinite(out["loss"])
+        # The toggle around the teacher call must not leak.
+        assert model.base_model.fused_linear_ce is True
+
+
+class TestCompactorRopeBase:
+    """Compactors must un-rotate with the base model's actual rope_base."""
+
+    def _build(self, rope_base):
+        from flower.models import build_model
+
+        cfg = ModelConfig(
+            variant="still",
+            vocab_size=64,
+            d_model=32,
+            num_heads=2,
+            num_layers=2,
+            ffn_dim=64,
+            max_seq_len=16,
+            local_window=8,
+            still_compact_len=8,
+            still_num_blocks=1,
+            still_d_latent=32,
+            rope_base=rope_base,
+        )
+        return build_model(cfg)
+
+    def test_inherited_from_config(self):
+        model = self._build(500.0)
+        for i, comp in enumerate(model.compactors):
+            assert comp.base_rope_base == 500.0, f"layer {i} kept the 10000 default"
+
+    def test_default_is_standard(self):
+        model = self._build(10000.0)
+        for comp in model.compactors:
+            assert comp.base_rope_base == 10000.0
+
+
+class TestTopkKLGoldSplice:
+    """Gold enters the top-k support only where absent (no double count)."""
+
+    def test_no_gold_duplication_in_support(self):
+        from flower.models import build_model
+
+        cfg = ModelConfig(
+            variant="still",
+            vocab_size=64,
+            d_model=32,
+            num_heads=2,
+            num_layers=1,
+            ffn_dim=64,
+            max_seq_len=16,
+            local_window=8,
+            still_compact_len=8,
+            still_num_blocks=1,
+            still_d_latent=32,
+        )
+        model = build_model(cfg)
+        model.kl_topk = 3
+        model.kl_temperature = 1.0
+
+        B, T, V = 1, 2, 8
+        # Position 0: ranks 0>1>2>3>(gold=5): gold OUTSIDE top-3 -> spliced in.
+        # Position 1: ranks 0>1>2>3, gold=1 already IN top-3 -> support unchanged.
+        teacher = torch.zeros(B, T, V)
+        teacher[0, 0] = torch.tensor([10.0, 9.0, 8.5, 8.0, 0.0, 7.0, 0.0, 0.0])
+        teacher[0, 1] = torch.tensor([10.0, 9.0, 8.5, 8.0, 0.0, 0.0, 0.0, 0.0])
+        student = teacher + torch.tensor([0.0, -1.0, 0.5, -2.0, 1.0, 0.0, 2.0, -0.5])
+        labels = torch.tensor([[5, 1]])
+
+        got = model._topk_kl_loss(teacher, student, labels=labels).item()
+
+        def reference(unconditional_splice: bool) -> float:
+            topk = teacher.topk(3, dim=-1).indices
+            gold = labels.clamp_min(0).unsqueeze(-1)
+            if unconditional_splice:
+                support = torch.cat([topk[:, :, :-1], gold], dim=-1)  # the old bug
+            else:
+                inside = (topk == gold).any(dim=-1, keepdim=True)
+                support = torch.where(
+                    inside, topk, torch.cat([topk[:, :, :-1], gold], dim=-1)
+                )
+            tp = teacher.softmax(-1).gather(-1, support)
+            tp = tp / tp.sum(-1, keepdim=True).clamp_min(1e-8)
+            sp = student.softmax(-1).gather(-1, support)
+            sp = sp / sp.sum(-1, keepdim=True).clamp_min(1e-8)
+            kl = (tp * (tp.clamp_min(1e-8).log() - sp.clamp_min(1e-8).log())).sum(-1)
+            return kl.sum().item() / (B * T)
+
+        expected = reference(unconditional_splice=False)
+        buggy = reference(unconditional_splice=True)
+        # The two supports genuinely disagree for this input...
+        assert not math.isclose(expected, buggy, rel_tol=1e-4), (
+            "test input does not separate fixed and buggy splicing"
+        )
+        # ...and the model implements the fixed one.
+        assert math.isclose(got, expected, rel_tol=1e-4), (
+            f"got {got}, expected {expected} (old duplicated-gold value: {buggy})"
+        )
+
+
+class TestWarmupGatingValidation:
+    """base_warmup_steps > compact_from_step must be rejected at construction."""
+
+    def _cfg(self, warmup, compact_from):
+        return ModelConfig(
+            variant="still",
+            vocab_size=64,
+            d_model=32,
+            num_heads=2,
+            num_layers=1,
+            ffn_dim=64,
+            max_seq_len=16,
+            local_window=8,
+            still_compact_len=8,
+            still_num_blocks=1,
+            still_d_latent=32,
+            still_base_warmup_steps=warmup,
+            still_compact_from_step=compact_from,
+        )
+
+    def test_warmup_exceeding_compact_from_raises(self):
+        from flower.models import build_model
+
+        with pytest.raises(ValueError, match="still_base_warmup_steps"):
+            build_model(self._cfg(warmup=10, compact_from=0))
+
+    def test_warmup_within_compact_from_builds(self):
+        from flower.models import build_model
+
+        model = build_model(self._cfg(warmup=5, compact_from=10))
+        assert model is not None
+
+
+class TestAttentionMatchWiring:
+    """still_attn_match_weight arm still trains after the pass-count refactor."""
+
+    def test_attention_match_trains(self):
+        from flower.models import build_model
+
+        cfg = ModelConfig(
+            variant="still",
+            vocab_size=128,
+            d_model=64,
+            num_heads=4,
+            num_layers=2,
+            ffn_dim=128,
+            max_seq_len=64,
+            local_window=32,
+            still_compact_len=16,
+            still_num_blocks=1,
+            still_d_latent=32,
+            still_kl_topk=50,
+            still_kl_weight=1.0,
+            still_attn_match_weight=0.5,
+        )
+        model = build_model(cfg)
+        model.train()
+        input_ids = torch.randint(0, 128, (2, 32), dtype=torch.long)
+        out = model(input_ids, labels=input_ids.clone())
+
+        am = out["diagnostics"]["attn_match_loss"]
+        assert am.item() > 0.0
+        assert torch.isfinite(out["loss"])
+        out["loss"].backward()
+        # Aggregate over all compactor parameters: at identity init the latent
+        # stream is exactly zero, so individual projections (e.g. key_proj)
+        # legitimately receive zero grad while the latents themselves do not.
+        total = sum(p.grad.abs().sum() for p in model.compactors.parameters() if p.grad is not None)
+        assert total > 0

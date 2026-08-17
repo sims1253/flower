@@ -792,56 +792,6 @@ class StillCompactorFlow(StillCompactor):
         return result
 
 
-class StillCompactorOTReg(StillCompactor):
-    """OT-regularized Perceiver compactor.
-
-    Adds a Sinkhorn OT regularizer to the standard Perceiver cross-attention.
-    The regularizer encourages the attention plan to be doubly-stochastic
-    (from ESPFormer, arXiv:2502.07962), ensuring the latents provably "cover"
-    the source token distribution.
-
-    Unlike StillCompactorOT (which replaces attention with OT), this variant
-    keeps standard softmax attention and adds an OT penalty on the attention
-    matrix. This is cheaper and preserves the learned attention patterns while
-    encouraging full coverage.
-    """
-
-    def forward(
-        self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        positions: torch.Tensor | None = None,
-        return_compact_cache: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        B, H, T, d = keys.shape
-        if positions is None:
-            positions = torch.arange(T, device=keys.device, dtype=torch.float32)
-
-        keys_free = _inverse_rope(keys, positions, d, base=self.base_rope_base)
-        x = torch.cat([keys_free, values], dim=-1)
-        z = self.latents.unsqueeze(0).expand(B, -1, -1, -1)
-
-        # Standard processing but capture attention matrix from block 0.
-        for block in self.blocks:
-            z = block(z, x, key_positions=positions)
-
-        # OT regularization is applied as a soft penalty during training.
-        # The penalty is computed on the attention matrix of the first block.
-        # This is handled in the training loss, not in the forward pass.
-        # Here we just return the standard output plus attention stats.
-        Ck = self.key_proj(z)
-        Cv = self.val_proj(z)
-
-        result: dict[str, torch.Tensor] = {"latent_out": z, "Ck_raw": Ck, "Cv": Cv}
-        if return_compact_cache:
-            out_positions = _even_positions(self.compact_len, T, keys.device)
-            Ck_rotated = _apply_rope(Ck, out_positions, d, base=self.base_rope_base)
-            result["compact_keys"] = Ck_rotated
-            result["compact_values"] = Cv
-            result["out_positions"] = out_positions
-        return result
-
-
 class StillCompactorOT(StillCompactor):
     """Still compactor with OT-coupled cross-attention read.
 

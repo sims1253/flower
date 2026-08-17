@@ -110,9 +110,25 @@ class ModelConfig:
     still_use_spectral: bool = False
     still_layer_adaptive: bool = False
     still_attn_match_weight: float = 0.0
+    # BROKEN/REMOVED: `still_ot_reg_weight` never had any effect. The
+    # StillCompactorOTReg arm it selected (still.py) was byte-identical to the
+    # plain compactor -- its forward read neither the weight nor produced a
+    # penalty ("handled in the training loss" was aspirational; no consumer
+    # existed). The dead class is deleted; setting this > 0 now raises a
+    # ValueError at model construction instead of silently training a plain
+    # compactor under a misleading name. No existing results are affected
+    # (they were plain-compactor runs regardless of this flag).
     still_ot_reg_weight: float = 0.0
     still_flow_steps: int = 0
     still_meanflow_steps: int = 0
+    # Weight for the MeanFlow self-consistency loss (still_meanflow_steps > 0).
+    # 0.0 (default) reproduces every existing still_meanflow run exactly: the
+    # compactor always computed the consistency loss, but StillLM.forward
+    # silently discarded it, so `still_meanflow_steps` only ever bought the
+    # extra no-grad Euler rollout without the objective it was supposed to
+    # train. > 0 finally activates the objective. The per-compactor,
+    # per-layer losses are mean-reduced before weighting.
+    still_meanflow_loss_weight: float = 0.0
     still_ot_epsilon: float = 0.1
     still_ot_iters: int = 10
     still_key_velocity_hidden: int | None = None
