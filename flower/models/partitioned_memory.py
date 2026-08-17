@@ -175,8 +175,12 @@ class PartitionedMemoryBlock(nn.Module):
         if memory is None or memory.shape[-3] != self.num_banks:
             memory = self._initial_memory_causal(x) if self.config.causal_memory else self._initial_memory(x)
         x = x + self.local(self.ln1(x))
-        bank_w, bank_logw = self._bank_weights(self.ln_mem(x))
-        x = x + self.mem_read(self.ln_mem(x), memory, bank_logw)
+        # ln_mem(x) feeds both the router and the memory read with the exact
+        # same input; compute it once and share. (It was previously evaluated
+        # twice per block — an identical-output full LayerNorm wasted.)
+        mem_in = self.ln_mem(x)
+        bank_w, bank_logw = self._bank_weights(mem_in)
+        x = x + self.mem_read(mem_in, memory, bank_logw)
         x = x + self.ff(self.ln2(x))
         if self.config.memory_update_frequency <= 1 or x.shape[1] % self.config.memory_update_frequency == 0:
             memory = self._update_memory(memory, x, bank_w)
