@@ -95,18 +95,34 @@ class SummaryMemoryBlock(nn.Module):
 
     @staticmethod
     def _orthogonal_residual(update: torch.Tensor, memory: torch.Tensor, eps: float) -> torch.Tensor:
-        """Project `update` onto the orthogonal complement of `memory` (per batch).
+        """Per-row Gram projection: orthogonalise each update row against its
+        OWN memory row only.
 
         update: (B, S, D)  candidate write to each memory slot
         memory: (B, S, D)  current contents of those slots
-        Returns the component of `update` that's orthogonal to the row span of `memory`,
-        so the additive write minimally overlaps with what's already stored (LATTICE A1).
+
+        What is actually computed (kept as-is; changing it would need a flag):
+        `coeff` is (B, S, 1) — one coefficient per row — so update row s is
+        projected against the eps-regularised unit-normalised memory row s
+        (the slot that row writes into) and nothing else. The result is
+        orthogonal to that same-slot memory row, NOT to the row span of the
+        whole memory: rows s' != s are never seen by row s, so the residual
+        can still overlap other slots' contents. A true projection onto the
+        orthogonal complement of the memory's row span would require the
+        (B, S, S) contraction coeff = update @ mem_norm^T (a Gram matrix over
+        all pairs of memory rows) followed by a solved subtraction across all
+        rows.
+
+        Works unchanged on the causal (B, T, S, D) layout: the projection is
+        pointwise over the last dim.
         """
-        # Normalise rows of memory to get an approximate orthonormal basis. For S<=D this
-        # works as a cheap stand-in for full Gram-Schmidt; we project each update row
-        # against each normalised memory row independently.
+        # Normalise rows of memory to get an approximate per-row basis. For
+        # each slot s we project update row s against its own normalised
+        # memory row only (see docstring — this is NOT a full row-span /
+        # Gram-Schmidt projection over all S rows).
         mem_norm = memory / (memory.norm(dim=-1, keepdim=True) + eps)  # (B, S, D)
-        # Coefficients of update along each memory row: (B, S, 1) via batched dot product.
+        # Coefficient of each update row along its OWN memory row: (B, S, 1)
+        # via a per-row dot product.
         coeff = (update * mem_norm).sum(dim=-1, keepdim=True)
         return update - coeff * mem_norm
 
