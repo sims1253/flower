@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
+from flower.diag import should_collect, stash
 from flower.models.base import CausalSelfAttention, FeedForward
 from flower.models.memory import MemoryRead
 
@@ -230,10 +231,17 @@ class MeanFlowMemoryLM(nn.Module):
             loss = ce
             if aux_losses:
                 loss = ce + torch.stack(aux_losses).mean()
+        # Aux-loss diagnostic. The old `float(...cpu())` here was a host sync
+        # every forward and a graph break under compile. Now stashed on-device
+        # under the standard guard (flower/diag.py); the diagnostics dict carries
+        # the same 0-d tensor under the same key, and the logging step in
+        # train.py does the single host transfer.
+        if aux_losses and should_collect():
+            stash(self, "meanflow_aux_loss", torch.stack(aux_losses).mean())
         diagnostics = {
             "parameter_count": sum(p.numel() for p in self.parameters() if p.requires_grad),
             "config": self._asdict(self.config),
-            "meanflow_aux_loss": float(torch.stack(aux_losses).mean().detach().cpu()) if aux_losses else 0.0,
+            "meanflow_aux_loss": getattr(self, "last_diag_meanflow_aux_loss", 0.0),
         }
         return {"logits": logits, "loss": loss, "diagnostics": diagnostics}
 

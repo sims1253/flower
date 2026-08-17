@@ -63,8 +63,11 @@ def _spawn(
     ] + extra_args
     if steps is not None:
         cmd += ["--steps", str(steps)]
-    log_fh = log_path.open("w")
-    proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
+    # The child keeps its own dup of the fd, so closing the parent's handle
+    # here is safe; previously it stayed open for the lifetime of the sweep
+    # (one leaked fd per trial).
+    with log_path.open("w") as log_fh:
+        proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
     return proc, name, metrics_path
 
 

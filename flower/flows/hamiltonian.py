@@ -33,7 +33,9 @@ composition with per-step time biases conserves a "shadow" one. Tracking
 ||H_final - H_init||^2 measures how far the explicit H is from being the
 shadow H -- a useful indicator of how smooth the learned potentials are and
 how well-conditioned the flow is. It's written into a buffer for free
-logging; never enters the loss.
+logging; never enters the loss. The bookend evaluations are gated behind
+`flower.diag.should_collect`, so under torch.compile (where nobody reads
+the buffer) they cost nothing.
 
 Why not just regularise an Euler flow toward energy conservation? Two reasons.
 (1) Architectural constraints are tighter than soft losses -- volume
@@ -62,6 +64,8 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from flower.diag import should_collect
 
 
 def _log_cosh(z: torch.Tensor) -> torch.Tensor:
@@ -170,14 +174,22 @@ class HamiltonianFlow(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, p = x.chunk(2, dim=-1)
-        with torch.no_grad():
-            h_init = self._hamiltonian(q, p)
+        # The energy-drift diagnostic costs two extra `_hamiltonian` evaluations
+        # per forward (~2x the flow's own FLOPs). Gate it on the shared
+        # diagnostic guard (flower/diag.py): under torch.compile the walker that
+        # reads the buffer is disabled, so those evaluations would be pure
+        # overhead and the buffer writes would graph-break the region.
+        collect = should_collect()
+        if collect:
+            with torch.no_grad():
+                h_init = self._hamiltonian(q, p)
         dt = 1.0 / self.steps
         for i in range(self.steps):
             q, p = self._leapfrog(q, p, dt, i)
-        with torch.no_grad():
-            h_final = self._hamiltonian(q, p)
-            self.last_diag_hamiltonian_energy_drift.copy_((h_final - h_init).pow(2).mean())
+        if collect:
+            with torch.no_grad():
+                h_final = self._hamiltonian(q, p)
+                self.last_diag_hamiltonian_energy_drift.copy_((h_final - h_init).pow(2).mean())
         return torch.cat([q, p], dim=-1)
 
 
@@ -197,6 +209,15 @@ class WalnutsHamiltonianFlow(HamiltonianFlow):
     correctness-first; we can refine to incremental refinement later if this
     proves promising. Worst-case extra forward cost is 2^(max_subdivisions+1)-1
     leapfrog evaluations per macro step.
+
+    The `.item()` calls in `forward` (relative energy error vs threshold) are
+    an inherent graph break under torch.compile: the number of leapfrog
+    substeps depends on the *values* being integrated, i.e. on data, so the
+    decision cannot be traced into a static graph. Removing the sync would
+    mean committing to a fixed subdivision schedule — a different algorithm,
+    not an optimisation. (The trailing energy-drift/substep *diagnostics*,
+    by contrast, are gated behind `flower.diag.should_collect` so they cost
+    nothing under compile.)
     """
 
     def __init__(
@@ -224,8 +245,13 @@ class WalnutsHamiltonianFlow(HamiltonianFlow):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, p = x.chunk(2, dim=-1)
-        with torch.no_grad():
-            h_init_total = self._hamiltonian(q, p)
+        # Gate the pure-diagnostic energy bookends on the shared guard (see
+        # HamiltonianFlow.forward). The `.item()` subdivision decisions below
+        # are control flow, not diagnostics, and stay unconditional.
+        collect = should_collect()
+        if collect:
+            with torch.no_grad():
+                h_init_total = self._hamiltonian(q, p)
         substep_log: list[int] = []
         for i in range(self.steps):
             chosen_n = 1
@@ -234,6 +260,8 @@ class WalnutsHamiltonianFlow(HamiltonianFlow):
                 n = 1 << trial  # 1, 2, 4, ...
                 # Probe on detached state, then commit a non-detached run with the
                 # winning n so gradients flow through the chosen trajectory.
+                # The `.item()`s are data-dependent control flow and therefore an
+                # inherent graph break under compile -- see class docstring.
                 with torch.no_grad():
                     qt, pt = self._trial_macro(q.detach(), p.detach(), i, n)
                     h_pre = self._hamiltonian(q.detach(), p.detach())
@@ -247,10 +275,11 @@ class WalnutsHamiltonianFlow(HamiltonianFlow):
                     break
             q, p = best_q, best_p
             substep_log.append(chosen_n)
-        with torch.no_grad():
-            steps_tensor = torch.tensor(substep_log, dtype=torch.float32, device=self.last_diag_hamiltonian_substeps_mean.device)
-            self.last_diag_hamiltonian_substeps_mean.copy_(steps_tensor.mean())
-            self.last_diag_hamiltonian_substeps_max.copy_(steps_tensor.max())
-            h_final_total = self._hamiltonian(q, p)
-            self.last_diag_hamiltonian_energy_drift.copy_((h_final_total - h_init_total).pow(2).mean())
+        if collect:
+            with torch.no_grad():
+                steps_tensor = torch.tensor(substep_log, dtype=torch.float32, device=self.last_diag_hamiltonian_substeps_mean.device)
+                self.last_diag_hamiltonian_substeps_mean.copy_(steps_tensor.mean())
+                self.last_diag_hamiltonian_substeps_max.copy_(steps_tensor.max())
+                h_final_total = self._hamiltonian(q, p)
+                self.last_diag_hamiltonian_energy_drift.copy_((h_final_total - h_init_total).pow(2).mean())
         return torch.cat([q, p], dim=-1)

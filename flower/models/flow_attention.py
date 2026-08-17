@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from flower.config import ModelConfig
@@ -11,8 +12,6 @@ from flower.models.base import (
     _get_or_build_block_mask,
     _load_flex_attention,
     causal_mask,
-    make_causal_local_block_mask,
-    scaled_dot_attention,
 )
 
 
@@ -37,6 +36,10 @@ class FlowSelfAttention(nn.Module):
         self._cached_block_mask = None
         self._cached_seq_len = 0
         self._cached_window = None
+        # Dense-path bool mask cache (see _get_causal_bool_mask).
+        self._cached_attn_mask = None
+        self._cached_mask_seq_len = 0
+        self._cached_mask_window = None
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -45,6 +48,31 @@ class FlowSelfAttention(nn.Module):
     def _get_block_mask(self, seq_len: int, device: torch.device):
         # Delegates to the shared, compile-safe cache logic (base.py).
         return _get_or_build_block_mask(self, seq_len, device)
+
+    def _get_causal_bool_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Cached (T, T) bool causal/local mask (True = attend).
+
+        Keyed on (seq_len, local_window, device) so the dense path does not
+        rebuild the mask every forward. Under torch.compile this is read-only,
+        mirroring `_get_or_build_block_mask`: an in-graph
+        `self._cached_attn_mask = ...` assignment is captured by Dynamo and
+        aliases the tensor across the per-layer reads, which cudagraph mode
+        rejects. A cold cache under compile rebuilds without storing — the
+        pre-caching per-forward behaviour, so no regression, just no win.
+        """
+        hit = (
+            self._cached_attn_mask is not None
+            and seq_len == self._cached_mask_seq_len
+            and self.local_window == self._cached_mask_window
+            and self._cached_attn_mask.device == device
+        )
+        if torch.compiler.is_compiling():
+            return self._cached_attn_mask if hit else causal_mask(seq_len, device, self.local_window)
+        if not hit:
+            self._cached_attn_mask = causal_mask(seq_len, device, self.local_window)
+            self._cached_mask_seq_len = seq_len
+            self._cached_mask_window = self.local_window
+        return self._cached_attn_mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -61,8 +89,12 @@ class FlowSelfAttention(nn.Module):
             block_mask = self._get_block_mask(x.shape[1], x.device)
             out = flex_attention(q, k, v, block_mask=block_mask)
         else:
-            mask = causal_mask(x.shape[1], x.device, self.local_window).view(1, 1, x.shape[1], x.shape[1])
-            out = scaled_dot_attention(q, k, v, mask)
+            # Fused SDPA with the cached bool mask instead of the legacy dense
+            # path, which materialized (B, H, T, T) scores — the OOM/spill-prone
+            # path CausalSelfAttention._forward_sdpa documents abandoning.
+            # Numerically equivalent; pinned by tests/test_sdpa_attention_parity.py.
+            mask = self._get_causal_bool_mask(x.shape[1], x.device).view(1, 1, x.shape[1], x.shape[1])
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).contiguous().view(x.shape)
         return self.out(out)
 
