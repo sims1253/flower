@@ -528,17 +528,23 @@ could partly be band noise. A second FP8 seed (or a third bf16 seed) would
 bound that — the existing seed-1 screen infrastructure
 (`runs/speedup_screen_450m_seed1/`) shows how.
 
-**No decision has been recorded.** The honest options:
+**RESOLVED by re-measurement (2026-08-18, option 3): the offset is REAL.**
 
-1. **Accept**: +0.0016 converged bpb for 1.30x throughput and −5 GB VRAM is a
-   good trade for *exploration* runs (more steps per euro), and final-quality
-   runs can always afford bf16. Write it down and mark the FP8 configs
-   accordingly (e.g. `exploration-only`).
-2. **Reject**: the pre-registered criterion is the criterion; FP8 stays off
-   research comparisons until a re-measurement says otherwise.
-3. **Re-measure**: one more seed per arm before deciding (cheapest way to
-   resolve the n=2 band question).
+A second FP8 seed (10k steps, same config, `runs/sweep13_450m_longctx_fp8_seed1/`,
+59,211 tok/s) settled the n=2 band question:
 
-Until one of these is written down here, this table is the record: the speedup
-is real and reproducible; the converged quality cost was measured, exceeded
-the pre-registered threshold, and has not been adjudicated.
+| arm | seed 0 | seed 1 | band | mean |
+|---|---:|---:|---:|---:|
+| bf16 | 0.90234 | 0.90270 | 0.00036 | 0.90252 |
+| FP8 stack | 0.90428 | 0.90414 | **0.00014** | 0.90421 |
+
+The FP8 seeds agree with each other to 0.00014 — **12x tighter than the
+offset itself** — and the closest FP8-to-bf16 gap is +0.00144 with zero
+overlap between the two n=2 distributions. The pre-registered criterion
+(within 0.0004) fails decisively: this is not band noise. The converged
+quality cost of the FP8 stack is real and stable at **≈ +0.0017 bpb**
+(mean-to-mean +0.00169) in exchange for **1.30x throughput and −5 GB VRAM**.
+
+The remaining choice (accept that trade for exploration runs and keep bf16
+for final numbers, or reject FP8 for research comparisons outright) is a
+policy call, not a measurement call — the measurement above is complete.
